@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0
+qrcode[pil]>=7.4
+python-dotenv>=1.0
+pytest>=8.0
+zxing-cpp>=2.2

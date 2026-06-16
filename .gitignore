@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+*service-account*.json
+credentials.json
+
+# Runtime data
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Generated artifacts (re-run scripts/make_phase0_qrs.py)
+phase0_qrs/
+
+# Local tooling
+.claude/settings.local.json
