@@ -16,8 +16,18 @@
 - The VLM (Gemini Flash) only *extracts* data from screenshots; membership
   decisions are made by deterministic checks in code (PRD §7.3).
 - Members are keyed by Telegram user ID, never by @username.
-- Phase 0 (QR reference-placement test) is BLOCKING for the payment engine —
-  check MEMORY.md for its outcome before building Phase 2.
+- The school account is called **DBS FLYMAX**.
+- Phase 0 is complete: preserve the original school Billing ID in every QR;
+  check `MEMORY.md` for the full outcome before building Phase 2.
+- Use **S$0.05** as the initial Phase 2 end-to-end test term fee. Keep fees
+  configurable per term; do not hardcode S$0.05 or the later S$20.00 fee.
+- Phase 2 is implemented: `/newterm`, `/pay`, receipt extraction, deterministic
+  verification, duplicate protection, and treasurer Approve/Reject review.
+- Tested payer receipts do not display the QR's `BDM...` reference. Do not
+  require it. Verify Billing ID, amount, recipient, full timestamp after QR
+  issue, and globally unique image hash + normalized bank reference instead.
+- `receipt_fingerprints` is permanent anti-reuse history. Never clear it between
+  terms, and back up `clubbot.db`.
 
 ## Stack
 

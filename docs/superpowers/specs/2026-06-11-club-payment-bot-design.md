@@ -6,7 +6,7 @@
 The club currently collects term membership fees via Microsoft Forms + a PayNow QR.
 Members forget to pay, submissions must be cross-checked by hand, and the exco
 spends hours every term chasing people. The treasurer (project owner) is the only
-person with (read-only) access to the school's DBS Flimax account where fees land.
+person with (read-only) access to the school's DBS FLYMAX account where fees land.
 
 ## 2. Goals
 
@@ -21,22 +21,23 @@ person with (read-only) access to the school's DBS Flimax account where fees lan
 ## 3. Non-goals
 
 - Moving money or refunds (school account is read-only; out of scope).
-- Replacing the school's QR/account or integrating with DBS/Flimax systems
+- Replacing the school's QR/account or integrating with DBS FLYMAX systems
   (no API/export exists; the account is confidential).
 - Event signups, court booking, or anything beyond membership + payments (v1).
 
 ## 4. Constraints & key facts (verified)
 
-- Money must land in the school's DBS Flimax account. Treasurer has **view-only**
+- Money must land in the school's DBS FLYMAX account. Treasurer has **view-only**
   access via app; **no export, no API, no alerts**. Bot can never see the account.
-- Flimax transaction history shows **payer name + reference/comment** per payment.
+- FLYMAX transaction history shows payer name, amount, date, transaction ID, and
+  the fixed school Billing ID. It does not show the secondary member reference.
 - Decoded the club's existing PayNow QR (`image.png`):
   - Payload: `00020101021126520009SG.PAYNOW010120213200913519CSL5030110408299912315204000053037025802SG5925SINGAPORE UNIVERSITY OF T6002SG62290125200913519CSL5EIU6161381696304432B`
   - Proxy: **UEN `200913519CSL5`** (SUTD UEN + sub-account suffix `SL5`)
   - Merchant name: `SINGAPORE UNIVERSITY OF T` (what the VLM checks as recipient)
   - Static QR, **amount editable by payer**, never expires
   - ⚠️ Embeds fixed bill number `200913519CSL5EIU616138169` — possibly used by
-    Flimax to allocate payments to the club. **Phase 0 must test whether a custom
+    FLYMAX to allocate payments to the club. **Phase 0 must test whether a custom
     bill number still allocates correctly.** (See §13 Phase 0.)
 - Membership: **fixed fee per SUTD term**, everyone renews at term start.
 - Registration data: full name, SUTD student ID, Telegram username (+ user ID auto).
@@ -50,7 +51,7 @@ person with (read-only) access to the school's DBS Flimax account where fees lan
 | Verification engine | Screenshot + VLM auto-check (5 deterministic checks); no human in common path |
 | VLM provider | **Gemini Flash** (start on free tier; privacy caveat noted §11; swappable function) |
 | Exceptions (failed checks) | DM the treasurer with Approve/Reject buttons |
-| Audit loop | **Weekly digest** during collection season; treasurer confirms codes vs Flimax (~5–10 min) |
+| Audit loop | **Weekly digest** during collection season; treasurer confirms payer names vs FLYMAX (~5–10 min) |
 | Membership model | Fixed fee per SUTD term |
 | Reminders | Auto-nag: term-start DM + day 3/7/14 reminders until paid, plus `/remind` manual trigger |
 | Admin records | Bot commands + read-only Google Sheet mirror |
@@ -72,14 +73,16 @@ One Python process on a free-tier VM (Oracle Always Free or GCP e2-micro),
 Components:
 1. **Bot core** — command/conversation handlers for members and admins.
 2. **QR generator** — builds per-member dynamic PayNow QR: club UEN proxy, exact
-   term fee (non-editable), unique reference code (e.g. `BDM-T5-047`) in the
-   EMVCo bill-number field. Pure function: EMVCo TLV payload + CRC-16/CCITT +
+   term fee (non-editable), mandatory school Billing ID in the bill-number field,
+   and a unique code (e.g. `BDM-T5-047`) in the reference-label field. Pure
+   function: EMVCo TLV payload + CRC-16/CCITT +
    `qrcode` PNG render. School QR's decoded values are config, not hardcoded.
-3. **Verification engine** — Gemini Flash (vision) extracts
-   `{amount, recipient, date, reference, txn_id, is_success_screen}` as
-   schema-enforced JSON; then plain code runs 5 checks:
-   amount == fee · recipient matches school account name · reference == member's
-   code · date recent (≤ N days) · txn_id + image hash unseen. All pass →
+3. **Verification engine** — Gemini Flash (vision) extracts amount, recipient,
+   Billing ID, full timestamp, bank reference, and completed-payment status as
+   schema-enforced JSON; then plain code checks:
+   amount == fee · recipient matches school account name · Billing ID matches ·
+   timestamp is within the term and after the member's QR issue time · bank
+   reference + image hash have never been submitted in any term. All pass →
    auto-approve. Any fail → exception queue. Model call isolated behind
    `extract_payment_details(image) -> ExtractedPayment` so provider is swappable.
 4. **Reminder scheduler** — PTB JobQueue: term-start blast (personal QR attached),
@@ -98,7 +101,9 @@ Components:
 - `terms(id PK, name, fee_cents, start_date, end_date, created_by, created_at)`
 - `payments(id PK, member_id FK, term_id FK, ref_code UNIQUE, status, amount_cents,
    screenshot_file_id, extracted_json, bank_txn_id UNIQUE NULLABLE, image_hash,
-   created_at, verified_at, verified_by)`
+   qr_issued_at, payment_timestamp, created_at, verified_at, verified_by)`
+- `receipt_fingerprints(payment_id FK, image_hash UNIQUE, bank_txn_id UNIQUE,
+   submitted_at)` — permanent cross-term anti-reuse history
   - `status ∈ {awaiting_payment, pending_verification, verified, exception, rejected, revoked}`
   - `verified_by ∈ {auto, treasurer, manual_override}`
 - `admins(telegram_user_id PK, role ∈ {treasurer, admin}, added_by, added_at)`
@@ -117,8 +122,8 @@ Members keyed by Telegram **user ID** (never @username — usernames change).
 verifies → ✅ receipt + membership active until term end, Sheet updated
 — or → exception → treasurer ping → Approve/Reject → member notified.
 
-**Audit (weekly during collection season):** digest of auto-approved codes →
-treasurer checks Flimax → "✓ all found" or marks missing codes → bot revokes +
+**Audit (weekly during collection season):** digest of auto-approved payments →
+treasurer checks FLYMAX by payer name, amount, and date → "✓ all found" or marks missing payments → bot revokes +
 notifies + flags those members. Quiet weeks (0 payments) send nothing.
 
 **Term rollover:** treasurer `/newterm Name fee start end` → at start date, blast
@@ -152,7 +157,9 @@ Treasurer: `/newterm`, `/markpaid <sutd_id>` (manual override, logged),
 | Case | Handling |
 |---|---|
 | Wrong amount (bank app allowed edit) | amount check fails → exception |
-| Duplicate screenshot / txn_id | auto-reject, tell member, flag repeats |
+| Exact copied screenshot | permanent SHA-256 image fingerprint rejects it |
+| Cropped/recompressed copied screenshot | permanent normalized bank reference rejects it |
+| Previous-term receipt not seen before | payment timestamp predates current QR issue and fails |
 | Blurry screenshot | bot asks to retake (no exception raised) |
 | Confirm-screen (not success) screenshot | `is_success_screen` false → ask member for the success screen |
 | Member switches Telegram account | `/relink` by SUTD ID |
@@ -163,16 +170,18 @@ Treasurer: `/newterm`, `/markpaid <sutd_id>` (manual override, logged),
 
 ## 13. Build phases
 
-**Phase 0 — validation spike (BLOCKING, ~$0.30 in test payments):**
+**Phase 0 — validation spike (COMPLETED 2026-06-20):**
 1. ✅ Decode school QR (done — see §4).
-2. Generate test QR **variant A**: school's original bill number kept, our code in
+2. ✅ Generate test QR **variant A**: school's original bill number kept, our code in
    a different EMVCo subfield; **variant B**: our ref code as the bill number.
-3. Pay ~$0.10 with each variant from a personal bank app.
-4. Treasurer checks Flimax: (a) did both payments arrive in the club account?
+3. ✅ Pay S$0.10 with each variant from a personal bank app.
+4. ✅ Treasurer checks FLYMAX: (a) did both payments arrive in the club account?
    (b) which field(s) show in history? (c) does variant B break allocation?
-5. Outcome decides the reference-code placement strategy (stored in `settings`).
-   If neither shows the code in history → fall back: payer-name matching for audit
-   (VLM flow unchanged; audit digest lists expected payer names instead of codes).
+5. ✅ Outcome: variant A arrived; variant B did not clear. FLYMAX displayed the
+   payer name and original Billing ID `200913519CSL5EIU616138169`, but not the
+   variant A reference-label code `BDMTEST01`. Therefore every real QR must keep
+   the original school bill number. Bank-side audits fall back to payer-name
+   matching, supported by amount/date; audit digests list expected payer names.
 
 **Phase 1 — core bot:** registration, SQLite, `/status`, admin bootstrap.
 **Phase 2 — payment engine:** QR generation, screenshot intake, Gemini extraction
@@ -199,7 +208,8 @@ Phase 0 test payments ~$0.30 (recoverable — they land in the club account).
 
 ## 16. Open questions (non-blocking)
 
-1. Phase 0 outcome → reference placement strategy (A/B/fallback). **Blocking for Phase 2 only.**
+1. ✅ Phase 0 outcome: preserve the original school bill number; use payer-name
+   matching for FLYMAX audits because its history does not show the reference label.
 2. Email to SUTD finance: can the account send per-transaction email alerts?
    If ever yes → verification upgrades to fully bank-confirmed; design unchanged.
 3. Term fee amount + current term dates (needed at Phase 3 config, not before).

@@ -1,7 +1,7 @@
 """Generate the two Phase 0 test QRs (PRD §13).
 
 Run:  python scripts/make_phase0_qrs.py
-Then pay S$0.10 with each QR from your own bank app and check the DBS Flimax
+Then pay S$0.10 with each QR from your own bank app and check DBS FLYMAX
 transaction history — see the printed instructions.
 """
 
@@ -22,7 +22,7 @@ Phase 0 test (PRD section 13) - what to do now:
      variant_A.png - keeps the school's bill number; our code BDMTEST01 rides
                      in the EMVCo "reference label" field
      variant_B.png - our code BDMTEST02 REPLACES the school's bill number
-2. Wait for both to clear, then check the DBS Flimax transaction history:
+2. Wait for both to clear, then check the DBS FLYMAX transaction history:
      a. Did BOTH payments arrive in the club account?
      b. What text shows for each payment (which code, if any)?
      c. Did variant B still get allocated to the club account?

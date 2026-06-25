@@ -2,7 +2,7 @@
 
 Variant A keeps the school's original bill number and carries our code in the
 EMVCo reference-label subfield. Variant B replaces the bill number with our
-code. The treasurer pays S$0.10 with each; what Flimax then shows decides the
+code. The treasurer pays S$0.10 with each; what FLYMAX then shows decides the
 strategy stored in settings.
 """
 

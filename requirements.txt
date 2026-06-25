@@ -1,5 +1,6 @@
-python-telegram-bot>=21.0
+python-telegram-bot[job-queue]>=21.0
 qrcode[pil]>=7.4
 python-dotenv>=1.0
+google-genai>=2.9,<3.0
 pytest>=8.0
 zxing-cpp>=2.2

@@ -1,9 +1,9 @@
 """Validators for registration input. Permissive on names (non-ASCII names
-exist in the club), strict on SUTD IDs (7 digits)."""
+exist in the club), strict on SUTD IDs (7 digits starting with 1010)."""
 
 import re
 
-_SUTD_ID_RE = re.compile(r"\d{7}")
+_SUTD_ID_RE = re.compile(r"1010\d{3}")
 
 
 def normalize_full_name(text: str) -> str | None:

@@ -1,10 +1,14 @@
 import asyncio
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from telegram.ext import ConversationHandler
 
 from clubbot import bot, db
+from clubbot.payments import SCHOOL_BILL_NUMBER, ExtractedPayment
+
+SINGAPORE_TIME = timezone(timedelta(hours=8))
 
 
 @pytest.fixture()
@@ -17,14 +21,23 @@ def make_update(user_id=111, text=None, username="alice"):
     update.effective_user.id = user_id
     update.effective_user.username = username
     update.message.text = text
+    update.message.photo = []
+    update.message.document = None
     update.message.reply_text = AsyncMock()
+    update.message.reply_photo = AsyncMock()
     return update
 
 
-def make_context(conn):
+def make_context(conn, extractor=None):
     context = MagicMock()
-    context.bot_data = {"db": conn}
+    context.bot_data = {"db": conn, "extractor": extractor}
     context.user_data = {}
+    context.args = []
+    context.bot.get_file = AsyncMock()
+    context.bot.send_message = AsyncMock()
+    # No real JobQueue in unit tests; /newterm's live scheduling is a no-op here
+    # and is covered directly in test_scheduler.py.
+    context.application.job_queue = None
     return context
 
 
@@ -44,7 +57,7 @@ def test_start_when_registered_shows_status(conn):
     )
     update, context = make_update(text="/start"), make_context(conn)
     assert asyncio.run(bot.cmd_start(update, context)) == ConversationHandler.END
-    assert "registered as Alice Tan" in reply_text_of(update)
+    assert "Registered as Alice Tan" in reply_text_of(update)
 
 
 def test_full_registration_flow(conn):
@@ -129,7 +142,7 @@ def test_status_shows_username_and_next_steps(conn):
     asyncio.run(bot.cmd_status(update, context))
     text = reply_text_of(update)
     assert "@alice" in text
-    assert "Fee collection hasn't started yet" in text
+    assert "Fee collection is not open" in text
 
 
 def test_status_refreshes_changed_username(conn):
@@ -158,7 +171,7 @@ def test_status_without_username_has_no_handle(conn):
     update = make_update(text="/status", username=None)
     asyncio.run(bot.cmd_status(update, make_context(conn)))
     text = reply_text_of(update)
-    assert "Fee collection hasn't started yet" in text
+    assert "Fee collection is not open" in text
     assert "@" not in text
     assert "(SUTD ID 1007654)" in text
 
@@ -166,4 +179,222 @@ def test_status_without_username_has_no_handle(conn):
 def test_build_application_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     assert app.bot_data["db"] is conn
-    assert len(app.handlers[0]) == 3  # conversation + /status + /help
+    assert len(app.handlers[0]) == 16
+
+
+def create_active_term(conn, treasurer_id=999):
+    today = date.today()
+    return db.create_term(
+        conn,
+        name="Payment Test",
+        fee_cents=5,
+        start_date=(today - timedelta(days=1)).isoformat(),
+        end_date=(today + timedelta(days=7)).isoformat(),
+        created_by=treasurer_id,
+    )
+
+
+def test_treasurer_can_create_five_cent_term(conn):
+    db.ensure_treasurer(conn, 999)
+    update = make_update(user_id=999, text="/newterm")
+    context = make_context(conn)
+    today = date.today()
+    context.args = [
+        "Payment",
+        "Test",
+        "0.05",
+        today.isoformat(),
+        (today + timedelta(days=7)).isoformat(),
+    ]
+    asyncio.run(bot.cmd_newterm(update, context))
+    assert db.get_active_term(conn)["fee_cents"] == 5
+    assert "S$0.05" in reply_text_of(update)
+
+
+def test_non_treasurer_cannot_create_term(conn):
+    update = make_update(user_id=111, text="/newterm")
+    context = make_context(conn)
+    asyncio.run(bot.cmd_newterm(update, context))
+    assert db.get_active_term(conn) is None
+    assert "Only the treasurer" in reply_text_of(update)
+
+
+def test_pay_sends_personal_qr(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+    )
+    create_active_term(conn)
+    update, context = make_update(text="/pay"), make_context(conn)
+    asyncio.run(bot.cmd_pay(update, context))
+    assert update.message.reply_photo.await_count == 1
+    caption = update.message.reply_photo.call_args.kwargs["caption"]
+    assert "S$0.05" in caption
+    payment = db.get_current_payment(conn, 111)
+    assert payment["qr_issued_at"] is not None
+    assert "Billing ID" in caption
+
+
+class FakeExtractor:
+    def __init__(self, result):
+        self.result = result
+
+    async def extract(self, image_bytes, mime_type):
+        assert image_bytes == b"receipt-image"
+        assert mime_type == "image/jpeg"
+        return self.result
+
+
+def test_valid_receipt_is_auto_verified(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+    )
+    term = create_active_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    payment = db.mark_qr_issued(conn, payment["id"])
+    extracted = ExtractedPayment(
+        readable=True,
+        is_success_screen=True,
+        amount_cents=5,
+        recipient="Singapore University of Technology and Design",
+        billing_id=SCHOOL_BILL_NUMBER,
+        payment_timestamp=datetime.now(SINGAPORE_TIME).isoformat(),
+        transaction_id="TX-VALID-1",
+    )
+    update = make_update()
+    photo = MagicMock(file_id="FILE1", file_size=100)
+    update.message.photo = [photo]
+    context = make_context(conn, FakeExtractor(extracted))
+    telegram_file = MagicMock()
+    telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"receipt-image"))
+    context.bot.get_file.return_value = telegram_file
+
+    asyncio.run(bot.on_receipt(update, context))
+
+    saved = db.get_payment(conn, payment["id"])
+    assert saved["status"] == "verified"
+    assert saved["verified_by"] == "auto"
+    assert saved["bank_txn_id"] == "TXVALID1"
+    assert "accepted" in reply_text_of(update)
+
+
+def test_wrong_receipt_notifies_treasurer(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+    )
+    db.ensure_treasurer(conn, 999)
+    term = create_active_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    payment = db.mark_qr_issued(conn, payment["id"])
+    extracted = ExtractedPayment(
+        readable=True,
+        is_success_screen=True,
+        amount_cents=500,
+        recipient="Someone Else",
+        billing_id="WRONG",
+        payment_timestamp=datetime.now(SINGAPORE_TIME).isoformat(),
+        transaction_id="TX-WRONG-1",
+    )
+    update = make_update()
+    update.message.photo = [MagicMock(file_id="FILE2", file_size=100)]
+    context = make_context(conn, FakeExtractor(extracted))
+    telegram_file = MagicMock()
+    telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"receipt-image"))
+    context.bot.get_file.return_value = telegram_file
+
+    asyncio.run(bot.on_receipt(update, context))
+
+    assert db.get_payment(conn, payment["id"])["status"] == "exception"
+    assert context.bot.send_message.await_count == 1
+    assert context.bot.send_message.call_args.kwargs["chat_id"] == 999
+
+
+def test_duplicate_transaction_is_flagged_without_database_error(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+    )
+    db.add_member(
+        conn, telegram_user_id=222, full_name="Bob Lim", sutd_id="1007655", username="bob"
+    )
+    db.ensure_treasurer(conn, 999)
+    term = create_active_term(conn)
+    alice = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    alice = db.mark_qr_issued(conn, alice["id"])
+    assert db.reserve_receipt_image(
+        conn, payment_id=alice["id"], image_hash="old-hash"
+    )
+    db.mark_payment_pending(
+        conn, alice["id"], screenshot_file_id="OLD", image_hash="old-hash"
+    )
+    assert db.reserve_bank_transaction(
+        conn,
+        payment_id=alice["id"],
+        image_hash="old-hash",
+        bank_txn_id="SHAREDTX",
+    )
+    db.save_verification_result(
+        conn,
+        alice["id"],
+        status="verified",
+        amount_cents=5,
+        extracted_json="{}",
+        bank_txn_id="SHAREDTX",
+        verified_by="auto",
+    )
+    bob = db.get_or_create_payment(conn, member_id=222, term_id=term["id"])
+    bob = db.mark_qr_issued(conn, bob["id"])
+    extracted = ExtractedPayment(
+        readable=True,
+        is_success_screen=True,
+        amount_cents=5,
+        recipient="Singapore University of Technology and Design",
+        billing_id=SCHOOL_BILL_NUMBER,
+        payment_timestamp=datetime.now(SINGAPORE_TIME).isoformat(),
+        transaction_id="SHARED-TX",
+    )
+    update = make_update(user_id=222, username="bob")
+    update.message.photo = [MagicMock(file_id="FILE3", file_size=100)]
+    context = make_context(conn, FakeExtractor(extracted))
+    telegram_file = MagicMock()
+    telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"receipt-image"))
+    context.bot.get_file.return_value = telegram_file
+
+    asyncio.run(bot.on_receipt(update, context))
+
+    saved = db.get_payment(conn, bob["id"])
+    assert saved["status"] == "exception"
+    assert saved["bank_txn_id"] is None
+
+
+def test_receipt_requires_pay_command_first(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+    )
+    create_active_term(conn)
+    update = make_update()
+    update.message.photo = [MagicMock(file_id="FILE4", file_size=100)]
+    asyncio.run(bot.on_receipt(update, make_context(conn, MagicMock())))
+    assert "Send /pay first" in reply_text_of(update)
+
+
+def test_exact_receipt_image_cannot_be_reused(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+    )
+    term = create_active_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    payment = db.mark_qr_issued(conn, payment["id"])
+    assert db.reserve_receipt_image(
+        conn,
+        payment_id=payment["id"],
+        image_hash="8e4998746c757d9ed5f2fb597c8be52ec501a71637d0cdf83a5c1068ce564f94",
+    )
+    update = make_update()
+    update.message.photo = [MagicMock(file_id="FILE5", file_size=100)]
+    context = make_context(conn, MagicMock())
+    telegram_file = MagicMock()
+    telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"receipt-image"))
+    context.bot.get_file.return_value = telegram_file
+
+    asyncio.run(bot.on_receipt(update, context))
+
+    assert "already been submitted" in reply_text_of(update)

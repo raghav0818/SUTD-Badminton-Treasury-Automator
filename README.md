@@ -11,7 +11,7 @@ and verifies payment screenshots automatically. Design doc:
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 copy .env.example .env
-# edit .env: bot token from @BotFather, your Telegram ID from @userinfobot
+# edit .env: bot token, your Telegram ID, and Gemini API key
 ```
 
 ## Run the bot
@@ -22,18 +22,39 @@ copy .env.example .env
 
 Stop with Ctrl+C. The database is a single file (`clubbot.db`).
 
+## Test the payment flow
+
+As the treasurer, create an active S$0.05 test term:
+
+```text
+/newterm Payment Test 0.05 2026-06-20 2026-07-20
+```
+
+A registered member can then send `/pay`, pay with the generated QR, and send
+the completed-payment screenshot back to the bot. The fee is stored per term;
+after testing, create the real term with `20.00` instead of changing code.
+
+The bot rejects reused receipts using two permanent identifiers:
+
+- SHA-256 fingerprint of every submitted image.
+- Normalized bank transaction/reference number extracted from the receipt.
+
+It also records when `/pay` first issued the member's QR and rejects receipts
+dated before that time. These records must be preserved with `clubbot.db`.
+
 ## Run the tests
 
 ```powershell
 .venv\Scripts\python -m pytest
 ```
 
-## Phase 0: QR placement test (do this once)
+## Phase 0: QR placement test (completed)
 
 ```powershell
 .venv\Scripts\python scripts/make_phase0_qrs.py
 ```
 
-Pay S$0.10 with each generated QR (`phase0_qrs/`) from your personal bank
-app, then check the DBS Flimax history and report what each payment shows.
-The outcome unblocks the payment engine (Phase 2).
+The test established that every generated QR must preserve the school's Billing
+ID. The tested bank receipt and DBS FLYMAX do not expose a shared member
+reference, so verification uses Billing ID, amount, timestamp, bank reference,
+and permanent duplicate protection.

@@ -11,6 +11,8 @@ class Config:
     bot_token: str
     treasurer_id: int
     db_path: str
+    gemini_api_key: str
+    gemini_model: str
 
 
 def load_config() -> Config:
@@ -25,4 +27,6 @@ def load_config() -> Config:
         bot_token=token,
         treasurer_id=int(treasurer),
         db_path=os.environ.get("DB_PATH", "clubbot.db"),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
     )
