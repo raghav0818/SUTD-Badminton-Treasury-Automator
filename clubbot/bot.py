@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from clubbot import admin, db, scheduler, validation
+from clubbot import admin, admin_manage, db, ops, paynow_config, scheduler, validation
 from clubbot.format import money
 from clubbot.payments import (
     build_member_qr,
@@ -78,7 +78,14 @@ ADMIN_HELP = (
     "/remind - nudge unpaid members now\n"
     "/audit - get the FLYMAX check-list now\n"
     "/flag <sutd_id> - mark a payment as unconfirmed in FLYMAX\n"
-    "/revoke <sutd_id> - remove a membership"
+    "/revoke <sutd_id> - remove a membership\n"
+    "/addadmin <sutd_id> - grant a member admin access\n"
+    "/removeadmin <sutd_id> - remove a member's admin access\n"
+    "/transfertreasurer <sutd_id> - hand over the treasurer role\n"
+    "/relink <sutd_id> [new_id] - move a member to a new Telegram account\n"
+    "/settings - view or change PayNow settings\n"
+    "/sync - refresh the Google Sheet now\n"
+    "/backup - save a database backup now"
 )
 
 
@@ -144,6 +151,15 @@ async def on_sutd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(BAD_SUTD_ID)
         return ASK_SUTD_ID
     if db.get_member_by_sutd_id(_db(context), sutd_id) is not None:
+        # Record this account as a relink candidate so the treasurer can move
+        # the SUTD ID over with /relink (PRD §12: member switched Telegram).
+        user = update.effective_user
+        db.upsert_relink_request(
+            _db(context),
+            sutd_id=sutd_id,
+            new_telegram_user_id=user.id,
+            new_username=user.username,
+        )
         await update.message.reply_text(SUTD_ID_TAKEN)
         return ASK_SUTD_ID
     context.user_data["sutd_id"] = sutd_id
@@ -172,6 +188,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return ConversationHandler.END
         name = context.user_data["full_name"]
         context.user_data.clear()
+        ops.mark_dirty(context)
         await update.message.reply_text(REGISTERED.format(name=name))
         return ConversationHandler.END
     if answer in ("no", "n"):
@@ -239,6 +256,7 @@ async def cmd_newterm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Could not create term: {exc}")
         return
     scheduler.schedule_term_jobs(context.application, _db(context), term["id"])
+    ops.mark_dirty(context)
     await update.message.reply_text(
         f"Term created: {term['name']}\n"
         f"Fee: {money(term['fee_cents'])}\n"
@@ -265,7 +283,9 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     payment = db.mark_qr_issued(conn, payment["id"])
     qr = build_member_qr(
-        fee_cents=term["fee_cents"], reference=payment["ref_code"]
+        fee_cents=term["fee_cents"],
+        reference=payment["ref_code"],
+        config=paynow_config.get_paynow_config(conn),
     )
     image = io.BytesIO(qr)
     image.name = "membership-paynow.png"
@@ -310,6 +330,13 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if payment["status"] == "verified":
         await update.message.reply_text("Your payment is already verified.")
+        return
+    # Throttle the expensive Gemini path per user (quota/cost/abuse protection).
+    limiter = context.bot_data.get("rate_limiter")
+    if limiter is not None and not limiter.allow(update.effective_user.id):
+        await update.message.reply_text(
+            "Please wait a moment before sending another receipt."
+        )
         return
     file_info = _receipt_file(update.message)
     if file_info is None:
@@ -376,6 +403,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         term_end=term["end_date"],
         qr_issued_at=payment["qr_issued_at"],
         duplicate_transaction=duplicate_txn,
+        config=paynow_config.get_paynow_config(conn),
     )
     if result.outcome == "retry":
         db.reset_payment_for_retry(conn, payment["id"])
@@ -400,6 +428,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         verified_by="auto" if result.passed else None,
     )
     if result.passed:
+        ops.mark_dirty(context)
         await update.message.reply_text(
             f"Payment receipt accepted.\n\n{term['name']}\n"
             f"Amount: {money(term['fee_cents'])}\nStatus: Verified"
@@ -469,6 +498,8 @@ async def on_payment_review(
         )
         return
     approved = action == "approve"
+    if approved:
+        ops.mark_dirty(context)
     await query.edit_message_text(
         f"Payment {'approved' if approved else 'rejected'} for "
         f"{payment['full_name']} ({payment['term_name']})."
@@ -483,11 +514,20 @@ async def on_payment_review(
 
 
 def build_application(
-    token: str, conn: sqlite3.Connection, *, extractor: Any | None = None
+    token: str,
+    conn: sqlite3.Connection,
+    *,
+    extractor: Any | None = None,
+    sheet_syncer: Any | None = None,
+    rate_limiter: Any | None = None,
+    db_path: str = "",
 ) -> Application:
     app = Application.builder().token(token).build()
     app.bot_data["db"] = conn
     app.bot_data["extractor"] = extractor
+    app.bot_data["sheet_syncer"] = sheet_syncer
+    app.bot_data["rate_limiter"] = rate_limiter
+    app.bot_data["db_path"] = db_path
     registration = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -512,12 +552,37 @@ def build_application(
     app.add_handler(CommandHandler("audit", admin.cmd_audit))
     app.add_handler(CommandHandler("flag", admin.cmd_flag))
     app.add_handler(CommandHandler("revoke", admin.cmd_revoke))
+    app.add_handler(CommandHandler("addadmin", admin_manage.cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin", admin_manage.cmd_removeadmin))
+    app.add_handler(
+        CommandHandler("transfertreasurer", admin_manage.cmd_transfertreasurer)
+    )
+    app.add_handler(CommandHandler("relink", admin_manage.cmd_relink))
+    app.add_handler(CommandHandler("settings", paynow_config.cmd_settings))
+    app.add_handler(CommandHandler("sync", admin.cmd_sync))
+    app.add_handler(CommandHandler("backup", admin.cmd_backup))
     app.add_handler(
         CallbackQueryHandler(on_payment_review, pattern=r"^payment:(approve|reject):\d+$")
     )
     app.add_handler(
         CallbackQueryHandler(admin.on_audit_allfound, pattern=r"^audit:allfound$")
     )
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_manage.on_transfer_confirm, pattern=r"^transfer:(confirm|cancel)$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_manage.on_relink_confirm, pattern=r"^relink:(confirm|cancel)$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            paynow_config.on_settings_confirm, pattern=r"^settings:(confirm|cancel)$"
+        )
+    )
+    app.add_error_handler(ops.on_error)
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_receipt)
     )

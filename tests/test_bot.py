@@ -179,7 +179,7 @@ def test_status_without_username_has_no_handle(conn):
 def test_build_application_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     assert app.bot_data["db"] is conn
-    assert len(app.handlers[0]) == 16
+    assert len(app.handlers[0]) == 26
 
 
 def create_active_term(conn, treasurer_id=999):
@@ -374,6 +374,45 @@ def test_receipt_requires_pay_command_first(conn):
     update.message.photo = [MagicMock(file_id="FILE4", file_size=100)]
     asyncio.run(bot.on_receipt(update, make_context(conn, MagicMock())))
     assert "Send /pay first" in reply_text_of(update)
+
+
+def test_taken_sutd_id_records_relink_request(conn):
+    db.add_member(
+        conn, telegram_user_id=999, full_name="Bob Lim", sutd_id="1010765", username=None
+    )
+    context = make_context(conn)
+    context.user_data["full_name"] = "Alice Tan"
+    update = make_update(user_id=222, text="1010765", username="alice_new")
+    assert asyncio.run(bot.on_sutd_id(update, context)) == bot.ASK_SUTD_ID
+    request = db.get_relink_request(conn, "1010765")
+    assert request is not None
+    assert request["new_telegram_user_id"] == 222
+    assert request["new_username"] == "alice_new"
+
+
+def test_receipt_blocked_by_rate_limiter(conn):
+    from clubbot import ops
+
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010765", username="alice"
+    )
+    term = create_active_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.mark_qr_issued(conn, payment["id"])
+
+    # A limiter that is already saturated for this user.
+    limiter = ops.RateLimiter(max_per_window=0, window_seconds=60)
+    context = make_context(conn, FakeExtractor(None))
+    context.bot_data["rate_limiter"] = limiter
+    update = make_update()
+    update.message.photo = [MagicMock(file_id="FILE9", file_size=100)]
+
+    asyncio.run(bot.on_receipt(update, context))
+
+    assert "wait a moment" in reply_text_of(update)
+    # Blocked before any Gemini call: status untouched, no fingerprint reserved.
+    assert db.get_payment(conn, payment["id"])["status"] == "awaiting_payment"
+    assert context.bot.get_file.await_count == 0
 
 
 def test_exact_receipt_image_cannot_be_reused(conn):

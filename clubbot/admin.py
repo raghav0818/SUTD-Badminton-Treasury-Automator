@@ -8,7 +8,7 @@ import sqlite3
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from clubbot import db, scheduler
+from clubbot import db, ops, scheduler
 from clubbot.format import money
 
 log = logging.getLogger(__name__)
@@ -62,8 +62,8 @@ async def cmd_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = [
         f"- {m['full_name']} (SUTD ID {m['sutd_id']})" for m in members
     ]
-    await update.message.reply_text(
-        f"Unpaid members for {term['name']}:\n" + "\n".join(lines)
+    await ops.reply_long(
+        update.message, f"Unpaid members for {term['name']}:\n" + "\n".join(lines)
     )
 
 
@@ -100,7 +100,7 @@ async def cmd_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for m in members:
         handle = f" @{m['username']}" if m["username"] else ""
         lines.append(f"- {m['full_name']} (SUTD ID {m['sutd_id']}){handle}")
-    await update.message.reply_text("Members:\n" + "\n".join(lines))
+    await ops.reply_long(update.message, "Members:\n" + "\n".join(lines))
 
 
 async def cmd_markpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -118,6 +118,7 @@ async def cmd_markpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     payment = db.mark_paid_manual(
         conn, member_id=member["telegram_user_id"], term_id=term["id"]
     )
+    ops.mark_dirty(context)
     await update.message.reply_text(
         f"Marked {payment['full_name']} as paid for {payment['term_name']}."
     )
@@ -176,6 +177,7 @@ async def cmd_flag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError as exc:
         await update.message.reply_text(f"Could not flag: {exc}")
         return
+    ops.mark_dirty(context)
     await update.message.reply_text(
         f"Flagged {payment['full_name']}'s payment for {payment['term_name']}."
     )
@@ -200,6 +202,7 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except ValueError as exc:
         await update.message.reply_text(f"Could not revoke: {exc}")
         return
+    ops.mark_dirty(context)
     await update.message.reply_text(
         f"Revoked {payment['full_name']}'s membership for {payment['term_name']}."
     )
@@ -211,6 +214,39 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Please contact the treasurer."
         ),
     )
+
+
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force a Google Sheet rebuild (treasurer-only)."""
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_TREASURER)
+        return
+    syncer = context.bot_data.get("sheet_syncer")
+    if syncer is None:
+        await update.message.reply_text("The Google Sheet mirror is not configured.")
+        return
+    syncer.mark_dirty()
+    await update.message.reply_text("Google Sheet refresh queued.")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Write an on-demand database backup (treasurer-only)."""
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_TREASURER)
+        return
+    db_path = context.bot_data.get("db_path")
+    if not db_path:
+        await update.message.reply_text("No database path is configured for backups.")
+        return
+    try:
+        path = ops.backup_database(db_path)
+    except Exception as exc:  # never crash on a backup attempt
+        log.exception("Manual backup failed")
+        await update.message.reply_text(f"Backup failed: {exc}")
+        return
+    await update.message.reply_text(f"Backup written to {path}")
 
 
 async def on_audit_allfound(

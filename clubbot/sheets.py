@@ -105,7 +105,9 @@ class SheetMirror:
         for title, builder in (("Members", member_rows), ("Payments", payment_rows)):
             ws = self._worksheet(title)
             ws.clear()
-            ws.update(builder(conn))
+            # gspread 6.x: update(values, range_name=...) — use named args so the
+            # v5->v6 argument-order swap can never silently transpose them.
+            ws.update(values=builder(conn), range_name="A1")
 
 
 class SheetSyncer:

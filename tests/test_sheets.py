@@ -17,8 +17,9 @@ class FakeWorksheet:
     def clear(self):
         self.cleared = True
 
-    def update(self, rows):
-        self.updated = rows
+    def update(self, values=None, range_name=None):
+        # Mirror gspread 6.x: update(values, range_name=...).
+        self.updated = values
 
 
 class FakeSpreadsheet:

@@ -9,14 +9,16 @@ from datetime import date, datetime, time, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from clubbot import db
+from clubbot import db, ops, paynow_config
 from clubbot.format import money
 from clubbot.payments import SINGAPORE_TIME, build_member_qr
 
 log = logging.getLogger(__name__)
 
-REMINDER_HOUR = 10  # 10:00 SGT for term-start blast and day-7 reminder
-AUDIT_HOUR = 9      # 09:00 SGT for the weekly digest
+REMINDER_HOUR = 10       # 10:00 SGT for term-start blast and day-7 reminder
+AUDIT_HOUR = 9           # 09:00 SGT for the weekly digest
+BACKUP_HOUR = 3          # 03:00 SGT daily database backup
+SHEET_REBUILD_HOUR = 4   # 04:00 SGT nightly Google Sheet rebuild
 
 
 # --- Pure run-time calculators (no I/O) ----------------------------------------
@@ -63,6 +65,7 @@ def pending_term_jobs(
 async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> None:
     """Send the membership QR to every active, not-yet-verified member, then stamp."""
     term = db.get_term(conn, term_id)
+    config = paynow_config.get_paynow_config(conn)
     caption = (
         f"{term['name']} membership fee: {money(term['fee_cents'])}\n"
         "Pay using this QR, then send the successful-payment screenshot here. "
@@ -77,7 +80,9 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
             continue
         payment = db.mark_qr_issued(conn, payment["id"])
         qr = build_member_qr(
-            fee_cents=term["fee_cents"], reference=payment["ref_code"]
+            fee_cents=term["fee_cents"],
+            reference=payment["ref_code"],
+            config=config,
         )
         image = io.BytesIO(qr)
         image.name = "membership-paynow.png"
@@ -180,6 +185,25 @@ async def _job_audit(context) -> None:
     await do_audit_digest(context.bot, conn)
 
 
+async def _job_backup(context) -> None:
+    """Daily database backup; failures are logged but never crash the bot."""
+    db_path = context.bot_data.get("db_path")
+    if not db_path:
+        return
+    try:
+        path = ops.backup_database(db_path)
+        log.info("Daily database backup written to %s", path)
+    except Exception:
+        log.warning("Daily database backup failed", exc_info=True)
+
+
+async def _job_sheet_rebuild(context) -> None:
+    """Nightly full Sheet rebuild — the backstop for any missed mark_dirty."""
+    syncer = context.bot_data.get("sheet_syncer")
+    if syncer is not None:
+        syncer.mark_dirty()
+
+
 def _arm_term_job(
     jq, kind: str, term_id: int, when: datetime, now: datetime
 ) -> None:
@@ -209,6 +233,16 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
         _job_audit,
         time=time(hour=AUDIT_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
         name="audit-digest",
+    )
+    jq.run_daily(
+        _job_backup,
+        time=time(hour=BACKUP_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
+        name="daily-backup",
+    )
+    jq.run_daily(
+        _job_sheet_rebuild,
+        time=time(hour=SHEET_REBUILD_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
+        name="sheet-rebuild",
     )
 
 
