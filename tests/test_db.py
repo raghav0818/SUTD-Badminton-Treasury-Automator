@@ -414,6 +414,33 @@ def test_reassign_carries_admin_role(conn):
     assert db.get_role(conn, 222) == "admin"
 
 
+def test_connect_dedupes_extra_treasurers(tmp_path):
+    # An older DB created before the single-treasurer index could, in theory,
+    # hold two treasurer rows. connect() must repair it, not crash.
+    path = tmp_path / "two_treasurers.db"
+    raw = sqlite3.connect(path)
+    raw.executescript(
+        "CREATE TABLE admins ("
+        " telegram_user_id INTEGER PRIMARY KEY, role TEXT NOT NULL,"
+        " added_by INTEGER, added_at TEXT NOT NULL DEFAULT (datetime('now')));"
+    )
+    raw.execute("INSERT INTO admins (telegram_user_id, role) VALUES (1, 'treasurer')")
+    raw.execute("INSERT INTO admins (telegram_user_id, role) VALUES (2, 'treasurer')")
+    raw.commit()
+    raw.close()
+
+    healed = db.connect(str(path))
+    treasurers = healed.execute(
+        "SELECT telegram_user_id FROM admins WHERE role = 'treasurer'"
+    ).fetchall()
+    assert len(treasurers) == 1
+    assert treasurers[0]["telegram_user_id"] == 1  # earliest kept
+    # The unique index is now in place.
+    assert healed.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'idx_one_treasurer'"
+    ).fetchone() is not None
+
+
 def test_list_all_payments_spans_terms(conn):
     _member(conn, 111, "1010001", "Alice")
     term = _term(conn)

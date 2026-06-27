@@ -86,12 +86,11 @@ CREATE TABLE IF NOT EXISTS relink_requests (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_member_term
     ON payments(member_id, term_id);
-
--- Enforce "at most one treasurer" at the storage layer, so a logic slip or a
--- race can never leave the club with two treasurers.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_one_treasurer
-    ON admins(role) WHERE role = 'treasurer';
 """
+
+# The "at most one treasurer" unique index is created in _migrate (not here),
+# after a dedup pass, so an older DB that already holds two treasurer rows is
+# repaired rather than crashing at startup.
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -149,6 +148,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
         FROM payments
         WHERE image_hash IS NOT NULL
         """
+    )
+    # Phase 4: enforce a single treasurer. Repair any accidental duplicates
+    # first (keep the earliest-added) so creating the unique index cannot fail.
+    treasurers = conn.execute(
+        "SELECT telegram_user_id FROM admins WHERE role = 'treasurer'"
+        " ORDER BY added_at, telegram_user_id"
+    ).fetchall()
+    if len(treasurers) > 1:
+        keep = treasurers[0]["telegram_user_id"]
+        conn.execute(
+            "UPDATE admins SET role = 'admin'"
+            " WHERE role = 'treasurer' AND telegram_user_id != ?",
+            (keep,),
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_treasurer"
+        " ON admins(role) WHERE role = 'treasurer'"
     )
 
 
