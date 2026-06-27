@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS receipt_fingerprints (
     submitted_at TEXT   NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS relink_requests (
+    sutd_id              TEXT    PRIMARY KEY,
+    new_telegram_user_id INTEGER NOT NULL,
+    new_username         TEXT,
+    requested_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_member_term
     ON payments(member_id, term_id);
 """
@@ -87,6 +94,10 @@ def connect(path: str) -> sqlite3.Connection:
     # from PTB's event loop; SQLite itself is fine with this single-loop use.
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Durability/robustness: WAL survives a crash mid-write better than the
+    # default rollback journal; busy_timeout avoids spurious "database is locked".
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     _migrate(conn)
@@ -711,3 +722,125 @@ def mark_term_reminder7_sent(conn: sqlite3.Connection, term_id: int) -> None:
 
 def list_terms(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM terms ORDER BY start_date, id").fetchall()
+
+
+# --- Phase 4: admin management, relink, and the Sheet mirror -------------------
+
+
+def add_admin(
+    conn: sqlite3.Connection, *, telegram_user_id: int, added_by: int
+) -> None:
+    """Grant a registered member the 'admin' role (idempotent)."""
+    conn.execute(
+        "INSERT OR IGNORE INTO admins (telegram_user_id, role, added_by)"
+        " VALUES (?, 'admin', ?)",
+        (telegram_user_id, added_by),
+    )
+    conn.commit()
+
+
+def remove_admin(conn: sqlite3.Connection, telegram_user_id: int) -> bool:
+    """Remove an 'admin' row. Never touches the treasurer. True if a row went."""
+    cursor = conn.execute(
+        "DELETE FROM admins WHERE telegram_user_id = ? AND role = 'admin'",
+        (telegram_user_id,),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def list_admins(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All admin rows, treasurer first."""
+    return conn.execute(
+        "SELECT * FROM admins ORDER BY role DESC, added_at"
+    ).fetchall()
+
+
+def transfer_treasurer(
+    conn: sqlite3.Connection, *, new_treasurer_id: int, added_by: int
+) -> None:
+    """Atomically demote the sitting treasurer to admin and promote the target.
+
+    Exactly one 'treasurer' row exists afterwards. Rolls back on any error.
+    """
+    with conn:  # implicit transaction
+        conn.execute("UPDATE admins SET role = 'admin' WHERE role = 'treasurer'")
+        conn.execute(
+            "INSERT INTO admins (telegram_user_id, role, added_by)"
+            " VALUES (?, 'treasurer', ?)"
+            " ON CONFLICT(telegram_user_id) DO UPDATE SET role = 'treasurer'",
+            (new_treasurer_id, added_by),
+        )
+
+
+def upsert_relink_request(
+    conn: sqlite3.Connection,
+    *,
+    sutd_id: str,
+    new_telegram_user_id: int,
+    new_username: str | None,
+) -> None:
+    """Record (or replace) the latest 'I am this SUTD member on a new account' note."""
+    conn.execute(
+        "INSERT INTO relink_requests (sutd_id, new_telegram_user_id, new_username)"
+        " VALUES (?, ?, ?)"
+        " ON CONFLICT(sutd_id) DO UPDATE SET"
+        "   new_telegram_user_id = excluded.new_telegram_user_id,"
+        "   new_username = excluded.new_username,"
+        "   requested_at = datetime('now')",
+        (sutd_id, new_telegram_user_id, new_username),
+    )
+    conn.commit()
+
+
+def get_relink_request(
+    conn: sqlite3.Connection, sutd_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM relink_requests WHERE sutd_id = ?", (sutd_id,)
+    ).fetchone()
+
+
+def delete_relink_request(conn: sqlite3.Connection, sutd_id: str) -> None:
+    conn.execute("DELETE FROM relink_requests WHERE sutd_id = ?", (sutd_id,))
+    conn.commit()
+
+
+def reassign_member_telegram_id(
+    conn: sqlite3.Connection, *, old_id: int, new_id: int, new_username: str | None
+) -> None:
+    """Move a member (and their payment/admin history) to a new Telegram id.
+
+    The member PK is the Telegram id, and payments/admins reference it, so the
+    swap needs foreign-key enforcement off briefly. Toggled outside a
+    transaction (a PRAGMA inside one is ignored), then restored in `finally`.
+    """
+    conn.commit()  # ensure no open transaction so the PRAGMA takes effect
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE members SET telegram_user_id = ?, username = ?"
+                " WHERE telegram_user_id = ?",
+                (new_id, new_username, old_id),
+            )
+            conn.execute(
+                "UPDATE payments SET member_id = ? WHERE member_id = ?",
+                (new_id, old_id),
+            )
+            conn.execute(
+                "UPDATE admins SET telegram_user_id = ? WHERE telegram_user_id = ?",
+                (new_id, old_id),
+            )
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def list_all_payments(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Every payment joined to its member and term — the Sheet mirror's source."""
+    rows = conn.execute(
+        "SELECT p.id AS id FROM payments p"
+        " JOIN terms t ON t.id = p.term_id"
+        " ORDER BY t.start_date, p.id"
+    ).fetchall()
+    return [get_payment(conn, row["id"]) for row in rows]

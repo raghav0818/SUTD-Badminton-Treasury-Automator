@@ -339,3 +339,86 @@ def test_term_notification_stamps(conn):
     assert refreshed["start_notified_at"] is not None
     assert refreshed["reminder7_sent_at"] is not None
     assert [t["id"] for t in db.list_terms(conn)] == [term["id"]]
+
+
+# --- Phase 4: admin management, relink, Sheet source --------------------------
+
+
+def test_admin_add_list_remove(conn):
+    _member(conn, 111, "1010001", "Alice")
+    db.ensure_treasurer(conn, 999)
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    assert db.get_role(conn, 111) == "admin"
+    assert 111 in {a["telegram_user_id"] for a in db.list_admins(conn)}
+    db.add_admin(conn, telegram_user_id=111, added_by=999)  # idempotent
+    assert db.get_role(conn, 111) == "admin"
+    assert db.remove_admin(conn, 111) is True
+    assert db.get_role(conn, 111) is None
+    # never removes the treasurer
+    assert db.remove_admin(conn, 999) is False
+    assert db.get_role(conn, 999) == "treasurer"
+
+
+def test_transfer_treasurer_is_atomic(conn):
+    _member(conn, 111, "1010001", "Alice")
+    db.ensure_treasurer(conn, 999)
+    db.transfer_treasurer(conn, new_treasurer_id=111, added_by=999)
+    assert db.get_role(conn, 111) == "treasurer"
+    assert db.get_role(conn, 999) == "admin"
+    assert db.get_treasurer_id(conn) == 111
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM admins WHERE role = 'treasurer'"
+        ).fetchone()["n"]
+        == 1
+    )
+
+
+def test_relink_request_roundtrip(conn):
+    db.upsert_relink_request(
+        conn, sutd_id="1010001", new_telegram_user_id=222, new_username="newacct"
+    )
+    req = db.get_relink_request(conn, "1010001")
+    assert req["new_telegram_user_id"] == 222
+    assert req["new_username"] == "newacct"
+    db.upsert_relink_request(
+        conn, sutd_id="1010001", new_telegram_user_id=333, new_username="newer"
+    )
+    assert db.get_relink_request(conn, "1010001")["new_telegram_user_id"] == 333
+    db.delete_relink_request(conn, "1010001")
+    assert db.get_relink_request(conn, "1010001") is None
+
+
+def test_reassign_member_preserves_payments(conn):
+    _member(conn, 111, "1010001", "Alice")
+    db.update_username(conn, 111, "old")
+    term = _term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    db.reassign_member_telegram_id(conn, old_id=111, new_id=222, new_username="new")
+
+    assert db.get_member(conn, 111) is None
+    moved = db.get_member(conn, 222)
+    assert moved["sutd_id"] == "1010001"
+    assert moved["username"] == "new"
+    pay = db.get_payment_for_member_term(conn, member_id=222, term_id=term["id"])
+    assert pay is not None and pay["status"] == "verified"
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_reassign_carries_admin_role(conn):
+    _member(conn, 111, "1010001", "Alice")
+    db.ensure_treasurer(conn, 999)
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    db.reassign_member_telegram_id(conn, old_id=111, new_id=222, new_username=None)
+    assert db.get_role(conn, 111) is None
+    assert db.get_role(conn, 222) == "admin"
+
+
+def test_list_all_payments_spans_terms(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    payments = db.list_all_payments(conn)
+    assert len(payments) == 1
+    assert payments[0]["full_name"] == "Alice"
+    assert payments[0]["term_name"] == "Term 5"
