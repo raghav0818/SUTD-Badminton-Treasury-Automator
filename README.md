@@ -5,6 +5,23 @@ and verifies payment screenshots automatically. Design doc:
 `docs/superpowers/specs/2026-06-11-club-payment-bot-design.md`. Living status:
 `MEMORY.md`.
 
+**Going live:** see **[`DEPLOY.md`](DEPLOY.md)** for the step-by-step free-VM
+(systemd) deployment and pre-launch checklist.
+
+## Commands
+
+**Members:** `/start` (register / status), `/pay` (get your QR), `/status`,
+`/help`, `/cancel`. After paying, send the payment screenshot to the bot.
+
+**Admins:** `/unpaid`, `/stats`, `/members`, `/settings` (view PayNow config).
+
+**Treasurer (everything admins can do, plus):** `/newterm <name> <fee> <start>
+<end>`, `/markpaid <sutd_id>`, `/remind`, `/audit`, `/flag <sutd_id>`,
+`/revoke <sutd_id>`, `/addadmin <sutd_id>`, `/removeadmin <sutd_id>`,
+`/transfertreasurer <sutd_id>`, `/relink <sutd_id> [new_id]`,
+`/settings set <key> <value>`, `/sync` (refresh the Google Sheet),
+`/backup` (save a database backup).
+
 ## Setup (Windows)
 
 ```powershell

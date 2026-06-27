@@ -172,6 +172,19 @@ make sure that all the requirements are downloaded.
   ├─────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤
   │ /revoke <sutd_id>                   │ Remove a member's paid status (also DMs them).                                                   │
 
+  Phase 4 treasurer commands (added for launch):
+
+  - /addadmin <sutd_id>          Grant a registered member admin access.
+  - /removeadmin <sutd_id>       Remove a member's admin access (never the treasurer).
+  - /transfertreasurer <sutd_id> Hand over the treasurer role (asks you to confirm).
+  - /relink <sutd_id> [new_id]   Move a member to a new Telegram account, keeping
+                                 their payment history. With no new_id, uses the
+                                 pending request from when the new account ran /start.
+  - /settings                    Show the PayNow config. /settings set <key> <value>
+                                 changes it; the UEN/Billing ID ask you to confirm.
+  - /sync                        Refresh the read-only Google Sheet now.
+  - /backup                      Save a database backup now (also runs nightly).
+
 
 
 

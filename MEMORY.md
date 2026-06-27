@@ -17,6 +17,63 @@ FLYMAX account) gets rare exception pings + a weekly audit digest.
 
 ## Current status (update this every session!)
 
+- **2026-06-27 — Phase 4 (admin mgmt, Sheet mirror, launch hardening) built.
+  172 pytest tests pass. Branch `phase4-launch` (not yet merged to main).**
+
+  Spec: `docs/superpowers/specs/2026-06-27-phase4-admin-mirror-and-hardening-design.md`.
+  Plan: `docs/superpowers/plans/2026-06-27-phase4-launch.md`. Built core spine
+  inline + three leaf modules by parallel subagents; Codex reviewed twice and its
+  findings were applied.
+
+  **New modules**
+  - `clubbot/admin_manage.py` — treasurer-only `/addadmin`, `/removeadmin`,
+    `/transfertreasurer` (two-step confirm; promotes target, demotes old treasurer
+    to admin), `/relink <sutd_id> [new_id]` (two-step confirm; reassigns the member
+    PK + payment history to a new Telegram account). Confirms via inline buttons.
+  - `clubbot/paynow_config.py` — settings-backed `PayNowConfig` (uen, merchant_name,
+    bill_number, recipient_match) defaulting to the verified `payments.SCHOOL_*`
+    constants. `/settings` shows config; `/settings set <key> <value>` is
+    treasurer-only and requires Confirm for routing-critical keys (paynow_uen,
+    bill_number). `set_value` rejects values that can't build a valid PayNow payload.
+    QR build + verification read the effective config so they always agree.
+  - `clubbot/sheets.py` — read-only Google Sheet mirror (gspread). `SheetMirror`
+    full-rebuilds Members+Payments tabs; `SheetSyncer` coalesces rapid changes into
+    one debounced rebuild on its OWN per-rebuild sqlite connection (worker thread),
+    failure-isolated. Disabled cleanly if unconfigured (`create_mirror_from_env`→None).
+  - `clubbot/ops.py` — robustness: global `on_error` (logs + rate-limited treasurer
+    DM), `RateLimiter` (per-user receipt throttle), `backup_database` (SQLite online
+    backup, keeps 14), `chunk_text`/`reply_long` (4096-char split), `mark_dirty`.
+
+  **Schema/db (auto-migrated, additive)**
+  - New `relink_requests(sutd_id PK, new_telegram_user_id, new_username, requested_at)`.
+  - `connect()` sets WAL + busy_timeout. New `idx_one_treasurer` partial unique index
+    is created in `_migrate` AFTER a dedup pass (so an older 2-treasurer DB self-heals,
+    not crashes).
+  - New queries: add_admin/remove_admin/list_admins/transfer_treasurer (atomic),
+    upsert/get/delete_relink_request, reassign_member_telegram_id (FK-off swap +
+    foreign_key_check before commit), list_all_payments.
+
+  **Integration (clubbot/bot.py, admin.py, scheduler.py, config.py, __main__.py)**
+  - Registered all new command + confirm-callback handlers; added `app.add_error_handler`.
+  - QR build (`/pay`, term-start blast) and receipt verification pass the effective
+    PayNow config. Receipt path is rate-limited before any Gemini call.
+  - Registration's "SUTD taken" branch records a relink request. `/members` `/unpaid`
+    use `reply_long`. Sheet `mark_dirty` after register/verify/exception/markpaid/
+    flag/revoke/approve/reject/relink/newterm. New daily jobs: backup (03:00 SGT),
+    Sheet rebuild (04:00 SGT). New env: `GOOGLE_SERVICE_ACCOUNT_JSON`, `SHEET_ID`.
+    New deps: `gspread`, `google-auth`.
+
+  **Also fixed:** the 3 red tests from a too-strict SUTD-ID validator — real IDs DO
+  start with `1010` (treasurer confirmed); fixtures corrected, validator unchanged.
+  `on_confirm` now catches a duplicate-SUTD IntegrityError race.
+
+  **Not yet done / next**
+  - `DEPLOY.md` written (Oracle Always Free + systemd). Gemini decision: **paid key**.
+  - Branch `phase4-launch` not merged to main and not yet run on real Telegram.
+  - Treasurer still to: provide real term fee/dates, do the pre-launch checklist in
+    DEPLOY.md §12 (wipe test `clubbot.db`, register 2-3 real members, one real S$20
+    E2E), and set up the Google service account if using the Sheet mirror.
+
 - **2026-06-20 (later) — Phase 3 (lifecycle & auditing) built. 107 pytest tests pass.**
 
   Implemented in one push, kept in clean modules that follow the existing
@@ -298,10 +355,11 @@ FLYMAX account) gets rare exception pings + a weekly audit digest.
 4. ~~Phase 3 — lifecycle and auditing~~ ✅ done 2026-06-20. Term-start blast +
    day-7 reminder, weekly flag-only FLYMAX audit digest, `/unpaid` `/stats`
    `/members` `/markpaid` `/remind` `/audit` `/flag` `/revoke`, restart-safe jobs.
-5. **Next engineering phase: Phase 4 — admin management & mirror.** `/addadmin`,
-   `/removeadmin`, `/transfertreasurer`, `/relink <sutd_id>` (member changed
-   Telegram account — already referenced in registration text), `/settings`
-   (PayNow proxy / merchant name editable), and the read-only Google Sheet mirror.
+5. ~~Phase 4 — admin management & mirror~~ ✅ done 2026-06-27 (branch
+   `phase4-launch`). `/addadmin` `/removeadmin` `/transfertreasurer` `/relink`
+   `/settings` `/sync` `/backup`, Google Sheet mirror, and a robustness/security
+   layer. Codex-reviewed; 172 tests pass. **Next: merge to main, then deploy per
+   `DEPLOY.md` and run the pre-launch checklist on real Telegram.**
 6. Watch the first live term: confirm the term-start blast and day-7 nudge fire on
    schedule, and that a reboot mid-term does not re-blast (the `_notified_at`
    stamps should prevent it).

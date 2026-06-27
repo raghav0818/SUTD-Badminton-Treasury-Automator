@@ -27,7 +27,17 @@
   require it. Verify Billing ID, amount, recipient, full timestamp after QR
   issue, and globally unique image hash + normalized bank reference instead.
 - `receipt_fingerprints` is permanent anti-reuse history. Never clear it between
-  terms, and back up `clubbot.db`.
+  terms, and back up `clubbot.db` (and the `backups/` directory it writes).
+- Phases 3 and 4 are implemented: lifecycle/reminders/audit; admin management
+  (`/addadmin` `/removeadmin` `/transfertreasurer`), account `/relink`, editable
+  PayNow `/settings`, the read-only Google Sheet mirror, plus a robustness layer
+  (global error handler, per-user receipt rate limiting, WAL, daily backups).
+- Routing-critical settings (`paynow_uen`, `bill_number`) require an in-bot
+  confirmation before they change — a wrong value silently breaks DBS FLYMAX
+  routing (Phase 0). The QR build and receipt verification read the effective
+  PayNow config, so they always agree.
+- Deploy/run guidance lives in `DEPLOY.md`. The Google Sheet mirror is optional
+  and isolated: a Sheets failure is logged and never blocks a member's flow.
 
 ## Stack
 
