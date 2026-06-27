@@ -40,15 +40,23 @@ class VerificationResult:
         return self.outcome == "verified"
 
 
-def build_member_qr(*, fee_cents: int, reference: str) -> bytes:
-    """Build a locked-amount QR while preserving the school's routing Billing ID."""
+DEFAULT_RECIPIENT_MATCH = "SINGAPOREUNIVERSITYOF"
+
+
+def build_member_qr(*, fee_cents: int, reference: str, config=None) -> bytes:
+    """Build a locked-amount QR while preserving the school's routing Billing ID.
+
+    `config` is any object exposing `.uen`, `.merchant_name`, `.bill_number`
+    (e.g. ``paynow_config.PayNowConfig``). When omitted, the school's verified
+    constants are used, so existing callers and tests are unaffected.
+    """
     if fee_cents <= 0:
         raise ValueError("fee must be positive")
     payload = paynow.build_payload(
-        uen=SCHOOL_UEN,
-        merchant_name=SCHOOL_MERCHANT_NAME,
+        uen=config.uen if config else SCHOOL_UEN,
+        merchant_name=config.merchant_name if config else SCHOOL_MERCHANT_NAME,
         amount=Decimal(fee_cents) / Decimal(100),
-        bill_number=SCHOOL_BILL_NUMBER,
+        bill_number=config.bill_number if config else SCHOOL_BILL_NUMBER,
         reference_label=reference,
     )
     return qrgen.render_png(payload)
@@ -72,8 +80,17 @@ def verify_extracted_payment(
     qr_issued_at: str,
     now: datetime | None = None,
     duplicate_transaction: bool = False,
+    config=None,
 ) -> VerificationResult:
-    """Apply rules that, unlike the vision model, are deterministic and auditable."""
+    """Apply rules that, unlike the vision model, are deterministic and auditable.
+
+    `config` (duck-typed `.recipient_match`, `.bill_number`) lets the treasurer
+    re-point the bot at a new school account via `/settings` without code edits.
+    When omitted, the verified school constants are used.
+    """
+    recipient_match = config.recipient_match if config else DEFAULT_RECIPIENT_MATCH
+    expected_bill = config.bill_number if config else SCHOOL_BILL_NUMBER
+
     if not extracted.readable:
         return VerificationResult("retry", ("The screenshot is unreadable.",))
     if not extracted.is_success_screen:
@@ -88,10 +105,10 @@ def verify_extracted_payment(
         )
 
     recipient = _normalise_text(extracted.recipient)
-    if "SINGAPOREUNIVERSITYOF" not in recipient:
+    if recipient_match not in recipient:
         reasons.append("Recipient does not match the SUTD account.")
 
-    if _normalise_text(extracted.billing_id) != _normalise_text(SCHOOL_BILL_NUMBER):
+    if _normalise_text(extracted.billing_id) != _normalise_text(expected_bill):
         reasons.append("Billing ID does not match the club's DBS FLYMAX account.")
 
     try:

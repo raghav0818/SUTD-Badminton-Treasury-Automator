@@ -1,4 +1,5 @@
 import io
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import zxingcpp
@@ -11,6 +12,16 @@ from clubbot.payments import (
     build_member_qr,
     verify_extracted_payment,
 )
+
+
+@dataclass(frozen=True)
+class _StubConfig:
+    """Stand-in for paynow_config.PayNowConfig (duck-typed, no import cycle)."""
+
+    uen: str = "200913519CSL5XYZ"
+    merchant_name: str = "NEW SCHOOL ACCOUNT"
+    bill_number: str = "NEWBILL000111"
+    recipient_match: str = "NEWSCHOOLACCOUNT"
 
 
 def valid_extraction(**overrides):
@@ -125,3 +136,31 @@ def test_timestamp_without_timezone_is_rejected():
     )
     assert result.outcome == "exception"
     assert "no timezone" in result.reasons[0]
+
+
+# --- Phase 4: settings-backed PayNow config -----------------------------------
+
+
+def test_build_qr_uses_config_bill_number():
+    cfg = _StubConfig()
+    png = build_member_qr(fee_cents=2000, reference="BDM-1-X", config=cfg)
+    result = zxingcpp.read_barcode(Image.open(io.BytesIO(png)))
+    extra = paynow.parse_tlv(paynow.parse_tlv(result.text)["62"])
+    assert extra["01"] == cfg.bill_number  # routing bill number swapped
+
+
+def test_verify_uses_config_recipient_and_bill():
+    cfg = _StubConfig()
+    result = verify_extracted_payment(
+        valid_extraction(recipient="New School Account", billing_id=cfg.bill_number),
+        expected_fee_cents=5,
+        term_start="2026-06-01",
+        term_end="2026-06-30",
+        qr_issued_at="2026-06-20T02:30:00+00:00",
+        now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
+        config=cfg,
+    )
+    joined = " ".join(result.reasons)
+    assert "Billing ID" not in joined
+    assert "Recipient" not in joined
+    assert result.passed
