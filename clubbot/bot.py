@@ -427,8 +427,8 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         payment_timestamp=extracted.payment_timestamp,
         verified_by="auto" if result.passed else None,
     )
+    ops.mark_dirty(context)  # verified or exception — both change the Payments sheet
     if result.passed:
-        ops.mark_dirty(context)
         await update.message.reply_text(
             f"Payment receipt accepted.\n\n{term['name']}\n"
             f"Amount: {money(term['fee_cents'])}\nStatus: Verified"
@@ -498,8 +498,7 @@ async def on_payment_review(
         )
         return
     approved = action == "approve"
-    if approved:
-        ops.mark_dirty(context)
+    ops.mark_dirty(context)  # approve or reject — both change the Payments sheet
     await query.edit_message_text(
         f"Payment {'approved' if approved else 'rejected'} for "
         f"{payment['full_name']} ({payment['term_name']})."

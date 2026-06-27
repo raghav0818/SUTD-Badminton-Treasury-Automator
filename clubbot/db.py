@@ -86,6 +86,11 @@ CREATE TABLE IF NOT EXISTS relink_requests (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_member_term
     ON payments(member_id, term_id);
+
+-- Enforce "at most one treasurer" at the storage layer, so a logic slip or a
+-- race can never leave the club with two treasurers.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_treasurer
+    ON admins(role) WHERE role = 'treasurer';
 """
 
 
@@ -832,6 +837,9 @@ def reassign_member_telegram_id(
                 "UPDATE admins SET telegram_user_id = ? WHERE telegram_user_id = ?",
                 (new_id, old_id),
             )
+            # Safety net: confirm no dangling references before committing.
+            if conn.execute("PRAGMA foreign_key_check").fetchall():
+                raise ValueError("reassignment would break referential integrity")
     finally:
         conn.execute("PRAGMA foreign_keys = ON")
 

@@ -85,6 +85,22 @@ def test_set_value_normalises_recipient_match(conn):
     assert db.get_setting(conn, "recipient_match") == "NEWSCHOOL"
 
 
+def test_set_value_rejects_unencodable_routing_values(conn):
+    # Too long for an EMVCo TLV field, and non-ASCII: both would break QR build.
+    with pytest.raises(ValueError):
+        paynow_config.set_value(conn, "bill_number", "X" * 200)
+    with pytest.raises(ValueError):
+        paynow_config.set_value(conn, "paynow_uen", "café")
+    # Nothing was persisted.
+    assert db.get_setting(conn, "bill_number") is None
+    assert db.get_setting(conn, "paynow_uen") is None
+
+
+def test_set_value_accepts_valid_routing_value(conn):
+    stored = paynow_config.set_value(conn, "bill_number", "200913519CSL5EIU000000001")
+    assert db.get_setting(conn, "bill_number") == stored
+
+
 # --- cmd_settings (read view) -------------------------------------------------
 
 

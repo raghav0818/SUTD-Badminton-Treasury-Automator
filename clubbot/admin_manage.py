@@ -5,7 +5,7 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from clubbot import admin, db
+from clubbot import admin, db, ops
 
 NOT_TREASURER_CALLBACK = "Only the treasurer can do this."
 
@@ -191,6 +191,7 @@ async def on_relink_confirm(
         new_username=pending["new_username"],
     )
     db.delete_relink_request(conn, pending["sutd_id"])
+    ops.mark_dirty(context)
     await query.edit_message_text(
         f"Relinked SUTD {pending['sutd_id']} to the new account."
     )

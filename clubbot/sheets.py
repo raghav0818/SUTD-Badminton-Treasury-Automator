@@ -115,12 +115,16 @@ class SheetSyncer:
 
     Many DB writes in quick succession collapse into a single debounced rebuild,
     and any rebuild failure is logged but never propagated to the caller (the
-    nightly rebuild is the backstop).
+    nightly rebuild is the backstop). Each rebuild opens its OWN short-lived
+    SQLite connection inside the worker thread, so the bot's main connection is
+    never used from two threads at once.
     """
 
-    def __init__(self, mirror: SheetMirror, conn: sqlite3.Connection, *, debounce_seconds: float = 5.0) -> None:
+    def __init__(
+        self, mirror: SheetMirror, db_path: str, *, debounce_seconds: float = 5.0
+    ) -> None:
         self._mirror = mirror
-        self._conn = conn
+        self._db_path = db_path
         self._debounce = debounce_seconds
         self._dirty = False
         self._task = None
@@ -138,14 +142,25 @@ class SheetSyncer:
         await asyncio.sleep(self._debounce)
         await self._run_now()
 
-    async def _run_now(self) -> None:
-        if not self._dirty:
-            return
-        self._dirty = False
+    def _rebuild(self) -> None:
+        """Open a private connection, rebuild, close. Runs in a worker thread."""
+        conn = sqlite3.connect(self._db_path)
         try:
-            await asyncio.to_thread(self._mirror.full_rebuild, self._conn)
-        except Exception:
-            log.warning("Google Sheet rebuild failed; continuing", exc_info=True)
+            conn.row_factory = sqlite3.Row
+            self._mirror.full_rebuild(conn)
+        finally:
+            conn.close()
+
+    async def _run_now(self) -> None:
+        # Loop so a mark that arrives mid-rebuild is not lost (it set _dirty
+        # again while we were awaiting); a persistent failure ends the loop
+        # because _dirty stays False unless a fresh mark sets it.
+        while self._dirty:
+            self._dirty = False
+            try:
+                await asyncio.to_thread(self._rebuild)
+            except Exception:
+                log.warning("Google Sheet rebuild failed; continuing", exc_info=True)
 
 
 def create_mirror_from_env(

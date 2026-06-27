@@ -12,12 +12,13 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from clubbot import db, payments
+from clubbot import db, paynow, payments
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ SETTING_KEYS = {
 }
 EDITABLE_KEYS = set(SETTING_KEYS)
 ROUTING_CRITICAL = {"paynow_uen", "bill_number"}
+# Keys whose value is embedded in the QR payload and must form a valid EMVCo/
+# PayNow field (ASCII, length-bounded). recipient_match is verify-only, so it is
+# not in this set.
+QR_PAYLOAD_KEYS = {"paynow_uen", "merchant_name", "bill_number"}
 
 # settings-table key -> default drawn from the verified school constants.
 _DEFAULTS = {
@@ -82,6 +87,20 @@ def set_value(conn: sqlite3.Connection, key: str, value: str) -> str:
             raise ValueError("value has no alphanumeric characters")
     else:
         stored = value.strip()
+    if key in QR_PAYLOAD_KEYS:
+        # Reject anything the EMVCo/PayNow builder cannot encode (non-ASCII,
+        # too long): a bad routing value would otherwise break every future QR.
+        candidate = replace(get_paynow_config(conn), **{SETTING_KEYS[key]: stored})
+        try:
+            paynow.build_payload(
+                uen=candidate.uen,
+                merchant_name=candidate.merchant_name,
+                amount=Decimal("0.05"),
+                bill_number=candidate.bill_number,
+                reference_label="BDMTEST",
+            )
+        except Exception as exc:
+            raise ValueError(f"not a valid PayNow {key}: {exc}") from exc
     db.set_setting(conn, key, stored)
     return stored
 
@@ -151,8 +170,17 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    stored = set_value(conn, key, value)
-    await update.message.reply_text(f"Updated {key} to: {stored}")
+    try:
+        stored = set_value(conn, key, value)
+    except ValueError as exc:
+        await update.message.reply_text(f"Could not update {key}: {exc}")
+        return
+    note = ""
+    if key == "merchant_name":
+        # The receipt check uses recipient_match (the bank's registered name),
+        # which is independent of this QR label — remind the treasurer.
+        note = "\nNote: receipt verification uses 'recipient_match', not this."
+    await update.message.reply_text(f"Updated {key} to: {stored}{note}")
 
 
 async def on_settings_confirm(
@@ -175,5 +203,11 @@ async def on_settings_confirm(
         await query.edit_message_text("Settings change cancelled.")
         return
 
-    stored = set_value(conn, change["key"], change["value"])
+    try:
+        stored = set_value(conn, change["key"], change["value"])
+    except ValueError as exc:
+        await query.edit_message_text(
+            f"Could not update {change['key']}: {exc}"
+        )
+        return
     await query.edit_message_text(f"Updated {change['key']} to: {stored}")

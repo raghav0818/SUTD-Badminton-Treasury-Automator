@@ -133,7 +133,7 @@ def test_full_rebuild_creates_and_populates_worksheets(seeded_conn):
 
 def test_mark_dirty_coalesces_into_single_rebuild():
     mirror = MagicMock()
-    syncer = sheets.SheetSyncer(mirror, conn=None, debounce_seconds=0)
+    syncer = sheets.SheetSyncer(mirror, db_path=":memory:", debounce_seconds=0)
 
     async def scenario():
         syncer.mark_dirty()
@@ -151,12 +151,29 @@ def test_mark_dirty_coalesces_into_single_rebuild():
 def test_run_now_swallows_rebuild_errors():
     mirror = MagicMock()
     mirror.full_rebuild.side_effect = RuntimeError("boom")
-    syncer = sheets.SheetSyncer(mirror, conn=None, debounce_seconds=0)
+    syncer = sheets.SheetSyncer(mirror, db_path=":memory:", debounce_seconds=0)
     syncer._dirty = True
 
     # Must not raise even though full_rebuild blows up.
     asyncio.run(syncer._run_now())
     mirror.full_rebuild.assert_called_once()
+
+
+def test_run_now_reruns_when_marked_during_rebuild():
+    # A mark that lands while a rebuild is in flight must not be lost.
+    mirror = MagicMock()
+    syncer = sheets.SheetSyncer(mirror, db_path=":memory:", debounce_seconds=0)
+    calls = {"n": 0}
+
+    def rebuild(conn):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            syncer._dirty = True  # simulate a DB write during the first rebuild
+
+    mirror.full_rebuild.side_effect = rebuild
+    syncer._dirty = True
+    asyncio.run(syncer._run_now())
+    assert calls["n"] == 2
 
 
 # (e) create_mirror_from_env guards -------------------------------------------

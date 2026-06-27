@@ -25,7 +25,7 @@ def main() -> None:
     mirror = sheets.create_mirror_from_env(
         cfg.google_service_account_json, cfg.sheet_id
     )
-    syncer = sheets.SheetSyncer(mirror, conn) if mirror is not None else None
+    syncer = sheets.SheetSyncer(mirror, cfg.db_path) if mirror is not None else None
     if syncer is None:
         logging.getLogger(__name__).info(
             "Google Sheet mirror not configured; skipping Sheet sync."
