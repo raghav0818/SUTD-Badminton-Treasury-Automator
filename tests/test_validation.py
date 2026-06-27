@@ -16,7 +16,7 @@ def test_name_allows_non_ascii():
 
 
 def test_sutd_id_accepts_seven_digits():
-    assert validation.normalize_sutd_id(" 1007654 ") == "1007654"
+    assert validation.normalize_sutd_id(" 1010765 ") == "1010765"
 
 
 def test_sutd_id_rejects_bad_input():

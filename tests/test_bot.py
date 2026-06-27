@@ -67,16 +67,16 @@ def test_full_registration_flow(conn):
     update = make_update(text="Alice Tan")
     assert asyncio.run(bot.on_name(update, context)) == bot.ASK_SUTD_ID
 
-    update = make_update(text="1007654")
+    update = make_update(text="1010765")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
-    assert "1007654" in reply_text_of(update)
+    assert "1010765" in reply_text_of(update)
 
     update = make_update(text="yes")
     assert asyncio.run(bot.on_confirm(update, context)) == ConversationHandler.END
 
     member = db.get_member(conn, 111)
     assert member["full_name"] == "Alice Tan"
-    assert member["sutd_id"] == "1007654"
+    assert member["sutd_id"] == "1010765"
     assert member["username"] == "alice"
 
 
@@ -95,11 +95,11 @@ def test_invalid_sutd_id_reprompts(conn):
 
 def test_duplicate_sutd_id_blocked(conn):
     db.add_member(
-        conn, telegram_user_id=999, full_name="Bob Lim", sutd_id="1007654", username=None
+        conn, telegram_user_id=999, full_name="Bob Lim", sutd_id="1010765", username=None
     )
     context = make_context(conn)
     context.user_data["full_name"] = "Alice Tan"
-    update = make_update(text="1007654")
+    update = make_update(text="1010765")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.ASK_SUTD_ID
     assert "already registered" in reply_text_of(update)
 

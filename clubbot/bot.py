@@ -157,13 +157,19 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     answer = update.message.text.strip().lower()
     if answer in ("yes", "y"):
         user = update.effective_user
-        db.add_member(
-            _db(context),
-            telegram_user_id=user.id,
-            full_name=context.user_data["full_name"],
-            sutd_id=context.user_data["sutd_id"],
-            username=user.username,
-        )
+        try:
+            db.add_member(
+                _db(context),
+                telegram_user_id=user.id,
+                full_name=context.user_data["full_name"],
+                sutd_id=context.user_data["sutd_id"],
+                username=user.username,
+            )
+        except sqlite3.IntegrityError:
+            # Two accounts confirmed the same SUTD ID (or this one) at once.
+            context.user_data.clear()
+            await update.message.reply_text(SUTD_ID_TAKEN)
+            return ConversationHandler.END
         name = context.user_data["full_name"]
         context.user_data.clear()
         await update.message.reply_text(REGISTERED.format(name=name))
