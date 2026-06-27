@@ -1,12 +1,19 @@
 # Going Live — SUTD Badminton Club Bot
 
-This guide takes the bot from a working build to a 24/7 service on a **free cloud
-Linux VM**. It is written for the treasurer, not a professional sysadmin — follow
-it top to bottom. Lines starting with `$` are commands you type in the server's
-terminal.
+This guide takes the bot from a working build to a 24/7 service on a **Linux
+machine** — either a free cloud VM, or a **Raspberry Pi / old laptop you own** (no
+credit card needed). It is written for the treasurer, not a professional
+sysadmin — follow it top to bottom. Lines starting with `$` are commands you type
+in the machine's terminal.
 
 The bot uses **long-polling**, so it needs no domain, no HTTPS, and no open ports.
 It only needs to stay running and reach the internet.
+
+> **No credit card?** Cloud providers (Oracle/AWS/GCP) ask for a card only to
+> verify identity — Always Free never charges it, and a **debit card** or a
+> **Revolut/YouTrip/Wise virtual card** usually works. If you have none, use the
+> **self-host** option in Section 1 — a Raspberry Pi or an old laptop runs this
+> bot fine and costs nothing to keep online.
 
 ---
 
@@ -26,23 +33,54 @@ It only needs to stay running and reach the internet.
 
 ---
 
-## 1. Create the VM
+## 1. Pick where it runs
 
-**Oracle Cloud Always Free** is recommended (genuinely free forever, generous):
+Choose **one**. Either way you end up SSH'd into a Linux machine running **Ubuntu
+24.04** (which ships Python 3.12, exactly what the bot needs), and Sections 2–12
+are then identical.
 
-1. Sign up at <https://www.oracle.com/cloud/free/>.
+### Option A — free cloud VM (needs a card for verification)
+
+**Oracle Cloud Always Free** (genuinely free forever):
+
+1. Sign up at <https://www.oracle.com/cloud/free/> (a debit or virtual card works).
 2. Create a **Compute instance** → image **Canonical Ubuntu 24.04**, shape
-   **VM.Standard.A1.Flex** (Ampere/ARM, Always Free eligible) or **E2.1.Micro**.
-3. Download the SSH private key when prompted.
-4. Note the instance's **public IP**.
+   **VM.Standard.A1.Flex** (Ampere/ARM) or **E2.1.Micro**.
+3. Download the SSH private key; note the instance's **public IP**.
+4. SSH in: `ssh -i /path/to/your-key ubuntu@YOUR_PUBLIC_IP`
 
-(Alternative: a **GCP e2-micro** in a free-tier region works the same way.)
+(A **GCP e2-micro** free-tier VM works the same way.)
 
-Then SSH in from your own computer:
+### Option B — self-host on a Raspberry Pi or old laptop (no card)
 
-```
-$ ssh -i /path/to/your-key ubuntu@YOUR_PUBLIC_IP
-```
+This is the best no-card option: free (or ~S$60 once for a Pi), and truly 24/7.
+
+**Install Ubuntu 24.04 on the device:**
+
+- **Raspberry Pi** (a Pi 4 or 5 is ideal; a Pi Zero 2 W also works): install the
+  [Raspberry Pi Imager](https://www.raspberrypi.com/software/) on your normal PC,
+  insert the SD card, and choose **Ubuntu Server 24.04 LTS (64-bit)** as the OS.
+  Click the gear/⚙ (Edit Settings) and set: a **hostname** (e.g. `clubbot`),
+  **enable SSH**, a **username + password**, and your **Wi-Fi** name/password.
+  Write the card, put it in the Pi, and power it on.
+- **Old laptop:** download the **Ubuntu Server 24.04 LTS** ISO, write it to a USB
+  stick with [balenaEtcher](https://etcher.balena.io/), boot the laptop from the
+  USB, and install (this erases the laptop — back up anything you want first).
+  During install, tick **"Install OpenSSH server"**.
+
+**Find the device's IP and SSH in from your normal PC:**
+
+- On the device's own screen you can run `hostname -I` to see its IP, or check
+  your home router's device list. Then from your PC:
+  `ssh your-username@DEVICE_IP` (use the username you set during install).
+
+**Keep it awake and stable (do this once it's set up):**
+
+- **Old laptop:** stop it sleeping when you close the lid —
+  `sudo sed -i 's/#HandleLidSwitch=suspend/HandleLidSwitch=ignore/' /etc/systemd/logind.conf && sudo systemctl restart systemd-logind`
+- Prefer a **wired Ethernet** connection if you can; leave the device **plugged
+  into power**. Off-device backups (Section 11) matter even more here, since SD
+  cards can wear out — copying backups to your PC protects the payment records.
 
 ## 2. Install system dependencies
 
@@ -182,10 +220,13 @@ The database holds your members, payment records, and the **permanent
 `backups/clubbot-YYYYMMDD-HHMMSS.db` (03:00 SGT) and keeps the most recent 14,
 and you can take one anytime with the `/backup` command.
 
-**Also copy backups off the VM** so a lost VM does not lose your data. From your
-own computer, periodically:
+**Also copy backups off the device** so a lost VM or a dead SD card does not lose
+your data. From your own computer, periodically:
 
 ```
+# Raspberry Pi / old laptop (use the username + IP you set up):
+$ scp "your-username@DEVICE_IP:clubbot/backups/*" ./clubbot-backups/
+# Oracle/cloud VM (add the key file):
 $ scp -i /path/to/your-key "ubuntu@YOUR_PUBLIC_IP:clubbot/backups/*" ./clubbot-backups/
 ```
 
@@ -237,4 +278,4 @@ Start the real launch from a clean database:
 | "Receipt verification is not configured" | `GEMINI_API_KEY` is set in `.env`, then restart |
 | Sheet not updating | service-account JSON path + `SHEET_ID` correct, Sheet shared as Editor; run `/sync` |
 | Crash loop after an update | `journalctl -u clubbot -e` for the traceback; `git pull` may need `pip install -r requirements.txt` |
-| Lost the VM | restore the latest off-box backup onto a fresh VM (Sections 1–9 + 11) |
+| Lost the VM / dead SD card | restore the latest off-device backup onto a fresh machine (Sections 1–9 + 11) |
