@@ -25,7 +25,17 @@ changing payment or verification logic.
   renamed 2026-07-14). Scheduled jobs are unit-tested but not yet observed
   over a real multi-day term.
 - **A version is deployed and running on the treasurer's Raspberry Pi 4**
-  as of 2026-07-14; keep it updated via `git pull` + service restart.
+  as of 2026-07-14. Pi layout: user `blud`, host `blud.local`, code at
+  `~/clubbot`, systemd service `clubbot` installed by `deploy/setup_pi.sh`
+  (idempotent — re-run it after every code copy). Update flow = scp the
+  code + secrets from this folder, then re-run the script (README has the
+  exact commands).
+- **Beware a stale parallel copy:** the Pi was first deployed from a second
+  working copy at `Documents\SUTD Projects\Badmintion Tele Bot` (different
+  remote, `badminton-tele-bot`, stuck at its first commit — another session
+  worked there on 2026-07-13 and wrote the original setup_pi.sh, since
+  adopted here). THIS repo (`SUTD-Badminton-Treasury-Automator`) is the
+  source of truth; do not work in or deploy from the old folder.
 - **Deployment target:** Raspberry Pi 4, systemd (`deploy/clubbot.service`),
   24/7. `scripts/preflight.py` verifies the Telegram/Gemini/Sheet secrets.
 - **Last known blockers (treasurer's side, 2026-07-14):** Google Sheet not yet

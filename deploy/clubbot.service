@@ -1,16 +1,14 @@
-# systemd unit for the SUTD Badminton Club payment bot (PRD Phase 5).
-# Install: sudo cp deploy/clubbot.service /etc/systemd/system/
-#          sudo systemctl daemon-reload && sudo systemctl enable --now clubbot
+# systemd service template — deploy/setup_pi.sh fills in {{USER}} and {{DIR}}
+# and installs it as /etc/systemd/system/clubbot.service. Don't install by hand.
 [Unit]
 Description=SUTD Badminton Club payment bot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-User=clubbot
-WorkingDirectory=/opt/clubbot
-ExecStart=/opt/clubbot/.venv/bin/python -m clubbot
+User={{USER}}
+WorkingDirectory={{DIR}}
+ExecStart={{DIR}}/.venv/bin/python -m clubbot
 # 24/7 unattended: restart on any exit, but back off so a crash loop
 # (bad .env, no network) does not hammer the Telegram API.
 Restart=always

@@ -82,44 +82,37 @@ changes nothing.
 
 ---
 
-## Deploy on the Raspberry Pi 4 (24/7)
+## Deploy / update on the Raspberry Pi 4 (24/7)
 
-One-time, on the Pi (Raspberry Pi OS 64-bit):
+The bot lives at `~/clubbot` on the Pi. The SAME two steps do both the first
+install and every later update — `setup_pi.sh` is safe to re-run.
 
-```bash
-sudo apt update && sudo apt install -y git python3-venv
-sudo useradd -r -m -d /opt/clubbot clubbot
-sudo -u clubbot git clone https://github.com/raghav0818/SUTD-Badminton-Treasury-Automator.git /opt/clubbot
-cd /opt/clubbot
-sudo -u clubbot python3 -m venv .venv
-sudo -u clubbot .venv/bin/pip install -r requirements.txt
-```
-
-Copy the two secret files from your PC (run on the PC, in the project folder):
+**Step 1 — copy the code + secrets from the PC** (run in THIS project folder;
+replace `<user>@<pi>` with your Pi login, e.g. `blud@blud.local`):
 
 ```powershell
-scp .env service-account.json <username>@<pi-ip-address>:/tmp/
+ssh <user>@<pi> "mkdir -p clubbot"
+scp -r clubbot scripts deploy requirements.txt .env service-account.json <user>@<pi>:clubbot/
 ```
 
-Back on the Pi:
+**Step 2 — install/restart on the Pi** (in an ssh window):
 
 ```bash
-sudo mv /tmp/.env /tmp/service-account.json /opt/clubbot/
-sudo chown clubbot:clubbot /opt/clubbot/.env /opt/clubbot/service-account.json
-sudo -u clubbot /opt/clubbot/.venv/bin/python /opt/clubbot/scripts/preflight.py  # all PASS
-sudo cp /opt/clubbot/deploy/clubbot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now clubbot
+bash ~/clubbot/deploy/setup_pi.sh
+~/clubbot/.venv/bin/python ~/clubbot/scripts/preflight.py   # all lines PASS
 ```
 
+The script ends by printing the service status — look for `active (running)`.
 The service restarts itself after crashes and reboots. Long-polling means no
 port forwarding — home Wi-Fi is fine.
 
 ### Daily database backup (do this — the DB is irreplaceable)
 
+On the Pi (replace `<user>` with your Pi username):
+
 ```bash
-sudo -u clubbot mkdir -p /opt/clubbot/backups
-echo '0 3 * * * clubbot cp /opt/clubbot/clubbot.db /opt/clubbot/backups/clubbot-$(date +\%F).db' | sudo tee /etc/cron.d/clubbot-backup
+mkdir -p ~/clubbot/backups
+echo '0 3 * * * <user> cp /home/<user>/clubbot/clubbot.db /home/<user>/clubbot/backups/clubbot-$(date +\%F).db' | sudo tee /etc/cron.d/clubbot-backup
 ```
 
 ### Operating it
@@ -128,8 +121,10 @@ echo '0 3 * * * clubbot cp /opt/clubbot/clubbot.db /opt/clubbot/backups/clubbot-
 journalctl -u clubbot -f              # watch live logs
 sudo systemctl restart clubbot        # restart
 sudo systemctl stop clubbot           # stop
-cd /opt/clubbot && sudo -u clubbot git pull && sudo systemctl restart clubbot   # update to latest code
 ```
+
+To update the code later: redo Step 1 + Step 2 above. Never run the bot on
+the PC while the Pi service is running — two copies fight over Telegram.
 
 ### Before the first real term
 
@@ -137,7 +132,7 @@ Delete the test data ONCE, before any real member pays:
 
 ```bash
 sudo systemctl stop clubbot
-sudo -u clubbot rm /opt/clubbot/clubbot.db
+rm ~/clubbot/clubbot.db
 sudo systemctl start clubbot
 ```
 
