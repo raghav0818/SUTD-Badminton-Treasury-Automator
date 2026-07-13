@@ -38,10 +38,29 @@ changing payment or verification logic.
   source of truth; do not work in or deploy from the old folder.
 - **Deployment target:** Raspberry Pi 4, systemd (`deploy/clubbot.service`),
   24/7. `scripts/preflight.py` verifies the Telegram/Gemini/Sheet secrets.
-- **Last known blockers (treasurer's side, 2026-07-14):** Google Sheet not yet
+- **PAUSED MID-TASK 2026-07-14 ~01:15 SGT — resume here next session.**
+  Updating the Pi to the latest code is INCOMPLETE and the Pi's `clubbot`
+  service is CRASH-LOOPING (`ImportError: cannot import name 'admin'` — the
+  Pi has a half-mixed old/new copy; harmless to leave overnight, systemd just
+  keeps retrying). Diagnosis: the Pi's first deploy left files under
+  `~/clubbot` owned by root, so the treasurer's `scp`/`rm` as user `blud`
+  hit "Permission denied" and copies were partial. The treasurer was given
+  this sequence but stopped for the day, still unable to complete it —
+  verify each step's output next time, and if `sudo chown` itself errors,
+  get the exact message:
+  1. Pi: `sudo chown -R blud:blud ~/clubbot`
+  2. Pi: `rm -rf ~/clubbot/clubbot ~/clubbot/scripts ~/clubbot/deploy`
+  3. PC (GitHub folder): `scp -r clubbot scripts deploy requirements.txt .env service-account.json blud@blud.local:clubbot/`
+     (confirm `admin.py`, `scheduler.py`, `sheets.py`, `preflight.py` scroll
+     past at 100%; OneDrive cloud-only placeholder files are a suspect if
+     files are skipped — "Always keep on this device" fixes that)
+  4. Pi: `bash ~/clubbot/deploy/setup_pi.sh` → expect `active (running)`
+  5. Pi: `~/clubbot/.venv/bin/python ~/clubbot/scripts/preflight.py` → 3 PASS
+- **Other open items (treasurer's side):** Google Sheet may still not be
   shared with the service account (`firebase-adminsdk-fbsvc@clubsync-e7436.iam.gserviceaccount.com`),
-  and the Gemini key needed replacing (old project billing-suspended). Rerun
-  preflight to see current state.
+  and the Gemini key needed replacing (old project billing-suspended) — the
+  PC-side preflight last showed both FAILing; the `.env` in THIS folder is
+  the current one to ship to the Pi. Rerun preflight to see current state.
 
 ### Launch checklist (remaining user actions)
 
