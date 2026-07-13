@@ -1,0 +1,4 @@
+# Test/development extras: pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=8.0
+zxing-cpp>=2.2

@@ -56,7 +56,10 @@ def pending_term_jobs(
         if term["start_notified_at"] is None:
             jobs.append(("start", term, term_start_run_time(term, now)))
         if term["reminder7_sent_at"] is None:
-            jobs.append(("reminder7", term, reminder7_run_time(term)))
+            when = reminder7_run_time(term)
+            # A short term can end before day 7; don't nag after collection closed.
+            if when.date() <= date.fromisoformat(term["end_date"]):
+                jobs.append(("reminder7", term, when))
     return jobs
 
 
@@ -73,18 +76,21 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
         "payment time, and bank reference number are visible."
     )
     school = school_config(conn)
+    attempted = sent = 0
     for member in db.list_active_members(conn):
         payment = db.get_or_create_payment(
             conn, member_id=member["telegram_user_id"], term_id=term_id
         )
-        if payment["status"] == "verified":
+        # qr_issued_at doubles as a per-member "already got a QR" marker, so a
+        # blast interrupted by a power cut does not re-DM the first half.
+        if payment["status"] == "verified" or payment["qr_issued_at"]:
             continue
-        payment = db.mark_qr_issued(conn, payment["id"])
         qr = build_member_qr(
             fee_cents=term["fee_cents"], reference=payment["ref_code"], school=school
         )
         image = io.BytesIO(qr)
         image.name = "membership-paynow.png"
+        attempted += 1
         try:
             await bot.send_photo(
                 chat_id=member["telegram_user_id"], photo=image, caption=caption
@@ -95,6 +101,15 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
                 member["telegram_user_id"],
                 exc_info=True,
             )
+        else:
+            sent += 1
+            # Stamp only delivered members so a retry re-sends exactly the rest.
+            db.mark_qr_issued(conn, payment["id"])
+    if attempted and not sent:
+        # Telegram was down for the whole loop: leave the term unstamped so
+        # the daily re-arm retries the blast instead of silently dropping it.
+        log.error("Term-start blast for term %s failed for all members", term_id)
+        return
     db.mark_term_start_notified(conn, term_id)
 
 
@@ -225,6 +240,19 @@ def _arm_term_job(
     )
 
 
+async def _job_rearm(context) -> None:
+    """Daily self-heal: re-arm any pending term job that is no longer queued.
+
+    run_once jobs are consumed even when they raise; without this, a crashed
+    blast/reminder would be lost until the next process restart.
+    """
+    conn = context.bot_data["db"]
+    now = datetime.now(SINGAPORE_TIME)
+    for kind, term, when in pending_term_jobs(conn, now):
+        if not context.job_queue.get_jobs_by_name(f"{kind}-{term['id']}"):
+            _arm_term_job(context.job_queue, kind, term["id"], when, now)
+
+
 def schedule_all(app, conn: sqlite3.Connection) -> None:
     """Restore outstanding one-shot term jobs and arm the daily audit check.
 
@@ -238,6 +266,11 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
         _job_audit,
         time=time(hour=AUDIT_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
         name="audit-digest",
+    )
+    jq.run_daily(
+        _job_rearm,
+        time=time(hour=REMINDER_HOUR, minute=5, tzinfo=SINGAPORE_TIME),
+        name="term-job-rearm",
     )
     # Nightly Sheet rebuild; the job itself no-ops when no mirror is configured.
     jq.run_daily(

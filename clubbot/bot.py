@@ -13,11 +13,13 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -62,6 +64,14 @@ REGISTERED = (
 RELINKED = (
     "Welcome back, {name}! This Telegram account is now linked to your "
     "membership, and your payment history has moved over. Check /status."
+)
+RELINK_EXPIRED = (
+    "This relink is no longer active. Ask the treasurer to run /relink again, "
+    "then re-register with /start."
+)
+REGISTRATION_FAILED = (
+    "Registration could not be completed (the SUTD ID may have just been "
+    "taken). Send /start to try again or contact the treasurer."
 )
 CANCELLED = "Registration cancelled. Send /start whenever you're ready."
 NOT_REGISTERED = "You're not registered yet. Send /start to register."
@@ -154,7 +164,7 @@ async def on_sutd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(BAD_SUTD_ID)
         return ASK_SUTD_ID
     if db.get_member_by_sutd_id(_db(context), sutd_id) is not None:
-        if db.get_setting(_db(context), f"relink:{sutd_id}") is None:
+        if not db.relink_armed(_db(context), sutd_id):
             await update.message.reply_text(SUTD_ID_TAKEN)
             return ASK_SUTD_ID
         context.user_data["relink"] = True
@@ -171,29 +181,40 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         user = update.effective_user
         name = context.user_data["full_name"]
         sutd_id = context.user_data["sutd_id"]
-        if context.user_data.get("relink"):
-            db.relink_member(
-                _db(context),
-                sutd_id=sutd_id,
-                new_telegram_id=user.id,
-                full_name=name,
-                username=user.username,
-            )
-            db.delete_setting(_db(context), f"relink:{sutd_id}")
+        try:
+            if context.user_data.get("relink"):
+                # Re-check at use time: the flag may have been consumed or
+                # expired while this conversation sat at the confirm step.
+                if not db.relink_armed(_db(context), sutd_id):
+                    context.user_data.clear()
+                    await update.message.reply_text(RELINK_EXPIRED)
+                    return ConversationHandler.END
+                db.relink_member(
+                    _db(context),
+                    sutd_id=sutd_id,
+                    new_telegram_id=user.id,
+                    full_name=name,
+                    username=user.username,
+                )
+                db.disarm_relink(_db(context), sutd_id)
+                reply = RELINKED.format(name=name)
+            else:
+                db.add_member(
+                    _db(context),
+                    telegram_user_id=user.id,
+                    full_name=name,
+                    sutd_id=sutd_id,
+                    username=user.username,
+                )
+                reply = REGISTERED.format(name=name)
+        except (ValueError, sqlite3.IntegrityError):
+            log.exception("Registration failed for user %s", user.id)
             context.user_data.clear()
-            scheduler.request_sheet_sync(context.application)
-            await update.message.reply_text(RELINKED.format(name=name))
+            await update.message.reply_text(REGISTRATION_FAILED)
             return ConversationHandler.END
-        db.add_member(
-            _db(context),
-            telegram_user_id=user.id,
-            full_name=name,
-            sutd_id=sutd_id,
-            username=user.username,
-        )
         context.user_data.clear()
         scheduler.request_sheet_sync(context.application)
-        await update.message.reply_text(REGISTERED.format(name=name))
+        await update.message.reply_text(reply)
         return ConversationHandler.END
     if answer in ("no", "n"):
         context.user_data.clear()
@@ -230,7 +251,8 @@ def _parse_fee_cents(value: str) -> int:
         amount = Decimal(value)
     except InvalidOperation as exc:
         raise ValueError("fee must be a number") from exc
-    if amount <= 0 or amount.as_tuple().exponent < -2:
+    # is_finite() first: NaN/Infinity pass Decimal() but break the checks below.
+    if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -2:
         raise ValueError("fee must be positive with at most 2 decimal places")
     return int(amount * 100)
 
@@ -402,6 +424,13 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         school=school_config(conn),
     )
     if result.outcome == "retry":
+        # Nothing was accepted, so free the image fingerprint for a resend.
+        # (A reservation that already carries a bank reference is kept: the
+        # same member's later receipt with that reference is allowed through
+        # reserve_bank_transaction's own-payment check.)
+        db.release_receipt_image(
+            conn, payment_id=payment["id"], image_hash=image_hash
+        )
         db.reset_payment_for_retry(conn, payment["id"])
         await update.message.reply_text(
             "I couldn't verify that image:\n- "
@@ -434,7 +463,12 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         "Your receipt needs treasurer review. You will be notified after it is checked."
     )
-    await _notify_treasurer(context, payment["id"], result.reasons)
+    try:
+        await _notify_treasurer(context, payment["id"], result.reasons)
+    except Exception:
+        # The payment stays in 'exception' (visible in /stats); don't crash the
+        # handler just because the treasurer DM failed.
+        log.exception("Treasurer notification failed for payment %s", payment["id"])
 
 
 async def _notify_treasurer(
@@ -508,6 +542,11 @@ async def on_payment_review(
     )
 
 
+async def _ignore_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.edited_message is not None or update.edited_channel_post is not None:
+        raise ApplicationHandlerStop
+
+
 def build_application(
     token: str,
     conn: sqlite3.Connection,
@@ -519,6 +558,9 @@ def build_application(
     app.bot_data["db"] = conn
     app.bot_data["extractor"] = extractor
     app.bot_data["sheet"] = sheet
+    # Every handler dereferences update.message; edited messages would arrive
+    # with message=None and crash them, so drop edits before any other group.
+    app.add_handler(TypeHandler(Update, _ignore_edited), group=-1)
     registration = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={

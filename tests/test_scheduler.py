@@ -81,6 +81,12 @@ def test_pending_term_jobs_drops_start_after_stamp(conn):
     assert [kind for kind, _, _ in jobs] == ["reminder7"]
 
 
+def test_pending_term_jobs_skips_reminder7_past_term_end(conn):
+    _term(conn, start_offset=-1, end_offset=4)  # 5-day term: day 7 is after end
+    jobs = scheduler.pending_term_jobs(conn, datetime.now(SINGAPORE_TIME))
+    assert [kind for kind, _, _ in jobs] == ["start"]
+
+
 def test_pending_term_jobs_ignores_ended_term(conn):
     today = date.today()
     db.create_term(
@@ -114,6 +120,33 @@ def test_term_start_blast_messages_unverified_only(conn):
     caption = fake_bot.send_photo.await_args_list[0].kwargs["caption"]
     assert "S$20.00" in caption
     assert db.get_term(conn, term["id"])["start_notified_at"] is not None
+
+
+def test_term_start_blast_skips_members_who_already_got_a_qr(conn):
+    _member(conn, 111, "1000001", "Alice")
+    _member(conn, 222, "1000002", "Bob")
+    term = _term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.mark_qr_issued(conn, payment["id"])  # e.g. sent before a mid-blast reboot
+
+    fake_bot = make_bot()
+    asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
+
+    sent_to = {call.kwargs["chat_id"] for call in fake_bot.send_photo.await_args_list}
+    assert sent_to == {222}
+
+
+def test_term_start_blast_total_failure_leaves_term_unstamped(conn):
+    _member(conn, 111, "1000001", "Alice")
+    term = _term(conn)
+
+    fake_bot = make_bot()
+    fake_bot.send_photo.side_effect = Exception("telegram down")
+    asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
+
+    assert db.get_term(conn, term["id"])["start_notified_at"] is None
+    # And the member is not falsely marked as having received a QR.
+    assert db.get_current_payment(conn, 111)["qr_issued_at"] is None
 
 
 def test_term_start_blast_continues_after_send_failure(conn):
@@ -214,6 +247,7 @@ def test_schedule_all_smoke(conn):
     scheduler.schedule_all(app, conn)
     jobs = {job.name for job in app.job_queue.jobs()}
     assert "audit-digest" in jobs
+    assert "term-job-rearm" in jobs
     assert len(app.job_queue.jobs()) >= 1
 
 

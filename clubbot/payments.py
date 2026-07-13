@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from clubbot import db, paynow, qrgen
@@ -15,7 +15,7 @@ SCHOOL_UEN = "200913519CSL5"
 SCHOOL_MERCHANT_NAME = "SINGAPORE UNIVERSITY OF T"
 SCHOOL_BILL_NUMBER = "200913519CSL5EIU616138169"
 RECIPIENT_MATCH = "SINGAPORE UNIVERSITY OF"
-SINGAPORE_TIME = timezone(timedelta(hours=8))
+SINGAPORE_TIME = db.SINGAPORE_TIME  # single source of truth for SGT
 
 
 @dataclass(frozen=True)
@@ -148,7 +148,10 @@ def verify_extracted_payment(
     except ValueError:
         reasons.append("Payment timestamp is missing, invalid, or has no timezone.")
 
-    if not extracted.transaction_id:
+    # Check the NORMALISED id: a reference of only punctuation/unicode
+    # lookalikes must not slip past both this check and the dedup reservation
+    # (which keys on the normalised value).
+    if not normalise_transaction_id(extracted.transaction_id):
         reasons.append("Transaction ID is missing.")
     elif duplicate_transaction:
         reasons.append("Transaction ID has already been submitted.")

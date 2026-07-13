@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -418,14 +418,45 @@ def test_transfertreasurer_to_current_treasurer_errors(conn):
 # --- Phase 4: relink -------------------------------------------------------------
 
 
-def test_relink_arms_pending_flag(conn):
+def test_relink_arms_flag_with_expiry(conn):
     db.ensure_treasurer(conn, 999)
     seed_members(conn)
     update, context = make_update(user_id=999), make_context(conn)
     context.args = ["1007654"]
     asyncio.run(admin.cmd_relink(update, context))
-    assert db.get_setting(conn, "relink:1007654") == "pending"
+    assert db.relink_armed(conn, "1007654")
     assert "NEW Telegram account" in reply_text_of(update)
+    assert "48 hours" in reply_text_of(update)
+
+
+def test_relink_no_args_lists_armed(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.arm_relink(conn, "1007654")
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_relink(update, context))
+    assert "1007654" in reply_text_of(update)
+
+
+def test_relink_cancel_disarms(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.arm_relink(conn, "1007654")
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654", "cancel"]
+    asyncio.run(admin.cmd_relink(update, context))
+    assert not db.relink_armed(conn, "1007654")
+    assert "cancelled" in reply_text_of(update)
+
+
+def test_relink_flag_expires_after_ttl(conn):
+    seed_members(conn)
+    stale = (datetime.now(timezone.utc) - db.RELINK_TTL - timedelta(minutes=1)).isoformat(
+        timespec="seconds"
+    )
+    db.set_setting(conn, "relink:1007654", stale)
+    assert not db.relink_armed(conn, "1007654")
+    assert db.list_armed_relinks(conn) == []
 
 
 def test_relink_unknown_member(conn):
@@ -460,6 +491,15 @@ def test_settings_set_and_show_override(conn):
     text = reply_text_of(update)
     assert "school_merchant_name = NEW SCHOOL NAME" in text
     assert "school_merchant_name = NEW SCHOOL NAME (default)" not in text
+
+
+def test_settings_rejects_value_that_breaks_qr(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["school_merchant_name", "CAFÉ", "…"]  # non-ASCII breaks EMVCo
+    asyncio.run(admin.cmd_settings(update, context))
+    assert "Not saved" in reply_text_of(update)
+    assert db.get_setting(conn, "school_merchant_name") is None
 
 
 def test_settings_rejects_unknown_key(conn):

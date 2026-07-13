@@ -126,7 +126,7 @@ def test_relink_registration_moves_history(conn):
     )
     term = create_active_term(conn)
     payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
-    db.set_setting(conn, "relink:1010654", "pending")
+    db.arm_relink(conn, "1010654")
 
     context = make_context(conn)
     context.user_data["full_name"] = "Alice Tan"
@@ -142,7 +142,54 @@ def test_relink_registration_moves_history(conn):
     assert member["username"] == "alice_new"
     assert db.get_member(conn, 111) is None
     assert db.get_payment(conn, payment["id"])["telegram_user_id"] == 555
-    assert db.get_setting(conn, "relink:1010654") is None
+    assert not db.relink_armed(conn, "1010654")
+
+
+def test_relink_confirm_after_disarm_is_blocked(conn):
+    # A squatter must not be able to park at CONFIRM and fire the relink after
+    # the flag was consumed or cancelled.
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    db.arm_relink(conn, "1010654")
+    context = make_context(conn)
+    context.user_data["full_name"] = "Attacker"
+    update = make_update(user_id=666, text="1010654", username="attacker")
+    assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
+
+    db.disarm_relink(conn, "1010654")  # legitimate relink completed / cancelled
+
+    update = make_update(user_id=666, text="yes", username="attacker")
+    assert asyncio.run(bot.on_confirm(update, context)) == ConversationHandler.END
+    assert "no longer active" in reply_text_of(update)
+    assert db.get_member(conn, 111) is not None  # Alice untouched
+    assert db.get_member(conn, 666) is None
+
+
+def test_confirm_duplicate_race_gets_friendly_error(conn):
+    # Two accounts pass on_sutd_id with the same free ID; the loser's "yes"
+    # must produce a reply, not an unhandled IntegrityError.
+    context = make_context(conn)
+    context.user_data.update({"full_name": "Alice Tan", "sutd_id": "1010654"})
+    db.add_member(
+        conn, telegram_user_id=222, full_name="Bob Lim", sutd_id="1010654", username=None
+    )
+    update = make_update(user_id=111, text="yes")
+    assert asyncio.run(bot.on_confirm(update, context)) == ConversationHandler.END
+    assert "could not be completed" in reply_text_of(update)
+
+
+def test_edited_messages_are_dropped(conn):
+    update = MagicMock()
+    update.edited_message = MagicMock()
+    update.edited_channel_post = None
+    with pytest.raises(bot.ApplicationHandlerStop):
+        asyncio.run(bot._ignore_edited(update, make_context(conn)))
+
+    normal = MagicMock()
+    normal.edited_message = None
+    normal.edited_channel_post = None
+    asyncio.run(bot._ignore_edited(normal, make_context(conn)))  # no raise
 
 
 def test_relink_not_armed_still_blocks_duplicate_id(conn):

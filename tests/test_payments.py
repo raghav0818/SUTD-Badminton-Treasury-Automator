@@ -129,6 +129,21 @@ def test_timestamp_without_timezone_is_rejected():
     assert "no timezone" in result.reasons[0]
 
 
+def test_transaction_id_that_normalises_to_empty_is_treated_as_missing():
+    # Punctuation-only or unicode-lookalike references must not slip past both
+    # the missing-ID check and the (normalised) duplicate reservation.
+    result = verify_extracted_payment(
+        valid_extraction(transaction_id="ＴＸ－１２３"),  # fullwidth: normalises to ""
+        expected_fee_cents=5,
+        term_start="2026-06-01",
+        term_end="2026-06-30",
+        qr_issued_at="2026-06-20T02:30:00+00:00",
+        now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
+    )
+    assert result.outcome == "exception"
+    assert "Transaction ID is missing" in result.reasons[0]
+
+
 def test_school_config_defaults_and_settings_override():
     conn = db.connect(":memory:")
     assert school_config(conn).uen == SCHOOL_UEN

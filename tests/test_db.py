@@ -181,7 +181,13 @@ def test_receipt_fingerprints_are_permanent_and_global(conn):
     assert not db.reserve_receipt_image(
         conn, payment_id=payment["id"], image_hash="HASH1"
     )
-    assert db.find_duplicate_submission(conn, bank_txn_id="TX1") is not None
+    # Same payment re-claiming its own reference is fine; another payment isn't.
+    assert db.reserve_bank_transaction(
+        conn, payment_id=payment["id"], image_hash="HASH2", bank_txn_id="TX1"
+    )
+    assert not db.reserve_bank_transaction(
+        conn, payment_id=payment["id"] + 999, image_hash="HASH3", bank_txn_id="TX1"
+    )
 
 
 def test_connect_migrates_existing_payment_database(tmp_path):

@@ -9,10 +9,13 @@ and verifies payment screenshots automatically. Design doc:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m pip install -r requirements-dev.txt
 copy .env.example .env
 # edit .env: bot token, your Telegram ID, and Gemini API key
 ```
+
+(`requirements.txt` is runtime-only for deployment; `requirements-dev.txt`
+adds pytest and the QR test decoder.)
 
 ## Run the bot
 
@@ -45,6 +48,7 @@ dated before that time. These records must be preserved with `clubbot.db`.
 ## Run the tests
 
 ```powershell
+.venv\Scripts\python -m pip install -r requirements-dev.txt
 .venv\Scripts\python -m pytest
 ```
 
@@ -64,20 +68,34 @@ The bot rebuilds the Members and Payments tabs about 30 seconds after any
 change, plus a full nightly rebuild at 02:30 SGT. The Sheet is a mirror only;
 editing it changes nothing in the bot.
 
-## Deploy to a Linux VM (systemd)
+## Deploy 24/7 — Raspberry Pi 4 or any Linux box (systemd)
+
+Tested target: Raspberry Pi 4, 64-bit Raspberry Pi OS Lite. One-time prep:
+
+```bash
+sudo apt update && sudo apt install -y git python3-venv
+sudo timedatectl set-timezone Asia/Singapore   # optional; the bot computes SGT itself
+```
+
+Install and start the bot (identical on a Pi or a cloud VM):
 
 ```bash
 sudo useradd -r -m -d /opt/clubbot clubbot
-sudo -u clubbot git clone <this-repo> /opt/clubbot
+sudo -u clubbot git clone https://github.com/raghav0818/SUTD-Badminton-Treasury-Automator.git /opt/clubbot
 cd /opt/clubbot
 sudo -u clubbot python3 -m venv .venv
 sudo -u clubbot .venv/bin/pip install -r requirements.txt
-sudo -u clubbot cp .env.example .env   # then edit .env with real values
+sudo -u clubbot cp .env.example .env
+sudo -u clubbot nano .env              # bot token, treasurer ID, Gemini key
 sudo cp deploy/clubbot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now clubbot
 journalctl -u clubbot -f               # watch the logs
 ```
+
+The service restarts automatically after crashes and reboots
+(`Restart=always` + `systemctl enable`), and the bot uses long-polling, so no
+port forwarding or domain is needed — a home network is fine.
 
 Back up the database daily — `clubbot.db` holds all membership, payment, and
 permanent anti-reuse history and must never be lost between terms:

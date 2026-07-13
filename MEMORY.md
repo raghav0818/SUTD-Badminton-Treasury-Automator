@@ -17,6 +17,58 @@ FLYMAX account) gets rare exception pings + a weekly audit digest.
 
 ## Current status (update this every session!)
 
+- **2026-07-14 — Full-codebase review (3 parallel review agents + manual pass),
+  11 bugs fixed, Raspberry Pi 4 24/7 deployment prep. 139 pytest tests pass.**
+
+  Note: the treasurer asked for "codex review"; OpenAI Codex is not available
+  in this tooling, so Claude review subagents were used instead (told to the
+  treasurer).
+
+  **Security/correctness fixes (all regression-tested):**
+  - Relink hardened: armed flags now carry a timestamp and expire after 48h
+    (`db.RELINK_TTL`); the flag is re-checked at the CONFIRM step (previously a
+    squatter could park at confirm and fire the relink after the window);
+    `/relink` with no args lists armed relinks, `/relink <id> cancel` disarms.
+  - Verification: transaction IDs are now checked in NORMALISED form — a
+    reference of punctuation/fullwidth lookalikes previously skipped both the
+    missing-ID check and duplicate reservation (auto-verify bypass).
+  - `reserve_bank_transaction` treats the same payment's own earlier reference
+    as NOT a duplicate, so an honest "send a clearer screenshot" retry of the
+    same transaction can still auto-verify.
+  - Retry outcome (blurry/preview screenshot) now releases the image
+    fingerprint (reference kept if extracted) so the member can resend.
+  - Edited Telegram messages are dropped in handler group -1
+    (`bot._ignore_edited`); previously every handler crashed on
+    `update.message = None`, and an edited /newterm double-created terms.
+  - `get_active_term` uses the SINGAPORE date, not the host OS date
+    (`db.SINGAPORE_TIME` is now the single SGT source; a UTC Pi previously had
+    an 8-hour skew at term boundaries: /pay refused on term-start morning).
+  - Term-start blast is restart-safe per member (`qr_issued_at` doubles as a
+    delivered marker, stamped only after successful send); a total send outage
+    leaves the term unstamped; a new daily `term-job-rearm` job (10:05 SGT)
+    re-arms crashed one-shot jobs; day-7 reminder skipped when it would land
+    after the term ends.
+  - Sheet mirror: worksheet is resized to the mirror size before update —
+    previously a tab auto-created while the DB was empty could never grow
+    (silent permanent sync failure).
+  - `/settings` dry-runs a QR build before saving (non-ASCII/too-long values
+    previously broke /pay for everyone); `/newterm` handles NaN/Infinity fees;
+    registration confirm handles the duplicate-ID race with a friendly reply;
+    treasurer-notification failures are logged instead of crashing on_receipt;
+    `transfer_treasurer` rolls back on failure; dead `find_duplicate_submission`
+    deleted.
+
+  **Pi 4 / 24-7 deployment prep:**
+  - `requirements.txt` is runtime-only; new `requirements-dev.txt` adds
+    pytest + zxing-cpp (test-only). README has a Raspberry Pi 4 deploy section.
+  - `deploy/clubbot.service`: `Restart=always`, `RestartSec=15`,
+    `StartLimitIntervalSec=0` for unattended operation.
+  - This machine (fresh clone) has no `clubbot.db` / `.env` / `phase0_qrs`;
+    the test data ("noobslayer") lives only in the OLD machine's `clubbot.db`
+    — wipe that file before real launch (launch checklist below).
+  - `.venv` and `.pytest_cache` were deleted at the treasurer's request after
+    the final test run (recreate venv with requirements-dev.txt to run tests).
+
 - **2026-07-13 — Phase 4 (admin management & Sheet mirror) + Phase 5 ship
   artifacts built. 127 pytest tests pass. Feature-complete per the PRD.**
 

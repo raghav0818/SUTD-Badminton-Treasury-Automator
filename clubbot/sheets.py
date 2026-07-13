@@ -74,5 +74,8 @@ class SheetMirror:
             worksheet = self._spreadsheet.add_worksheet(
                 title, rows=len(rows) + 1, cols=len(headers)
             )
+        # values.update cannot write past the worksheet's grid, so grow (and
+        # shrink) it to the exact mirror size before writing.
+        worksheet.resize(rows=len(rows) + 1, cols=len(headers))
         worksheet.clear()
         worksheet.update([headers] + rows)

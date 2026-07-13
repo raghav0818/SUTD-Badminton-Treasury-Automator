@@ -7,14 +7,23 @@ from clubbot.sheets import MEMBER_HEADERS, PAYMENT_HEADERS, SheetMirror
 
 
 class FakeWorksheet:
-    def __init__(self):
+    def __init__(self, rows=1, cols=1):
         self.cleared = False
         self.data = None
+        self.rows = rows
+        self.cols = cols
+
+    def resize(self, rows, cols):
+        self.rows = rows
+        self.cols = cols
 
     def clear(self):
         self.cleared = True
 
     def update(self, values):
+        # Mimic the real API: writes beyond the grid are a 400 error.
+        if len(values) > self.rows or any(len(r) > self.cols for r in values):
+            raise AssertionError("update exceeds grid limits")
         self.data = values
 
 
@@ -28,7 +37,7 @@ class FakeSpreadsheet:
         return self.worksheets[title]
 
     def add_worksheet(self, title, rows, cols):
-        self.worksheets[title] = FakeWorksheet()
+        self.worksheets[title] = FakeWorksheet(rows, cols)
         return self.worksheets[title]
 
 
@@ -96,3 +105,16 @@ def test_empty_database_pushes_headers_only(conn):
     assert members == []
     assert payments == []
     mirror.push(members, payments)
+
+
+def test_tab_created_while_empty_still_accepts_growth(conn):
+    # The auto-created tab is sized to the first (empty) snapshot; later
+    # syncs must resize it instead of failing with a grid-limit error.
+    spreadsheet = FakeSpreadsheet()
+    mirror = SheetMirror(spreadsheet)
+    mirror.push(*mirror.snapshot(conn))  # creates 1-row tabs
+
+    seed(conn)
+    mirror.push(*mirror.snapshot(conn))  # must not raise
+
+    assert len(spreadsheet.worksheets["Payments"].data) == 2

@@ -2,7 +2,11 @@
 
 import secrets
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+
+# Terms are defined by Singapore calendar dates, so "today" must be computed in
+# SGT no matter what the host OS timezone is (a deployed Pi typically runs UTC).
+SINGAPORE_TIME = timezone(timedelta(hours=8))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
@@ -239,16 +243,23 @@ def transfer_treasurer(conn: sqlite3.Connection, *, new_treasurer_id: int) -> No
     old = get_treasurer_id(conn)
     if old == new_treasurer_id:
         raise ValueError("this member is already the treasurer")
-    conn.execute("DELETE FROM admins WHERE telegram_user_id = ?", (new_treasurer_id,))
-    if old is not None:
+    try:
         conn.execute(
-            "UPDATE admins SET role = 'admin' WHERE telegram_user_id = ?", (old,)
+            "DELETE FROM admins WHERE telegram_user_id = ?", (new_treasurer_id,)
         )
-    conn.execute(
-        "INSERT INTO admins (telegram_user_id, role, added_by) VALUES (?, 'treasurer', ?)",
-        (new_treasurer_id, old),
-    )
-    conn.commit()
+        if old is not None:
+            conn.execute(
+                "UPDATE admins SET role = 'admin' WHERE telegram_user_id = ?", (old,)
+            )
+        conn.execute(
+            "INSERT INTO admins (telegram_user_id, role, added_by) VALUES (?, 'treasurer', ?)",
+            (new_treasurer_id, old),
+        )
+        conn.commit()
+    except BaseException:
+        # Never leave the club without a treasurer half-way through.
+        conn.rollback()
+        raise
 
 
 def relink_member(
@@ -303,6 +314,49 @@ def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
 def delete_setting(conn: sqlite3.Connection, key: str) -> None:
     conn.execute("DELETE FROM settings WHERE key = ?", (key,))
     conn.commit()
+
+
+# An armed relink is an account-takeover window if it never expires, so flags
+# carry their arm time and go stale after 48 hours.
+RELINK_TTL = timedelta(hours=48)
+
+
+def _relink_key(sutd_id: str) -> str:
+    return f"relink:{sutd_id}"
+
+
+def arm_relink(conn: sqlite3.Connection, sutd_id: str) -> None:
+    set_setting(conn, _relink_key(sutd_id), _utc_now())
+
+
+def disarm_relink(conn: sqlite3.Connection, sutd_id: str) -> None:
+    delete_setting(conn, _relink_key(sutd_id))
+
+
+def relink_armed(conn: sqlite3.Connection, sutd_id: str) -> bool:
+    value = get_setting(conn, _relink_key(sutd_id))
+    if value is None:
+        return False
+    try:
+        armed_at = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) - armed_at < RELINK_TTL
+
+
+def list_armed_relinks(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(sutd_id, armed_at) for every relink flag, freshest first, expired pruned."""
+    rows = conn.execute(
+        "SELECT key, value FROM settings WHERE key LIKE 'relink:%' ORDER BY value DESC"
+    ).fetchall()
+    armed: list[tuple[str, str]] = []
+    for row in rows:
+        sutd_id = row["key"].removeprefix("relink:")
+        if relink_armed(conn, sutd_id):
+            armed.append((sutd_id, row["value"]))
+        else:
+            delete_setting(conn, row["key"])
+    return armed
 
 
 def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -360,7 +414,7 @@ def get_term(conn: sqlite3.Connection, term_id: int) -> sqlite3.Row | None:
 def get_active_term(
     conn: sqlite3.Connection, on_date: date | None = None
 ) -> sqlite3.Row | None:
-    day = (on_date or date.today()).isoformat()
+    day = (on_date or datetime.now(SINGAPORE_TIME).date()).isoformat()
     return conn.execute(
         """
         SELECT * FROM terms
@@ -449,30 +503,6 @@ def get_current_payment(
     )
 
 
-def find_duplicate_submission(
-    conn: sqlite3.Connection,
-    *,
-    image_hash: str | None = None,
-    bank_txn_id: str | None = None,
-    excluding_payment_id: int | None = None,
-) -> sqlite3.Row | None:
-    clauses: list[str] = []
-    params: list[object] = []
-    if image_hash:
-        clauses.append("image_hash = ?")
-        params.append(image_hash)
-    if bank_txn_id:
-        clauses.append("bank_txn_id = ?")
-        params.append(bank_txn_id)
-    if not clauses:
-        return None
-    sql = f"SELECT * FROM receipt_fingerprints WHERE ({' OR '.join(clauses)})"
-    if excluding_payment_id is not None:
-        sql += " AND payment_id != ?"
-        params.append(excluding_payment_id)
-    return conn.execute(sql + " LIMIT 1", params).fetchone()
-
-
 def reserve_receipt_image(
     conn: sqlite3.Connection, *, payment_id: int, image_hash: str
 ) -> bool:
@@ -499,7 +529,17 @@ def reserve_bank_transaction(
     image_hash: str,
     bank_txn_id: str,
 ) -> bool:
-    """Attach a bank reference permanently; false means another receipt used it."""
+    """Attach a bank reference permanently; false means another PAYMENT used it.
+
+    The same payment resubmitting its own reference (e.g. a clearer screenshot
+    of the same transaction after a failed check) is not a duplicate.
+    """
+    owner = conn.execute(
+        "SELECT payment_id FROM receipt_fingerprints WHERE bank_txn_id = ?",
+        (bank_txn_id,),
+    ).fetchone()
+    if owner is not None:
+        return owner["payment_id"] == payment_id
     try:
         cursor = conn.execute(
             """

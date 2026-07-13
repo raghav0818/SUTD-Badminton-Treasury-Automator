@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from dataclasses import replace
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from clubbot import db, scheduler
 from clubbot.format import money
-from clubbot.payments import SchoolConfig, school_config
+from clubbot.payments import SchoolConfig, build_member_qr, school_config
 
 log = logging.getLogger(__name__)
 
@@ -282,23 +283,39 @@ async def cmd_transfertreasurer(
     )
 
 
-def _relink_key(sutd_id: str) -> str:
-    return f"relink:{sutd_id}"
-
-
 async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conn = _db(context)
     if not _is_treasurer(conn, update.effective_user.id):
         await update.message.reply_text(NOT_TREASURER)
         return
+    if not context.args:
+        armed = db.list_armed_relinks(conn)
+        if not armed:
+            await update.message.reply_text(
+                "No relinks are armed.\n"
+                "Usage: /relink <sutd_id> to arm, /relink <sutd_id> cancel to disarm."
+            )
+            return
+        lines = ["Armed relinks (each expires 48h after arming):"]
+        lines += [f"- SUTD ID {sutd_id}, armed {when}" for sutd_id, when in armed]
+        await update.message.reply_text("\n".join(lines))
+        return
     member = await _resolve_member(update, context)
     if member is None:
         return
-    db.set_setting(conn, _relink_key(member["sutd_id"]), "pending")
+    if len(context.args) > 1 and context.args[1].lower() == "cancel":
+        db.disarm_relink(conn, member["sutd_id"])
+        await update.message.reply_text(
+            f"Relink cancelled for {member['full_name']} (SUTD ID {member['sutd_id']})."
+        )
+        return
+    db.arm_relink(conn, member["sutd_id"])
     await update.message.reply_text(
         f"Relink armed for {member['full_name']} (SUTD ID {member['sutd_id']}).\n"
         "Ask them to send /start from their NEW Telegram account and register "
-        "with the same SUTD ID. Their payment history will move over."
+        "with the same SUTD ID within 48 hours. Their payment history will "
+        "move over. Cancel with /relink "
+        f"{member['sutd_id']} cancel."
     )
 
 
@@ -337,6 +354,16 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"Usage: /settings {key} <value>")
         return
     value = " ".join(context.args[1:]).strip()
+    # Dry-run a QR with the candidate value; a bad UEN/merchant name/bill
+    # number (non-ASCII, too long) would otherwise break /pay for everyone.
+    candidate = replace(school_config(conn), **{key.removeprefix("school_"): value})
+    try:
+        build_member_qr(fee_cents=100, reference="BDM-0-TEST", school=candidate)
+    except Exception as exc:
+        await update.message.reply_text(
+            f"Not saved - this value cannot be encoded in a PayNow QR: {exc}"
+        )
+        return
     db.set_setting(conn, key, value)
     await update.message.reply_text(
         f"{key} set to: {value}\n"

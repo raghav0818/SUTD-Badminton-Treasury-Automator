@@ -11,8 +11,11 @@ Type=simple
 User=clubbot
 WorkingDirectory=/opt/clubbot
 ExecStart=/opt/clubbot/.venv/bin/python -m clubbot
-Restart=on-failure
-RestartSec=10
+# 24/7 unattended: restart on any exit, but back off so a crash loop
+# (bad .env, no network) does not hammer the Telegram API.
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
