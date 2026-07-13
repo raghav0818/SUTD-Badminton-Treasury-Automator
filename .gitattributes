@@ -1,0 +1,4 @@
+# Shell scripts and the systemd unit run on Linux — keep LF even on Windows
+# checkouts, or bash on the Pi fails with "\r: command not found".
+*.sh text eol=lf
+deploy/clubbot.service text eol=lf
