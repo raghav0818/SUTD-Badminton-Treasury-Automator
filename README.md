@@ -5,7 +5,8 @@ personal PayNow QR, pay, and send back the payment screenshot — the bot
 verifies it automatically. You (the treasurer) only approve rare exceptions
 and confirm a weekly audit list against DBS FLYMAX.
 
-Bot: **@MyClubFinanceBot** · Runs 24/7 on a Raspberry Pi 4.
+Bot: **SUTD ShuttleBuddy** (handle: `@MyClubFinanceBot`) · Runs 24/7 on a
+Raspberry Pi 4.
 
 ---
 

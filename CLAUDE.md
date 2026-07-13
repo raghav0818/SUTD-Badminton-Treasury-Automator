@@ -20,9 +20,12 @@ changing payment or verification logic.
   transaction-ID bypass, edited-message crashes, UTC/SGT term skew,
   restart-safe blasts, Sheet grid growth, and more — see git log `f84460f`).
 - **Live-proven:** registration and the full S$0.05 payment flow (QR → real
-  payment → screenshot → Gemini → auto-verify) succeeded on real Telegram
-  (bot: `@MyClubFinanceBot`). Scheduled jobs are unit-tested but not yet
-  observed over a real multi-day term.
+  payment → screenshot → Gemini → auto-verify) succeeded on real Telegram.
+  The bot is named **SUTD ShuttleBuddy** (handle still `@MyClubFinanceBot`;
+  renamed 2026-07-14). Scheduled jobs are unit-tested but not yet observed
+  over a real multi-day term.
+- **A version is deployed and running on the treasurer's Raspberry Pi 4**
+  as of 2026-07-14; keep it updated via `git pull` + service restart.
 - **Deployment target:** Raspberry Pi 4, systemd (`deploy/clubbot.service`),
   24/7. `scripts/preflight.py` verifies the Telegram/Gemini/Sheet secrets.
 - **Last known blockers (treasurer's side, 2026-07-14):** Google Sheet not yet
