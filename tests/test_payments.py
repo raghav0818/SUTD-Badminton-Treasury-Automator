@@ -4,11 +4,13 @@ from datetime import datetime, timezone
 import zxingcpp
 from PIL import Image
 
-from clubbot import paynow
+from clubbot import db, paynow
 from clubbot.payments import (
     SCHOOL_BILL_NUMBER,
+    SCHOOL_UEN,
     ExtractedPayment,
     build_member_qr,
+    school_config,
     verify_extracted_payment,
 )
 
@@ -125,3 +127,38 @@ def test_timestamp_without_timezone_is_rejected():
     )
     assert result.outcome == "exception"
     assert "no timezone" in result.reasons[0]
+
+
+def test_school_config_defaults_and_settings_override():
+    conn = db.connect(":memory:")
+    assert school_config(conn).uen == SCHOOL_UEN
+    assert school_config(conn).bill_number == SCHOOL_BILL_NUMBER
+
+    db.set_setting(conn, "school_bill_number", "NEWBILL999")
+    school = school_config(conn)
+    assert school.bill_number == "NEWBILL999"
+    assert school.uen == SCHOOL_UEN  # untouched keys keep their defaults
+
+    # Verification follows the override: the old default billing id now fails.
+    result = verify_extracted_payment(
+        valid_extraction(),
+        expected_fee_cents=5,
+        term_start="2026-06-01",
+        term_end="2026-06-30",
+        qr_issued_at="2026-06-20T02:30:00+00:00",
+        now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
+        school=school,
+    )
+    assert result.outcome == "exception"
+    assert any("Billing ID" in reason for reason in result.reasons)
+
+
+def test_member_qr_uses_school_config_override():
+    conn = db.connect(":memory:")
+    db.set_setting(conn, "school_bill_number", "NEWBILL999")
+    png = build_member_qr(
+        fee_cents=5, reference="BDM-1-ABC123", school=school_config(conn)
+    )
+    result = zxingcpp.read_barcode(Image.open(io.BytesIO(png)))
+    extra = paynow.parse_tlv(paynow.parse_tlv(result.text)["62"])
+    assert extra["01"] == "NEWBILL999"

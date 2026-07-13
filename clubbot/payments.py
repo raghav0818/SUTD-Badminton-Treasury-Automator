@@ -4,16 +4,40 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from clubbot import paynow, qrgen
+from clubbot import db, paynow, qrgen
 
 SCHOOL_UEN = "200913519CSL5"
 SCHOOL_MERCHANT_NAME = "SINGAPORE UNIVERSITY OF T"
 SCHOOL_BILL_NUMBER = "200913519CSL5EIU616138169"
+RECIPIENT_MATCH = "SINGAPORE UNIVERSITY OF"
 SINGAPORE_TIME = timezone(timedelta(hours=8))
+
+
+@dataclass(frozen=True)
+class SchoolConfig:
+    """QR routing + verification values; overridable via the settings table."""
+
+    uen: str = SCHOOL_UEN
+    merchant_name: str = SCHOOL_MERCHANT_NAME
+    bill_number: str = SCHOOL_BILL_NUMBER
+    recipient_match: str = RECIPIENT_MATCH
+
+
+def school_config(conn: sqlite3.Connection) -> SchoolConfig:
+    """Current school values: settings override, PRD defaults otherwise."""
+    return SchoolConfig(
+        uen=db.get_setting(conn, "school_uen") or SCHOOL_UEN,
+        merchant_name=db.get_setting(conn, "school_merchant_name")
+        or SCHOOL_MERCHANT_NAME,
+        bill_number=db.get_setting(conn, "school_bill_number") or SCHOOL_BILL_NUMBER,
+        recipient_match=db.get_setting(conn, "school_recipient_match")
+        or RECIPIENT_MATCH,
+    )
 
 
 @dataclass(frozen=True)
@@ -40,15 +64,18 @@ class VerificationResult:
         return self.outcome == "verified"
 
 
-def build_member_qr(*, fee_cents: int, reference: str) -> bytes:
+def build_member_qr(
+    *, fee_cents: int, reference: str, school: SchoolConfig | None = None
+) -> bytes:
     """Build a locked-amount QR while preserving the school's routing Billing ID."""
     if fee_cents <= 0:
         raise ValueError("fee must be positive")
+    school = school or SchoolConfig()
     payload = paynow.build_payload(
-        uen=SCHOOL_UEN,
-        merchant_name=SCHOOL_MERCHANT_NAME,
+        uen=school.uen,
+        merchant_name=school.merchant_name,
         amount=Decimal(fee_cents) / Decimal(100),
-        bill_number=SCHOOL_BILL_NUMBER,
+        bill_number=school.bill_number,
         reference_label=reference,
     )
     return qrgen.render_png(payload)
@@ -72,8 +99,10 @@ def verify_extracted_payment(
     qr_issued_at: str,
     now: datetime | None = None,
     duplicate_transaction: bool = False,
+    school: SchoolConfig | None = None,
 ) -> VerificationResult:
     """Apply rules that, unlike the vision model, are deterministic and auditable."""
+    school = school or SchoolConfig()
     if not extracted.readable:
         return VerificationResult("retry", ("The screenshot is unreadable.",))
     if not extracted.is_success_screen:
@@ -88,10 +117,10 @@ def verify_extracted_payment(
         )
 
     recipient = _normalise_text(extracted.recipient)
-    if "SINGAPOREUNIVERSITYOF" not in recipient:
+    if _normalise_text(school.recipient_match) not in recipient:
         reasons.append("Recipient does not match the SUTD account.")
 
-    if _normalise_text(extracted.billing_id) != _normalise_text(SCHOOL_BILL_NUMBER):
+    if _normalise_text(extracted.billing_id) != _normalise_text(school.bill_number):
         reasons.append("Billing ID does not match the club's DBS FLYMAX account.")
 
     try:

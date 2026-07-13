@@ -27,6 +27,8 @@ def make_context(conn):
     context.user_data = {}
     context.args = []
     context.bot.send_message = AsyncMock()
+    context.application.job_queue = None
+    context.application.bot_data = context.bot_data
     return context
 
 
@@ -343,3 +345,132 @@ def test_audit_allfound_denies_non_treasurer(conn):
     asyncio.run(admin.on_audit_allfound(update, context))
     assert "Only the treasurer" in edit_text_of(update)
     assert conn.execute("SELECT COUNT(*) AS n FROM audits").fetchone()["n"] == 0
+
+
+# --- Phase 4: admin management --------------------------------------------------
+
+
+def test_addadmin_promotes_member(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_addadmin(update, context))
+    assert db.get_role(conn, 111) == "admin"
+    assert "now an admin" in reply_text_of(update)
+
+
+def test_addadmin_rejects_existing_admin(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_addadmin(update, context))
+    assert "already an admin" in reply_text_of(update)
+
+
+def test_addadmin_denies_non_treasurer(conn):
+    update, context = make_update(user_id=111), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_addadmin(update, context))
+    assert "Only the treasurer" in reply_text_of(update)
+
+
+def test_removeadmin_demotes(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_removeadmin(update, context))
+    assert db.get_role(conn, 111) is None
+    assert "no longer an admin" in reply_text_of(update)
+
+
+def test_removeadmin_protects_treasurer(conn):
+    db.ensure_treasurer(conn, 999)
+    with pytest.raises(ValueError, match="transfertreasurer"):
+        db.remove_admin(conn, 999)
+
+
+def test_transfertreasurer_swaps_roles_and_dms(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_transfertreasurer(update, context))
+    assert db.get_role(conn, 111) == "treasurer"
+    assert db.get_role(conn, 999) == "admin"
+    assert db.get_treasurer_id(conn) == 111
+    assert context.bot.send_message.call_args.kwargs["chat_id"] == 111
+
+
+def test_transfertreasurer_to_current_treasurer_errors(conn):
+    db.ensure_treasurer(conn, 111)
+    seed_members(conn)
+    update, context = make_update(user_id=111), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_transfertreasurer(update, context))
+    assert "Could not transfer" in reply_text_of(update)
+
+
+# --- Phase 4: relink -------------------------------------------------------------
+
+
+def test_relink_arms_pending_flag(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_relink(update, context))
+    assert db.get_setting(conn, "relink:1007654") == "pending"
+    assert "NEW Telegram account" in reply_text_of(update)
+
+
+def test_relink_unknown_member(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["9999999"]
+    asyncio.run(admin.cmd_relink(update, context))
+    assert "No member" in reply_text_of(update)
+
+
+# --- Phase 4: settings -----------------------------------------------------------
+
+
+def test_settings_lists_defaults(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_settings(update, context))
+    text = reply_text_of(update)
+    assert "school_uen = 200913519CSL5 (default)" in text
+    assert "school_bill_number" in text
+
+
+def test_settings_set_and_show_override(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["school_merchant_name", "NEW", "SCHOOL", "NAME"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert db.get_setting(conn, "school_merchant_name") == "NEW SCHOOL NAME"
+
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_settings(update, context))
+    text = reply_text_of(update)
+    assert "school_merchant_name = NEW SCHOOL NAME" in text
+    assert "school_merchant_name = NEW SCHOOL NAME (default)" not in text
+
+
+def test_settings_rejects_unknown_key(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["nonsense", "value"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert "Unknown setting" in reply_text_of(update)
+
+
+def test_settings_denies_non_treasurer(conn):
+    update, context = make_update(user_id=111), make_context(conn)
+    asyncio.run(admin.cmd_settings(update, context))
+    assert "Only the treasurer" in reply_text_of(update)

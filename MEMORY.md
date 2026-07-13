@@ -17,6 +17,57 @@ FLYMAX account) gets rare exception pings + a weekly audit digest.
 
 ## Current status (update this every session!)
 
+- **2026-07-13 — Phase 4 (admin management & Sheet mirror) + Phase 5 ship
+  artifacts built. 127 pytest tests pass. Feature-complete per the PRD.**
+
+  Session started with a repo health check: Phase 3 *was* committed after all
+  (commit `541b09f "latest update"`, 2026-06-25 — the previous session's
+  "nothing committed" note was stale). Found 3 stale tests still using
+  pre-`1010` SUTD IDs (the validator requires 7 digits starting `1010`);
+  fixed the tests, the code was correct.
+
+  **Phase 4 — new features**
+  - `/addadmin <sutd_id>`, `/removeadmin <sutd_id>` — admins by SUTD ID; the
+    treasurer role cannot be removed this way.
+  - `/transfertreasurer <sutd_id>` — hands over the role, DMs the new
+    treasurer, the old treasurer stays on as admin. DB treasurer wins over
+    `.env` on restart (unchanged `ensure_treasurer` behaviour).
+  - `/relink <sutd_id>` — treasurer arms a pending flag (settings key
+    `relink:<sutd_id>`); the member re-registers via /start from the NEW
+    account with the same SUTD ID, and `db.relink_member` moves the member row,
+    payment history, and any admin role to the new Telegram ID (FKs are
+    briefly disabled inside one transaction because telegram_user_id is the
+    members PK). Flag is cleared after use; without the flag, duplicate SUTD
+    IDs are still blocked.
+  - `/settings` — view/set `school_uen`, `school_merchant_name`,
+    `school_bill_number`, `school_recipient_match` in the settings table.
+    `payments.SchoolConfig` + `school_config(conn)` feed both QR generation
+    (bot /pay + term-start blast) and receipt verification; PRD defaults apply
+    when a key is unset.
+  - Google Sheet mirror (`clubbot/sheets.py`): read-only Members + Payments
+    tabs, full rebuild each sync ("mirror, not database"). `snapshot()` reads
+    SQLite on the event loop; `push()` (gspread network I/O) runs via
+    `asyncio.to_thread`. Debounced 30-s on-change sync
+    (`scheduler.request_sheet_sync`, named job `sheet-sync`) triggered by
+    registration, relink, receipt verdicts, treasurer review, /markpaid,
+    /revoke; nightly full rebuild 02:30 SGT (`sheet-nightly`). Disabled unless
+    BOTH `GOOGLE_SERVICE_ACCOUNT_FILE` and `SHEET_ID` are set in `.env`.
+    `gspread>=6.0` added to requirements.
+
+  **Phase 5 — ship artifacts**
+  - `deploy/clubbot.service` systemd unit; README gained: VM deploy steps,
+    daily `clubbot.db` backup cron, Google Sheet setup guide, and a
+    treasurer-handover checklist.
+
+  **Not yet done / next session**
+  - Sheet mirror not tested against a real Google Sheet (unit-tested with a
+    fake spreadsheet only). Needs the treasurer to create the service account
+    + Sheet and do one live sync.
+  - New commands not yet exercised on real Telegram (all unit-tested).
+    Suggested live smoke: /settings, /addadmin, /relink flow with a second
+    account, /transfertreasurer (and transfer back).
+  - Live-term watch items from the 2026-06-20 session still stand.
+
 - **2026-06-20 (later) — Phase 3 (lifecycle & auditing) built. 107 pytest tests pass.**
 
   Implemented in one push, kept in clean modules that follow the existing
@@ -298,13 +349,21 @@ FLYMAX account) gets rare exception pings + a weekly audit digest.
 4. ~~Phase 3 — lifecycle and auditing~~ ✅ done 2026-06-20. Term-start blast +
    day-7 reminder, weekly flag-only FLYMAX audit digest, `/unpaid` `/stats`
    `/members` `/markpaid` `/remind` `/audit` `/flag` `/revoke`, restart-safe jobs.
-5. **Next engineering phase: Phase 4 — admin management & mirror.** `/addadmin`,
-   `/removeadmin`, `/transfertreasurer`, `/relink <sutd_id>` (member changed
-   Telegram account — already referenced in registration text), `/settings`
-   (PayNow proxy / merchant name editable), and the read-only Google Sheet mirror.
-6. Watch the first live term: confirm the term-start blast and day-7 nudge fire on
+5. ~~Phase 4 — admin management & mirror~~ ✅ done 2026-07-13. All PRD commands
+   plus the Google Sheet mirror; ship artifacts (systemd unit, deploy/handover
+   README) also done. **The bot is feature-complete per the PRD.**
+6. **Launch checklist (user actions):**
+   - Wipe test data before real launch: stop the bot, delete `clubbot.db`
+     (test member "noobslayer" 1010345 and the S$0.05 test term live there),
+     restart. NOTE: this also clears `receipt_fingerprints` — acceptable only
+     this once, before the first real term ever opens.
+   - Deploy to the free-tier VM per README (systemd + backup cron).
+   - Optional: set up the Google Sheet mirror (README steps) and do one live sync.
+   - Live smoke of the new commands: /settings, /addadmin, /relink with a
+     second account, /transfertreasurer (and back).
+   - Open the first real term with `/newterm <name> 20.00 <start> <end>`.
+   - Decide Gemini free vs paid at launch; ask SUTD finance about
+     per-transaction email alerts (optional, would enable full bank confirmation).
+7. Watch the first live term: confirm the term-start blast and day-7 nudge fire on
    schedule, and that a reboot mid-term does not re-blast (the `_notified_at`
    stamps should prevent it).
-7. Pending user actions: provide the real term fee (S$20.00) + dates to open the
-   first real term; decide Gemini free vs paid at launch; ask SUTD finance about
-   per-transaction email alerts (optional, would enable full bank confirmation).

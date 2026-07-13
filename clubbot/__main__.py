@@ -4,6 +4,7 @@ import logging
 
 from clubbot import bot, config, db
 from clubbot.gemini import GeminiExtractor
+from clubbot.sheets import SheetMirror
 
 
 def main() -> None:
@@ -18,7 +19,15 @@ def main() -> None:
         if cfg.gemini_api_key
         else None
     )
-    app = bot.build_application(cfg.bot_token, conn, extractor=extractor)
+    sheet = None
+    if cfg.google_credentials and cfg.sheet_id:
+        sheet = SheetMirror.from_config(cfg.google_credentials, cfg.sheet_id)
+    elif cfg.google_credentials or cfg.sheet_id:
+        logging.warning(
+            "Google Sheet mirror needs BOTH GOOGLE_SERVICE_ACCOUNT_FILE and "
+            "SHEET_ID; mirror disabled."
+        )
+    app = bot.build_application(cfg.bot_token, conn, extractor=extractor, sheet=sheet)
     app.run_polling()
 
 

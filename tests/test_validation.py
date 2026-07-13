@@ -16,10 +16,11 @@ def test_name_allows_non_ascii():
 
 
 def test_sutd_id_accepts_seven_digits():
-    assert validation.normalize_sutd_id(" 1007654 ") == "1007654"
+    assert validation.normalize_sutd_id(" 1010654 ") == "1010654"
 
 
 def test_sutd_id_rejects_bad_input():
-    assert validation.normalize_sutd_id("100765") is None       # 6 digits
-    assert validation.normalize_sutd_id("10076545") is None     # 8 digits
+    assert validation.normalize_sutd_id("101065") is None       # 6 digits
+    assert validation.normalize_sutd_id("10106545") is None     # 8 digits
     assert validation.normalize_sutd_id("abcdefg") is None      # not digits
+    assert validation.normalize_sutd_id("1007654") is None      # wrong prefix

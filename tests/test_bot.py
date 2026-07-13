@@ -38,6 +38,7 @@ def make_context(conn, extractor=None):
     # No real JobQueue in unit tests; /newterm's live scheduling is a no-op here
     # and is covered directly in test_scheduler.py.
     context.application.job_queue = None
+    context.application.bot_data = context.bot_data
     return context
 
 
@@ -53,7 +54,7 @@ def test_start_unregistered_asks_for_name(conn):
 
 def test_start_when_registered_shows_status(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     update, context = make_update(text="/start"), make_context(conn)
     assert asyncio.run(bot.cmd_start(update, context)) == ConversationHandler.END
@@ -67,16 +68,16 @@ def test_full_registration_flow(conn):
     update = make_update(text="Alice Tan")
     assert asyncio.run(bot.on_name(update, context)) == bot.ASK_SUTD_ID
 
-    update = make_update(text="1007654")
+    update = make_update(text="1010654")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
-    assert "1007654" in reply_text_of(update)
+    assert "1010654" in reply_text_of(update)
 
     update = make_update(text="yes")
     assert asyncio.run(bot.on_confirm(update, context)) == ConversationHandler.END
 
     member = db.get_member(conn, 111)
     assert member["full_name"] == "Alice Tan"
-    assert member["sutd_id"] == "1007654"
+    assert member["sutd_id"] == "1010654"
     assert member["username"] == "alice"
 
 
@@ -95,18 +96,18 @@ def test_invalid_sutd_id_reprompts(conn):
 
 def test_duplicate_sutd_id_blocked(conn):
     db.add_member(
-        conn, telegram_user_id=999, full_name="Bob Lim", sutd_id="1007654", username=None
+        conn, telegram_user_id=999, full_name="Bob Lim", sutd_id="1010654", username=None
     )
     context = make_context(conn)
     context.user_data["full_name"] = "Alice Tan"
-    update = make_update(text="1007654")
+    update = make_update(text="1010654")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.ASK_SUTD_ID
     assert "already registered" in reply_text_of(update)
 
 
 def test_confirm_no_cancels(conn):
     context = make_context(conn)
-    context.user_data.update({"full_name": "Alice Tan", "sutd_id": "1007654"})
+    context.user_data.update({"full_name": "Alice Tan", "sutd_id": "1010654"})
     update = make_update(text="no")
     assert asyncio.run(bot.on_confirm(update, context)) == ConversationHandler.END
     assert db.get_member(conn, 111) is None
@@ -114,9 +115,45 @@ def test_confirm_no_cancels(conn):
 
 def test_confirm_gibberish_reprompts(conn):
     context = make_context(conn)
-    context.user_data.update({"full_name": "Alice Tan", "sutd_id": "1007654"})
+    context.user_data.update({"full_name": "Alice Tan", "sutd_id": "1010654"})
     update = make_update(text="maybe")
     assert asyncio.run(bot.on_confirm(update, context)) == bot.CONFIRM
+
+
+def test_relink_registration_moves_history(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    term = create_active_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_setting(conn, "relink:1010654", "pending")
+
+    context = make_context(conn)
+    context.user_data["full_name"] = "Alice Tan"
+    update = make_update(user_id=555, text="1010654", username="alice_new")
+    assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
+
+    update = make_update(user_id=555, text="yes", username="alice_new")
+    assert asyncio.run(bot.on_confirm(update, context)) == ConversationHandler.END
+    assert "relinked" in reply_text_of(update).lower() or "linked" in reply_text_of(update)
+
+    member = db.get_member(conn, 555)
+    assert member["sutd_id"] == "1010654"
+    assert member["username"] == "alice_new"
+    assert db.get_member(conn, 111) is None
+    assert db.get_payment(conn, payment["id"])["telegram_user_id"] == 555
+    assert db.get_setting(conn, "relink:1010654") is None
+
+
+def test_relink_not_armed_still_blocks_duplicate_id(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    context = make_context(conn)
+    context.user_data["full_name"] = "Impostor"
+    update = make_update(user_id=555, text="1010654", username="impostor")
+    assert asyncio.run(bot.on_sutd_id(update, context)) == bot.ASK_SUTD_ID
+    assert "already registered" in reply_text_of(update)
 
 
 def test_status_unregistered(conn):
@@ -127,7 +164,7 @@ def test_status_unregistered(conn):
 
 def test_status_registered(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     update, context = make_update(text="/status"), make_context(conn)
     asyncio.run(bot.cmd_status(update, context))
@@ -136,7 +173,7 @@ def test_status_registered(conn):
 
 def test_status_shows_username_and_next_steps(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     update, context = make_update(text="/status"), make_context(conn)
     asyncio.run(bot.cmd_status(update, context))
@@ -147,7 +184,7 @@ def test_status_shows_username_and_next_steps(conn):
 
 def test_status_refreshes_changed_username(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     update = make_update(text="/status", username="alice_new")
     asyncio.run(bot.cmd_status(update, make_context(conn)))
@@ -157,7 +194,7 @@ def test_status_refreshes_changed_username(conn):
 
 def test_start_refreshes_changed_username(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     update = make_update(text="/start", username="alice_new")
     asyncio.run(bot.cmd_start(update, make_context(conn)))
@@ -166,20 +203,20 @@ def test_start_refreshes_changed_username(conn):
 
 def test_status_without_username_has_no_handle(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username=None
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username=None
     )
     update = make_update(text="/status", username=None)
     asyncio.run(bot.cmd_status(update, make_context(conn)))
     text = reply_text_of(update)
     assert "Fee collection is not open" in text
     assert "@" not in text
-    assert "(SUTD ID 1007654)" in text
+    assert "(SUTD ID 1010654)" in text
 
 
 def test_build_application_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     assert app.bot_data["db"] is conn
-    assert len(app.handlers[0]) == 16
+    assert len(app.handlers[0]) == 21
 
 
 def create_active_term(conn, treasurer_id=999):
@@ -221,7 +258,7 @@ def test_non_treasurer_cannot_create_term(conn):
 
 def test_pay_sends_personal_qr(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     create_active_term(conn)
     update, context = make_update(text="/pay"), make_context(conn)
@@ -246,7 +283,7 @@ class FakeExtractor:
 
 def test_valid_receipt_is_auto_verified(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     term = create_active_term(conn)
     payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
@@ -279,7 +316,7 @@ def test_valid_receipt_is_auto_verified(conn):
 
 def test_wrong_receipt_notifies_treasurer(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     db.ensure_treasurer(conn, 999)
     term = create_active_term(conn)
@@ -310,10 +347,10 @@ def test_wrong_receipt_notifies_treasurer(conn):
 
 def test_duplicate_transaction_is_flagged_without_database_error(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     db.add_member(
-        conn, telegram_user_id=222, full_name="Bob Lim", sutd_id="1007655", username="bob"
+        conn, telegram_user_id=222, full_name="Bob Lim", sutd_id="1010655", username="bob"
     )
     db.ensure_treasurer(conn, 999)
     term = create_active_term(conn)
@@ -367,7 +404,7 @@ def test_duplicate_transaction_is_flagged_without_database_error(conn):
 
 def test_receipt_requires_pay_command_first(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     create_active_term(conn)
     update = make_update()
@@ -378,7 +415,7 @@ def test_receipt_requires_pay_command_first(conn):
 
 def test_exact_receipt_image_cannot_be_reused(conn):
     db.add_member(
-        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username="alice"
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     term = create_active_term(conn)
     payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])

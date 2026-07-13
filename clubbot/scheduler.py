@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import sqlite3
@@ -11,12 +12,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from clubbot import db
 from clubbot.format import money
-from clubbot.payments import SINGAPORE_TIME, build_member_qr
+from clubbot.payments import SINGAPORE_TIME, build_member_qr, school_config
 
 log = logging.getLogger(__name__)
 
 REMINDER_HOUR = 10  # 10:00 SGT for term-start blast and day-7 reminder
 AUDIT_HOUR = 9      # 09:00 SGT for the weekly digest
+SHEET_HOUR = 2      # 02:30 SGT nightly full Sheet rebuild
+SHEET_SYNC_DELAY = timedelta(seconds=30)  # debounce for on-change syncs
 
 
 # --- Pure run-time calculators (no I/O) ----------------------------------------
@@ -69,6 +72,7 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
         "Expand the transfer details so the amount, recipient, Billing ID, "
         "payment time, and bank reference number are visible."
     )
+    school = school_config(conn)
     for member in db.list_active_members(conn):
         payment = db.get_or_create_payment(
             conn, member_id=member["telegram_user_id"], term_id=term_id
@@ -77,7 +81,7 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
             continue
         payment = db.mark_qr_issued(conn, payment["id"])
         qr = build_member_qr(
-            fee_cents=term["fee_cents"], reference=payment["ref_code"]
+            fee_cents=term["fee_cents"], reference=payment["ref_code"], school=school
         )
         image = io.BytesIO(qr)
         image.name = "membership-paynow.png"
@@ -171,6 +175,31 @@ async def _job_reminder7(context) -> None:
     await do_reminder7(context.bot, conn, context.job.data["term_id"])
 
 
+async def _job_sheet_sync(context) -> None:
+    mirror = context.bot_data.get("sheet")
+    if mirror is None:
+        return
+    conn = context.bot_data["db"]
+    members, payments = mirror.snapshot(conn)
+    try:
+        await asyncio.to_thread(mirror.push, members, payments)
+    except Exception:
+        log.warning("Google Sheet sync failed", exc_info=True)
+
+
+def request_sheet_sync(app) -> None:
+    """Debounced 'sync the Sheet soon' after a data change.
+
+    No-op when no mirror is configured or the JobQueue is missing; the nightly
+    rebuild remains the backstop.
+    """
+    if app.bot_data.get("sheet") is None or app.job_queue is None:
+        return
+    for existing in app.job_queue.get_jobs_by_name("sheet-sync"):
+        existing.schedule_removal()
+    app.job_queue.run_once(_job_sheet_sync, when=SHEET_SYNC_DELAY, name="sheet-sync")
+
+
 async def _job_audit(context) -> None:
     # run_daily fires every day; act only on Mondays so the digest is weekly
     # without depending on PTB's day indexing.
@@ -209,6 +238,12 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
         _job_audit,
         time=time(hour=AUDIT_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
         name="audit-digest",
+    )
+    # Nightly Sheet rebuild; the job itself no-ops when no mirror is configured.
+    jq.run_daily(
+        _job_sheet_sync,
+        time=time(hour=SHEET_HOUR, minute=30, tzinfo=SINGAPORE_TIME),
+        name="sheet-nightly",
     )
 
 

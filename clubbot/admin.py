@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 
 from clubbot import db, scheduler
 from clubbot.format import money
+from clubbot.payments import SchoolConfig, school_config
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ async def cmd_markpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     payment = db.mark_paid_manual(
         conn, member_id=member["telegram_user_id"], term_id=term["id"]
     )
+    scheduler.request_sheet_sync(context.application)
     await update.message.reply_text(
         f"Marked {payment['full_name']} as paid for {payment['term_name']}."
     )
@@ -200,6 +202,7 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except ValueError as exc:
         await update.message.reply_text(f"Could not revoke: {exc}")
         return
+    scheduler.request_sheet_sync(context.application)
     await update.message.reply_text(
         f"Revoked {payment['full_name']}'s membership for {payment['term_name']}."
     )
@@ -210,6 +213,134 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "because it could not be confirmed against the bank. "
             "Please contact the treasurer."
         ),
+    )
+
+
+# --- Phase 4: admin management, relink, settings --------------------------------
+
+
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_TREASURER)
+        return
+    member = await _resolve_member(update, context)
+    if member is None:
+        return
+    try:
+        db.add_admin(
+            conn,
+            telegram_user_id=member["telegram_user_id"],
+            added_by=update.effective_user.id,
+        )
+    except ValueError as exc:
+        await update.message.reply_text(f"Could not add admin: {exc}")
+        return
+    await update.message.reply_text(f"{member['full_name']} is now an admin.")
+
+
+async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_TREASURER)
+        return
+    member = await _resolve_member(update, context)
+    if member is None:
+        return
+    try:
+        db.remove_admin(conn, member["telegram_user_id"])
+    except ValueError as exc:
+        await update.message.reply_text(f"Could not remove admin: {exc}")
+        return
+    await update.message.reply_text(f"{member['full_name']} is no longer an admin.")
+
+
+async def cmd_transfertreasurer(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_TREASURER)
+        return
+    member = await _resolve_member(update, context)
+    if member is None:
+        return
+    try:
+        db.transfer_treasurer(conn, new_treasurer_id=member["telegram_user_id"])
+    except ValueError as exc:
+        await update.message.reply_text(f"Could not transfer: {exc}")
+        return
+    await update.message.reply_text(
+        f"{member['full_name']} is now the treasurer. You remain an admin."
+    )
+    await context.bot.send_message(
+        chat_id=member["telegram_user_id"],
+        text=(
+            "You are now the club treasurer. Send /help to see the treasurer "
+            "commands, including payment review and the weekly audit."
+        ),
+    )
+
+
+def _relink_key(sutd_id: str) -> str:
+    return f"relink:{sutd_id}"
+
+
+async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_TREASURER)
+        return
+    member = await _resolve_member(update, context)
+    if member is None:
+        return
+    db.set_setting(conn, _relink_key(member["sutd_id"]), "pending")
+    await update.message.reply_text(
+        f"Relink armed for {member['full_name']} (SUTD ID {member['sutd_id']}).\n"
+        "Ask them to send /start from their NEW Telegram account and register "
+        "with the same SUTD ID. Their payment history will move over."
+    )
+
+
+SETTING_KEYS = (
+    "school_uen",
+    "school_merchant_name",
+    "school_bill_number",
+    "school_recipient_match",
+)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_TREASURER)
+        return
+    if not context.args:
+        current = school_config(conn)
+        defaults = SchoolConfig()
+        lines = ["Current settings:"]
+        for key in SETTING_KEYS:
+            attr = key.removeprefix("school_")
+            value = getattr(current, attr)
+            suffix = " (default)" if value == getattr(defaults, attr) else ""
+            lines.append(f"{key} = {value}{suffix}")
+        lines.append("\nChange with: /settings <key> <value>")
+        await update.message.reply_text("\n".join(lines))
+        return
+    key = context.args[0]
+    if key not in SETTING_KEYS:
+        await update.message.reply_text(
+            "Unknown setting. Available keys:\n" + "\n".join(SETTING_KEYS)
+        )
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(f"Usage: /settings {key} <value>")
+        return
+    value = " ".join(context.args[1:]).strip()
+    db.set_setting(conn, key, value)
+    await update.message.reply_text(
+        f"{key} set to: {value}\n"
+        "This affects newly generated QRs and receipt verification immediately."
     )
 
 

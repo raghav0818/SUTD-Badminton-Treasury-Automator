@@ -1,0 +1,18 @@
+# systemd unit for the SUTD Badminton Club payment bot (PRD Phase 5).
+# Install: sudo cp deploy/clubbot.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now clubbot
+[Unit]
+Description=SUTD Badminton Club payment bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clubbot
+WorkingDirectory=/opt/clubbot
+ExecStart=/opt/clubbot/.venv/bin/python -m clubbot
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

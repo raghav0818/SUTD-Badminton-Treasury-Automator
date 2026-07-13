@@ -26,6 +26,7 @@ from clubbot.format import money
 from clubbot.payments import (
     build_member_qr,
     normalise_transaction_id,
+    school_config,
     verify_extracted_payment,
 )
 
@@ -58,6 +59,10 @@ REGISTERED = (
     "You'll get a message here when membership fee collection opens. "
     "Check /status at any time."
 )
+RELINKED = (
+    "Welcome back, {name}! This Telegram account is now linked to your "
+    "membership, and your payment history has moved over. Check /status."
+)
 CANCELLED = "Registration cancelled. Send /start whenever you're ready."
 NOT_REGISTERED = "You're not registered yet. Send /start to register."
 HELP_TEXT = (
@@ -78,7 +83,12 @@ ADMIN_HELP = (
     "/remind - nudge unpaid members now\n"
     "/audit - get the FLYMAX check-list now\n"
     "/flag <sutd_id> - mark a payment as unconfirmed in FLYMAX\n"
-    "/revoke <sutd_id> - remove a membership"
+    "/revoke <sutd_id> - remove a membership\n"
+    "/addadmin <sutd_id> - make a member an admin\n"
+    "/removeadmin <sutd_id> - remove an admin\n"
+    "/transfertreasurer <sutd_id> - hand over the treasurer role\n"
+    "/relink <sutd_id> - let a member re-register from a new Telegram account\n"
+    "/settings - view or change the PayNow/verification settings"
 )
 
 
@@ -144,8 +154,10 @@ async def on_sutd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(BAD_SUTD_ID)
         return ASK_SUTD_ID
     if db.get_member_by_sutd_id(_db(context), sutd_id) is not None:
-        await update.message.reply_text(SUTD_ID_TAKEN)
-        return ASK_SUTD_ID
+        if db.get_setting(_db(context), f"relink:{sutd_id}") is None:
+            await update.message.reply_text(SUTD_ID_TAKEN)
+            return ASK_SUTD_ID
+        context.user_data["relink"] = True
     context.user_data["sutd_id"] = sutd_id
     await update.message.reply_text(
         CONFIRM_PROMPT.format(name=context.user_data["full_name"], sutd_id=sutd_id)
@@ -157,15 +169,30 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     answer = update.message.text.strip().lower()
     if answer in ("yes", "y"):
         user = update.effective_user
+        name = context.user_data["full_name"]
+        sutd_id = context.user_data["sutd_id"]
+        if context.user_data.get("relink"):
+            db.relink_member(
+                _db(context),
+                sutd_id=sutd_id,
+                new_telegram_id=user.id,
+                full_name=name,
+                username=user.username,
+            )
+            db.delete_setting(_db(context), f"relink:{sutd_id}")
+            context.user_data.clear()
+            scheduler.request_sheet_sync(context.application)
+            await update.message.reply_text(RELINKED.format(name=name))
+            return ConversationHandler.END
         db.add_member(
             _db(context),
             telegram_user_id=user.id,
-            full_name=context.user_data["full_name"],
-            sutd_id=context.user_data["sutd_id"],
+            full_name=name,
+            sutd_id=sutd_id,
             username=user.username,
         )
-        name = context.user_data["full_name"]
         context.user_data.clear()
+        scheduler.request_sheet_sync(context.application)
         await update.message.reply_text(REGISTERED.format(name=name))
         return ConversationHandler.END
     if answer in ("no", "n"):
@@ -259,7 +286,9 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     payment = db.mark_qr_issued(conn, payment["id"])
     qr = build_member_qr(
-        fee_cents=term["fee_cents"], reference=payment["ref_code"]
+        fee_cents=term["fee_cents"],
+        reference=payment["ref_code"],
+        school=school_config(conn),
     )
     image = io.BytesIO(qr)
     image.name = "membership-paynow.png"
@@ -370,6 +399,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         term_end=term["end_date"],
         qr_issued_at=payment["qr_issued_at"],
         duplicate_transaction=duplicate_txn,
+        school=school_config(conn),
     )
     if result.outcome == "retry":
         db.reset_payment_for_retry(conn, payment["id"])
@@ -393,6 +423,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         payment_timestamp=extracted.payment_timestamp,
         verified_by="auto" if result.passed else None,
     )
+    scheduler.request_sheet_sync(context.application)
     if result.passed:
         await update.message.reply_text(
             f"Payment receipt accepted.\n\n{term['name']}\n"
@@ -463,6 +494,7 @@ async def on_payment_review(
         )
         return
     approved = action == "approve"
+    scheduler.request_sheet_sync(context.application)
     await query.edit_message_text(
         f"Payment {'approved' if approved else 'rejected'} for "
         f"{payment['full_name']} ({payment['term_name']})."
@@ -477,11 +509,16 @@ async def on_payment_review(
 
 
 def build_application(
-    token: str, conn: sqlite3.Connection, *, extractor: Any | None = None
+    token: str,
+    conn: sqlite3.Connection,
+    *,
+    extractor: Any | None = None,
+    sheet: Any | None = None,
 ) -> Application:
     app = Application.builder().token(token).build()
     app.bot_data["db"] = conn
     app.bot_data["extractor"] = extractor
+    app.bot_data["sheet"] = sheet
     registration = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -506,6 +543,11 @@ def build_application(
     app.add_handler(CommandHandler("audit", admin.cmd_audit))
     app.add_handler(CommandHandler("flag", admin.cmd_flag))
     app.add_handler(CommandHandler("revoke", admin.cmd_revoke))
+    app.add_handler(CommandHandler("addadmin", admin.cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin", admin.cmd_removeadmin))
+    app.add_handler(CommandHandler("transfertreasurer", admin.cmd_transfertreasurer))
+    app.add_handler(CommandHandler("relink", admin.cmd_relink))
+    app.add_handler(CommandHandler("settings", admin.cmd_settings))
     app.add_handler(
         CallbackQueryHandler(on_payment_review, pattern=r"^payment:(approve|reject):\d+$")
     )

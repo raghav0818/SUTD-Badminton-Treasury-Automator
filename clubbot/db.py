@@ -209,9 +209,100 @@ def get_treasurer_id(conn: sqlite3.Connection) -> int | None:
     return row["telegram_user_id"] if row else None
 
 
+def add_admin(conn: sqlite3.Connection, *, telegram_user_id: int, added_by: int) -> None:
+    role = get_role(conn, telegram_user_id)
+    if role == "treasurer":
+        raise ValueError("this member is the treasurer")
+    if role == "admin":
+        raise ValueError("this member is already an admin")
+    conn.execute(
+        "INSERT INTO admins (telegram_user_id, role, added_by) VALUES (?, 'admin', ?)",
+        (telegram_user_id, added_by),
+    )
+    conn.commit()
+
+
+def remove_admin(conn: sqlite3.Connection, telegram_user_id: int) -> None:
+    role = get_role(conn, telegram_user_id)
+    if role == "treasurer":
+        raise ValueError("the treasurer cannot be removed; use /transfertreasurer")
+    if role != "admin":
+        raise ValueError("this member is not an admin")
+    conn.execute(
+        "DELETE FROM admins WHERE telegram_user_id = ?", (telegram_user_id,)
+    )
+    conn.commit()
+
+
+def transfer_treasurer(conn: sqlite3.Connection, *, new_treasurer_id: int) -> None:
+    """Hand the treasurer role over; the previous treasurer stays on as an admin."""
+    old = get_treasurer_id(conn)
+    if old == new_treasurer_id:
+        raise ValueError("this member is already the treasurer")
+    conn.execute("DELETE FROM admins WHERE telegram_user_id = ?", (new_treasurer_id,))
+    if old is not None:
+        conn.execute(
+            "UPDATE admins SET role = 'admin' WHERE telegram_user_id = ?", (old,)
+        )
+    conn.execute(
+        "INSERT INTO admins (telegram_user_id, role, added_by) VALUES (?, 'treasurer', ?)",
+        (new_treasurer_id, old),
+    )
+    conn.commit()
+
+
+def relink_member(
+    conn: sqlite3.Connection,
+    *,
+    sutd_id: str,
+    new_telegram_id: int,
+    full_name: str,
+    username: str | None,
+) -> None:
+    """Move a member (and their payment history + admin role) to a new Telegram account."""
+    member = get_member_by_sutd_id(conn, sutd_id)
+    if member is None:
+        raise ValueError("no member with this SUTD ID")
+    old = member["telegram_user_id"]
+    if get_member(conn, new_telegram_id) is not None:
+        raise ValueError("the new Telegram account is already registered")
+    conn.commit()
+    # telegram_user_id is the members PK that payments/admins reference, so the
+    # move must bypass FK enforcement for the duration of one transaction.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute(
+            "UPDATE payments SET member_id = ? WHERE member_id = ?",
+            (new_telegram_id, old),
+        )
+        conn.execute(
+            "UPDATE admins SET telegram_user_id = ? WHERE telegram_user_id = ?",
+            (new_telegram_id, old),
+        )
+        conn.execute(
+            """
+            UPDATE members
+            SET telegram_user_id = ?, full_name = ?, username = ?
+            WHERE telegram_user_id = ?
+            """,
+            (new_telegram_id, full_name, username, old),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def get_setting(conn: sqlite3.Connection, key: str) -> str | None:
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else None
+
+
+def delete_setting(conn: sqlite3.Connection, key: str) -> None:
+    conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+    conn.commit()
 
 
 def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -711,3 +802,16 @@ def mark_term_reminder7_sent(conn: sqlite3.Connection, term_id: int) -> None:
 
 def list_terms(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM terms ORDER BY start_date, id").fetchall()
+
+
+def list_payments(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All payments joined with member and term, for the Sheet mirror."""
+    return conn.execute(
+        """
+        SELECT p.*, m.full_name, m.sutd_id, t.name AS term_name
+        FROM payments p
+        JOIN members m ON m.telegram_user_id = p.member_id
+        JOIN terms t ON t.id = p.term_id
+        ORDER BY t.start_date, t.id, m.full_name
+        """
+    ).fetchall()

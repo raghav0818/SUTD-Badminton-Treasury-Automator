@@ -13,6 +13,8 @@ class Config:
     db_path: str
     gemini_api_key: str
     gemini_model: str
+    google_credentials: str
+    sheet_id: str
 
 
 def load_config() -> Config:
@@ -29,4 +31,6 @@ def load_config() -> Config:
         db_path=os.environ.get("DB_PATH", "clubbot.db"),
         gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        google_credentials=os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", ""),
+        sheet_id=os.environ.get("SHEET_ID", ""),
     )
