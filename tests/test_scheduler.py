@@ -40,66 +40,160 @@ def _member(conn, uid, sutd_id, name="Member"):
     )
 
 
-# --- Pure run-time calculators -------------------------------------------------
+# --- Pure due-date calculators ------------------------------------------------
+
+TERM = {"start_date": "2026-09-01", "deadline": "2026-09-15"}  # starts on a Tuesday
 
 
-def test_term_start_run_time_future_start_is_ten_am_sgt():
-    now = datetime(2026, 6, 18, 12, 0, tzinfo=SINGAPORE_TIME)
-    term = {"start_date": "2026-06-20"}
-    when = scheduler.term_start_run_time(term, now)
-    assert when == datetime(2026, 6, 20, 10, 0, tzinfo=SINGAPORE_TIME)
+def _events(term, calc, days=20):
+    start = date.fromisoformat(term["start_date"])
+    days = (start + timedelta(days=n) for n in range(days))
+    return {day.isoformat(): calc(term, day) for day in days if calc(term, day)}
 
 
-def test_term_start_run_time_past_start_returns_now():
-    now = datetime(2026, 6, 25, 15, 30, tzinfo=SINGAPORE_TIME)
-    term = {"start_date": "2026-06-20"}
-    assert scheduler.term_start_run_time(term, now) == now
+def test_reminder_events_days_3_7_10_13_then_last_call():
+    assert _events(TERM, scheduler.reminder_event) == {
+        "2026-09-04": "remind-d3",
+        "2026-09-08": "remind-d7",
+        "2026-09-11": "remind-d10",
+        "2026-09-14": "remind-d13",
+        "2026-09-15": "lastcall",
+    }
 
 
-def test_reminder7_run_time_is_seven_days_after_start():
-    term = {"start_date": "2026-06-20"}
-    assert scheduler.reminder7_run_time(term) == datetime(
-        2026, 6, 27, 10, 0, tzinfo=SINGAPORE_TIME
+def test_reminder_events_only_before_short_deadline():
+    term = {"start_date": "2026-09-01", "deadline": "2026-09-08"}  # deadline = day 7
+    assert _events(term, scheduler.reminder_event) == {
+        "2026-09-04": "remind-d3",
+        "2026-09-08": "lastcall",
+    }
+
+
+def test_group_posts_mondays_and_thursdays_until_deadline():
+    assert sorted(_events(TERM, scheduler.group_post_event)) == [
+        "2026-09-03", "2026-09-07", "2026-09-10", "2026-09-14",
+    ]
+    assert scheduler.group_post_event(TERM, date(2026, 9, 7)) == "grouppost-2026-09-07"
+
+
+# --- run_due_events ------------------------------------------------------------
+
+
+def _sgt(day, hour, minute=0):
+    return datetime.fromisoformat(day).replace(
+        hour=hour, minute=minute, tzinfo=SINGAPORE_TIME
     )
 
 
-# --- pending_term_jobs ---------------------------------------------------------
+def _fixed_term(conn, *, blasted=True):
+    term = db.create_term(
+        conn, name="Term 1", fee_cents=2000, start_date="2026-09-01",
+        end_date="2026-12-01", deadline="2026-09-15", created_by=999,
+    )
+    if blasted:
+        db.mark_term_start_notified(conn, term["id"])
+    return term
 
 
-def test_pending_term_jobs_fresh_term_yields_both(conn):
-    term = _term(conn)
-    now = datetime.now(SINGAPORE_TIME)
-    jobs = scheduler.pending_term_jobs(conn, now)
-    kinds = [kind for kind, _, _ in jobs]
-    assert kinds == ["start", "reminder7"]
-    assert all(t["id"] == term["id"] for _, t, _ in jobs)
+def _sent_to(fake_bot):
+    return [call.kwargs["chat_id"] for call in fake_bot.send_message.await_args_list]
 
 
-def test_pending_term_jobs_drops_start_after_stamp(conn):
-    term = _term(conn)
+def test_due_reminder_skips_paid_and_opted_out_and_never_resends(conn):
+    _member(conn, 111, "1000001", "Alice")
+    _member(conn, 222, "1000002", "Bob")
+    _member(conn, 333, "1000003", "Cara")
+    term = _fixed_term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    db.opt_out(conn, db.get_or_create_payment(conn, member_id=333, term_id=term["id"])["id"])
+
+    fake_bot = make_bot()
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-04", 10, 1)))
+    assert _sent_to(fake_bot) == [222]
+    kwargs = fake_bot.send_message.await_args.kwargs
+    assert "2026-09-15" in kwargs["text"]
+    buttons = [row[0].callback_data for row in kwargs["reply_markup"].inline_keyboard]
+    assert buttons == ["pay:start", f"optout:{term['id']}"]
+
+    # A restart re-runs the check: the stamp stops a second send.
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-04", 15)))
+    assert _sent_to(fake_bot) == [222]
+
+
+def test_due_reminder_waits_for_ten_am_and_skips_non_reminder_days(conn):
+    _member(conn, 111, "1000001", "Alice")
+    _fixed_term(conn)
+    fake_bot = make_bot()
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-04", 9, 59)))
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-05", 10, 1)))
+    fake_bot.send_message.assert_not_awaited()
+
+
+def test_due_last_call_on_deadline_and_nothing_after(conn):
+    _member(conn, 111, "1000001", "Alice")
+    term = _fixed_term(conn, blasted=False)
+    fake_bot = make_bot()
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-16", 10, 1)))
+    fake_bot.send_message.assert_not_awaited()  # not even the unsent blast
+
     db.mark_term_start_notified(conn, term["id"])
-    jobs = scheduler.pending_term_jobs(conn, datetime.now(SINGAPORE_TIME))
-    assert [kind for kind, _, _ in jobs] == ["reminder7"]
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-15", 10, 1)))
+    assert "Last call" in fake_bot.send_message.await_args.kwargs["text"]
 
 
-def test_pending_term_jobs_skips_reminder7_past_term_end(conn):
-    _term(conn, start_offset=-1, end_offset=4)  # 5-day term: day 7 is after end
-    jobs = scheduler.pending_term_jobs(conn, datetime.now(SINGAPORE_TIME))
-    assert [kind for kind, _, _ in jobs] == ["start"]
+def test_due_same_day_blast_replaces_reminder(conn):
+    _member(conn, 111, "1000001", "Alice")
+    term = _fixed_term(conn, blasted=False)  # e.g. /newterm run on day 3
+    fake_bot = make_bot()
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-04", 10, 1)))
+    assert _sent_to(fake_bot) == [111]
+    assert "collection is open" in fake_bot.send_message.await_args.kwargs["text"]
+    assert db.get_term(conn, term["id"])["start_notified_at"] is not None
+    assert db.claim_term_event(conn, term["id"], "remind-d3") is False
 
 
-def test_pending_term_jobs_ignores_ended_term(conn):
-    today = date.today()
-    db.create_term(
-        conn,
-        name="Old Term",
-        fee_cents=2000,
-        start_date=(today - timedelta(days=40)).isoformat(),
-        end_date=(today - timedelta(days=10)).isoformat(),
-        created_by=999,
-    )
-    jobs = scheduler.pending_term_jobs(conn, datetime.now(SINGAPORE_TIME))
-    assert jobs == []
+def test_group_posts_counts_only_no_names_once(conn):
+    db.replace_roster(conn, [("Alice Tan", "1000001"), ("Ghost Lee", "1010999")])
+    _member(conn, 111, "1000001", "Alice Tan")
+    _member(conn, 222, "1000002", "Bob Lim")
+    _member(conn, 333, "1000003", "Cara Ng")
+    term = _fixed_term(conn)
+    for uid in (111, 222):
+        db.mark_paid_manual(conn, member_id=uid, term_id=term["id"])
+    db.set_setting(conn, "comp_group_id", "-1001")
+    db.set_setting(conn, "rec_group_id", "-1002")
+
+    fake_bot = make_bot()
+    fake_bot.username = "ShuttleBot"
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-07", 11, 1)))
+    fake_bot.send_message.assert_not_awaited()  # Monday, but before 12:00
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-07", 12, 1)))
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-07", 13, 1)))
+
+    posts = {c.kwargs["chat_id"]: c.kwargs["text"] for c in fake_bot.send_message.await_args_list}
+    assert fake_bot.send_message.await_count == 2
+    assert "Competitive: 1/2 paid" in posts[-1001]
+    assert "1 rec members paid so far" in posts[-1002]
+    for text in posts.values():
+        assert "https://t.me/ShuttleBot?start=pay" in text
+        assert "2026-09-15" in text
+        for name in ("Alice", "Bob", "Cara", "Ghost"):
+            assert name not in text
+
+
+def test_group_posts_switch_off_and_send_failure(conn):
+    _fixed_term(conn)
+    db.set_setting(conn, "rec_group_id", "-1002")
+    db.set_setting(conn, "comp_group_id", "-1001")
+    fake_bot = make_bot()
+    db.set_setting(conn, "group_posts", "off")
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-03", 12, 1)))
+    fake_bot.send_message.assert_not_awaited()
+
+    db.set_setting(conn, "group_posts", "on")
+    fake_bot.send_message.side_effect = Exception("bot was kicked")
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-03", 12, 1)))
+    assert fake_bot.send_message.await_count == 2  # both tried, no crash
 
 
 # --- do_term_start_blast -------------------------------------------------------
@@ -142,6 +236,25 @@ def test_term_start_blast_skips_members_who_already_got_a_qr(conn):
     assert sent_to == {222}
 
 
+def test_term_start_blast_resumes_after_mid_blast_restart(conn):
+    _member(conn, 111, "1000001", "Alice")
+    _member(conn, 222, "1000002", "Bob")
+    term = _term(conn)
+    fake_bot = make_bot()
+    class Crash(BaseException):  # not caught by the per-member `except Exception`
+        pass
+
+    fake_bot.send_message.side_effect = [None, Crash()]  # process dies after Alice
+    with pytest.raises(Crash):
+        asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
+    assert db.get_term(conn, term["id"])["start_notified_at"] is None
+
+    fake_bot = make_bot()
+    asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
+    sent_to = [call.kwargs["chat_id"] for call in fake_bot.send_message.await_args_list]
+    assert sent_to == [222]
+
+
 def test_term_start_blast_total_failure_leaves_term_unstamped(conn):
     _member(conn, 111, "1000001", "Alice")
     term = _term(conn)
@@ -168,7 +281,7 @@ def test_term_start_blast_continues_after_send_failure(conn):
     assert db.get_term(conn, term["id"])["start_notified_at"] is not None
 
 
-# --- send_unpaid_reminders / do_reminder7 --------------------------------------
+# --- send_unpaid_reminders ----------------------------------------------------
 
 
 def test_send_unpaid_reminders_counts_and_skips_verified(conn):
@@ -199,14 +312,6 @@ def test_send_unpaid_reminders_counts_only_successful(conn):
     )
 
     assert count == 1
-
-
-def test_do_reminder7_stamps_term(conn):
-    _member(conn, 111, "1000001", "Alice")
-    term = _term(conn)
-    fake_bot = make_bot()
-    asyncio.run(scheduler.do_reminder7(fake_bot, conn, term["id"]))
-    assert db.get_term(conn, term["id"])["reminder7_sent_at"] is not None
 
 
 # --- do_weekly_backup ----------------------------------------------------------
@@ -265,29 +370,15 @@ def test_schedule_all_smoke(conn):
     _member(conn, 111, "1000001", "Alice")
     _term(conn)
     app = bot.build_application("1234567:TESTTOKEN", conn)
-    scheduler.schedule_all(app, conn)
     jobs = {job.name for job in app.job_queue.jobs()}
-    assert "weekly-backup" in jobs
-    assert "term-job-rearm" in jobs
-    assert "extract-retry" in jobs
-    assert len(app.job_queue.jobs()) >= 1
+    assert {"weekly-backup", "due-check", "due-check-now", "sheet-nightly", "extract-retry"} <= jobs
 
 
-def test_schedule_term_jobs_arms_a_live_term(conn):
-    # A term created while the bot is already running must get its jobs armed
-    # immediately, not only after a restart.
+def test_schedule_term_jobs_runs_a_due_check(conn):
+    # A term created while the bot is running must be checked right away,
+    # not only at the next hourly check.
     app = bot.build_application("1234567:TESTTOKEN", conn)
+    before = len(app.job_queue.get_jobs_by_name("due-check-now"))
     term = _term(conn)
     scheduler.schedule_term_jobs(app, conn, term["id"])
-    names = {job.name for job in app.job_queue.jobs()}
-    assert f"start-{term['id']}" in names
-    assert f"reminder7-{term['id']}" in names
-
-
-def test_schedule_term_jobs_is_idempotent(conn):
-    app = bot.build_application("1234567:TESTTOKEN", conn)
-    term = _term(conn)
-    scheduler.schedule_term_jobs(app, conn, term["id"])
-    scheduler.schedule_term_jobs(app, conn, term["id"])
-    start_jobs = [j for j in app.job_queue.jobs() if j.name == f"start-{term['id']}"]
-    assert len(start_jobs) == 1
+    assert len(app.job_queue.get_jobs_by_name("due-check-now")) == before + 1
