@@ -24,9 +24,10 @@ changing payment or verification logic.
   `/setgroup`, per-term opt-out button, registration gate (club group or
   roster), pay prompt right after registration, Gemini-failure auto-retry
   (15 min × 4, then treasurer review), audit/flag removed, consent line.
-  Built by 4 parallel subagents in 2 waves and merged; 189 tests pass.
-  A full `/code-review` of `main...v2-build` was started 2026-10-04 —
-  check whether its findings were fixed before merging.
+  Built by 4 parallel subagents in 2 waves and merged, then a full
+  `/code-review` of `main...v2-build`: all 10 findings fixed (commit
+  `bc44238`); 198 tests pass. Member/admin commands only work in private
+  chats (the bot sits in the club groups).
 - **v1 (on `main`)** was live-proven on real Telegram (registration + a real
   S$0.05 auto-verified payment). Bot name **SUTD ShuttleBuddy**, handle
   `@MyClubFinanceBot`. Scheduled jobs never observed over a real term.
