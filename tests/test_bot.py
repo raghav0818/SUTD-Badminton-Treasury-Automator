@@ -975,3 +975,56 @@ def test_both_paths_share_the_post_extraction_step(conn, monkeypatch):
     db.record_extract_failure(conn, payment["id"])  # as if that check had failed
     asyncio.run(bot.retry_failed_extractions(receipt_context(conn, extractor)))
     assert calls == [payment["id"], payment["id"]]
+
+
+def test_parse_newterm_args_allows_a_term_without_shirts():
+    parsed = bot.parse_newterm_args(
+        ["T", "2026-09-01", "2026-12-01", "deadline=2026-09-15", "comp=20",
+         "rec=25", "recshirt=25", "shirt=0"]
+    )
+    assert parsed["shirt_fee_cents"] == 0
+
+
+def test_failed_retry_does_not_count_against_a_newer_receipt(conn):
+    payment = setup_receipt(conn)
+    submit_failing_receipt(conn)
+
+    class ReplacedMidRetry:
+        async def extract(self, image_bytes, mime_type):
+            # The member sends a different receipt while Gemini is working.
+            db.mark_payment_pending(
+                conn, payment["id"], screenshot_file_id="FILE-NEW", image_hash="other"
+            )
+            raise RuntimeError("Gemini down")
+
+    asyncio.run(bot.retry_failed_extractions(receipt_context(conn, ReplacedMidRetry())))
+    saved = db.get_payment(conn, payment["id"])
+    assert (saved["extract_attempts"], saved["last_extract_error_at"]) == (0, None)
+
+
+def _command_update(app, chat_type):
+    from telegram import Chat, Message, MessageEntity, Update, User
+
+    message = Message(
+        message_id=1,
+        date=datetime.now(SINGAPORE_TIME),
+        chat=Chat(id=-100 if chat_type != "private" else 111, type=chat_type),
+        from_user=User(id=111, first_name="A", is_bot=False),
+        text="/pay",
+        entities=[MessageEntity(type="bot_command", offset=0, length=4)],
+    )
+    message.set_bot(app.bot)
+    return Update(update_id=1, message=message)
+
+
+def test_member_commands_are_ignored_in_group_chats(conn):
+    from telegram import User
+
+    app = bot.build_application("1234567:TESTTOKEN", conn)
+    pay = next(
+        h for h in app.handlers[0]
+        if getattr(h, "commands", None) == frozenset({"pay"})
+    )
+    app.bot._bot_user = User(id=1234567, first_name="Bot", is_bot=True, username="testbot")
+    assert pay.check_update(_command_update(app, "private"))
+    assert not pay.check_update(_command_update(app, "supergroup"))

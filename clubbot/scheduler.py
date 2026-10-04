@@ -164,12 +164,12 @@ def group_post_texts(bot, conn: sqlite3.Connection, term) -> dict[str, str]:
         f"Tap to pay: https://t.me/{bot.username}?start=pay"
     )
     return {
-        "comp_group_id": (
+        db.GROUP_KEYS["comp"]: (
             f"{term['name']} membership - Competitive: "
             f"{db.roster_paid_count(conn, term['id'])}/{db.roster_size(conn)} paid."
             + tail
         ),
-        "rec_group_id": (
+        db.GROUP_KEYS["rec"]: (
             f"{term['name']} membership - "
             f"{db.recreational_paid_count(conn, term['id'])} rec members paid so far."
             + tail
@@ -264,10 +264,16 @@ async def do_weekly_backup(bot, conn: sqlite3.Connection) -> bool:
 # --- JobQueue glue -------------------------------------------------------------
 
 
+# The hourly check and a startup or /newterm one-shot can overlap; the blast
+# stamps each member only after its send, so two runs would double-message.
+_DUE_LOCK = asyncio.Lock()
+
+
 async def _job_due(context) -> None:
-    await run_due_events(
-        context.bot, context.bot_data["db"], datetime.now(SINGAPORE_TIME)
-    )
+    async with _DUE_LOCK:
+        await run_due_events(
+            context.bot, context.bot_data["db"], datetime.now(SINGAPORE_TIME)
+        )
 
 
 async def _job_sheet_sync(context) -> None:

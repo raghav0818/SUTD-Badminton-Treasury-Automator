@@ -367,6 +367,77 @@ def test_approved_exception_records_shirt_from_amount(conn):
     assert (reviewed["with_shirt"], reviewed["shirt_size"]) == (1, "S")
 
 
+def _approve_exception(conn, payment_id, amount_cents):
+    db.save_verification_result(
+        conn, payment_id, status="exception", amount_cents=amount_cents,
+        extracted_json="{}", bank_txn_id=None,
+    )
+    return db.review_payment(conn, payment_id, approve=True)
+
+
+def test_approved_wrong_amount_is_not_a_shirt(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _priced_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_shirt_size(conn, payment["id"], "M")
+    reviewed = _approve_exception(conn, payment["id"], 2000)  # rec underpaid
+    assert (reviewed["amount_cents"], reviewed["with_shirt"], reviewed["shirt_size"]) == (
+        2000, 0, None
+    )
+
+
+def test_approved_without_extracted_amount_uses_pay_flow_choice(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _priced_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_shirt_size(conn, payment["id"], "M")
+    reviewed = _approve_exception(conn, payment["id"], None)  # Gemini never read it
+    assert (reviewed["amount_cents"], reviewed["with_shirt"], reviewed["shirt_size"]) == (
+        3000, 1, "M"
+    )
+
+
+def test_term_without_shirt_never_records_one(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _priced_term(conn, recshirt_fee_cents=2500, shirt_fee_cents=0)
+    assert not db.offers_shirt(term, "recreational")
+    assert not db.offers_shirt(term, "competitive")
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_shirt_size(conn, payment["id"], "M")
+    assert _approve_exception(conn, payment["id"], 2500)["with_shirt"] == 0
+
+
+def test_replace_roster_keeps_category_once_a_qr_is_out(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _priced_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.mark_qr_issued(conn, payment["id"])  # holding a S$25 rec QR
+    db.replace_roster(conn, [("Alice", "1010001")])
+    assert db.get_payment(conn, payment["id"])["category"] == "recreational"
+
+
+def test_replacing_a_retry_waiting_receipt_frees_its_fingerprint(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _priced_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.reserve_receipt_image(conn, payment_id=payment["id"], image_hash="A")
+    db.mark_payment_pending(conn, payment["id"], screenshot_file_id="fa", image_hash="A")
+    db.record_extract_failure(conn, payment["id"])
+    db.reserve_receipt_image(conn, payment_id=payment["id"], image_hash="B")
+    db.mark_payment_pending(conn, payment["id"], screenshot_file_id="fb", image_hash="B")
+    # A was never checked, so the member can send it again later.
+    assert db.reserve_receipt_image(conn, payment_id=payment["id"], image_hash="A")
+
+
+def test_stats_unpaid_excludes_opted_out(conn):
+    _member(conn, 111, "1010001", "Alice")
+    _member(conn, 222, "1010002", "Bob")
+    term = _priced_term(conn)
+    db.opt_out(conn, db.get_or_create_payment(conn, member_id=111, term_id=term["id"])["id"])
+    stats = db.get_term_payment_stats(conn, term["id"])
+    assert (stats["unpaid"], stats["opted_out"]) == (1, 1)
+
+
 def test_set_shirt_size_rejects_unknown_size(conn):
     with pytest.raises(ValueError):
         db.set_shirt_size(conn, 1, "XXXL")
@@ -429,6 +500,7 @@ def test_term_payment_stats(conn):
         "registered": 3,
         "paid": 1,
         "unpaid": 2,
+        "opted_out": 0,
         "exceptions": 1,
     }
 

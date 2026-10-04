@@ -28,7 +28,7 @@ Raspberry Pi 4.
 |---|---|
 | `/unpaid` | Who hasn't paid this term, plus roster people who never opened the bot, and how many opted out. |
 | `/setgroup rec` / `/setgroup comp` | Send **inside** the rec or competitive group chat (bot must be a member) to link it. The bot then posts paid counts (no names) plus a tap-to-pay link there on Mondays and Thursdays at 12:00 until the deadline. |
-| `/stats` | Term summary: count × price per category (compare once per term against FLYMAX), total, roster paid, registered / paid / unpaid / exceptions. |
+| `/stats` | Term summary: count × price per category (compare once per term against FLYMAX), total, roster paid, registered / paid / unpaid / opted out / exceptions. |
 | `/roster` | Replace the competitive roster: `/roster` then one `Name, 1010xxx` line per person in the same message. `/roster` alone shows the current size. |
 | `/members` | All registered members. |
 
@@ -36,7 +36,7 @@ Raspberry Pi 4.
 
 | Command | What it does |
 |---|---|
-| `/newterm <name> <start> <end> deadline=… comp=… rec=… recshirt=… shirt=…` | Open fee collection, e.g. `/newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 comp=20 rec=25 recshirt=30 shirt=15` (competitive S$20, or S$35 with the S$15 shirt; rec S$25, or S$30 with shirt). Members get a "Pay now" message at 10:00 on the start date; unpaid members get reminders at 10:00 on days 3, 7, 10 and 13 (only those before the deadline) plus a last call on the deadline day. Each has a "Not continuing this term" button that stops their reminders (they can still `/pay` later). Tapping Pay now asks shirt yes/no (and size), then sends the QR at that amount. |
+| `/newterm <name> <start> <end> deadline=… comp=… rec=… recshirt=… shirt=…` | Open fee collection, e.g. `/newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 comp=20 rec=25 recshirt=30 shirt=15` (competitive S$20, or S$35 with the S$15 shirt; rec S$25, or S$30 with shirt). Members get a "Pay now" message at 10:00 on the start date; unpaid members get reminders at 10:00 on days 3, 7, 10 and 13 (only those before the deadline) plus a last call on the deadline day. Each has a "Not continuing this term" button that stops their reminders (they can still `/pay` later). Tapping Pay now asks shirt yes/no (and size), then sends the QR at that amount. No shirt on sale this term? Use `shirt=0` and set `recshirt` equal to `rec`, and the shirt question is skipped. |
 | `/markpaid <sutd_id>` | Record a cash/manual payment. |
 | `/remind` | Nudge all unpaid members right now. |
 | `/revoke <sutd_id>` | Remove a verified membership (member is notified). |

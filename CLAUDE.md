@@ -12,69 +12,46 @@ session** — that is how sessions hand off. The full design/PRD is at
 `docs/superpowers/specs/2026-06-11-club-payment-bot-design.md`; read it before
 changing payment or verification logic.
 
-## Status (2026-07-14)
+## Status (2026-10-04)
 
-- **Feature-complete per the PRD (Phases 0–5), reviewed, and hardened.**
-  All phases built and unit-tested (137 pytest tests). A full multi-agent +
-  manual code review fixed 11 bugs (relink hijack window, normalised
-  transaction-ID bypass, edited-message crashes, UTC/SGT term skew,
-  restart-safe blasts, Sheet grid growth, and more — see git log `f84460f`).
-- **Live-proven:** registration and the full S$0.05 payment flow (QR → real
-  payment → screenshot → Gemini → auto-verify) succeeded on real Telegram.
-  The bot is named **SUTD ShuttleBuddy** (handle still `@MyClubFinanceBot`;
-  renamed 2026-07-14). Scheduled jobs are unit-tested but not yet observed
-  over a real multi-day term.
-- **A version is deployed and running on the treasurer's Raspberry Pi 4**
-  as of 2026-07-14. Pi layout: user `blud`, host `blud.local`, code at
-  `~/clubbot`, systemd service `clubbot` installed by `deploy/setup_pi.sh`
-  (idempotent — re-run it after every code copy). Update flow = scp the
-  code + secrets from this folder, then re-run the script (README has the
-  exact commands).
-- **Beware a stale parallel copy:** the Pi was first deployed from a second
-  working copy at `Documents\SUTD Projects\Badmintion Tele Bot` (different
-  remote, `badminton-tele-bot`, stuck at its first commit — another session
-  worked there on 2026-07-13 and wrote the original setup_pi.sh, since
-  adopted here). THIS repo (`SUTD-Badminton-Treasury-Automator`) is the
-  source of truth; do not work in or deploy from the old folder.
-- **Deployment target:** Raspberry Pi 4, systemd (`deploy/clubbot.service`),
-  24/7. `scripts/preflight.py` verifies the Telegram/Gemini/Sheet secrets.
-- **PAUSED MID-TASK 2026-07-14 ~01:15 SGT — resume here next session.**
-  Updating the Pi to the latest code is INCOMPLETE and the Pi's `clubbot`
-  service is CRASH-LOOPING (`ImportError: cannot import name 'admin'` — the
-  Pi has a half-mixed old/new copy; harmless to leave overnight, systemd just
-  keeps retrying). Diagnosis: the Pi's first deploy left files under
-  `~/clubbot` owned by root, so the treasurer's `scp`/`rm` as user `blud`
-  hit "Permission denied" and copies were partial. The treasurer was given
-  this sequence but stopped for the day, still unable to complete it —
-  verify each step's output next time, and if `sudo chown` itself errors,
-  get the exact message:
-  1. Pi: `sudo chown -R blud:blud ~/clubbot`
-  2. Pi: `rm -rf ~/clubbot/clubbot ~/clubbot/scripts ~/clubbot/deploy`
-  3. PC (GitHub folder): `scp -r clubbot scripts deploy requirements.txt .env service-account.json blud@blud.local:clubbot/`
-     (confirm `admin.py`, `scheduler.py`, `sheets.py`, `preflight.py` scroll
-     past at 100%; OneDrive cloud-only placeholder files are a suspect if
-     files are skipped — "Always keep on this device" fixes that)
-  4. Pi: `bash ~/clubbot/deploy/setup_pi.sh` → expect `active (running)`
-  5. Pi: `~/clubbot/.venv/bin/python ~/clubbot/scripts/preflight.py` → 3 PASS
-- **Other open items (treasurer's side):** Google Sheet may still not be
-  shared with the service account (`firebase-adminsdk-fbsvc@clubsync-e7436.iam.gserviceaccount.com`),
-  and the Gemini key needed replacing (old project billing-suspended) — the
-  PC-side preflight last showed both FAILing; the `.env` in THIS folder is
-  the current one to ship to the Pi. Rerun preflight to see current state.
+- **v2 is built on branch `v2-build` (not merged to `main`, not pushed, not
+  deployed).** It implements every item in
+  `docs/superpowers/specs/2026-10-04-v2-build-list.md` (A–D): Gemini
+  `gemini-3.1-flash-lite`, git-clone deploy + `deploy/update.sh`, Sunday DB
+  backup DM, four prices + shirt/size buttons, `/roster` (competitive =
+  SUTD ID on roster), `/stats` per-price counts, Shirts Sheet tab, reminders
+  d3/d7/d10/d13 + deadline last call, Mon/Thu group progress posts,
+  `/setgroup`, per-term opt-out button, registration gate (club group or
+  roster), pay prompt right after registration, Gemini-failure auto-retry
+  (15 min × 4, then treasurer review), audit/flag removed, consent line.
+  Built by 4 parallel subagents in 2 waves and merged; 189 tests pass.
+  A full `/code-review` of `main...v2-build` was started 2026-10-04 —
+  check whether its findings were fixed before merging.
+- **v1 (on `main`)** was live-proven on real Telegram (registration + a real
+  S$0.05 auto-verified payment). Bot name **SUTD ShuttleBuddy**, handle
+  `@MyClubFinanceBot`. Scheduled jobs never observed over a real term.
+- **Pi 4 is switched OFF** (nobody was using the bot). Its old `~/clubbot`
+  copy is half-updated and root-owned; plan is a fresh `git clone` per the
+  README (move the old folder aside, keep its `.env`, which may be the only
+  copy of the secrets). Pi: user `blud`, host `blud.local`, service `clubbot`.
+- **Beware a stale parallel copy** at `Documents\SUTD Projects\Badmintion Tele Bot`
+  (remote `badminton-tele-bot`). THIS repo is the source of truth.
+- **Treasurer-side open items:** turn on Gemini billing and put the new key
+  in `.env`; share the Google Sheet with the service account
+  (`firebase-adminsdk-fbsvc@clubsync-e7436.iam.gserviceaccount.com`).
 
 ### Launch checklist (remaining user actions)
 
-1. Get all three `scripts/preflight.py` lines to PASS.
-2. Wipe test data before real launch: stop the bot, delete `clubbot.db`,
-   restart. (Acceptable only this once, before the first real term ever
-   opens — `receipt_fingerprints` must never be cleared after that.)
-3. Deploy to the Pi per README; enable the backup cron.
-4. Live-smoke the admin commands (`/settings`, `/addadmin`, `/relink` with a
-   second account, `/transfertreasurer` and back).
-5. Open the first real term: `/newterm <name> 20.00 <start> <end>`.
-6. Watch the first term: term-start blast and day-7 nudge fire on schedule;
-   a mid-term reboot must not re-blast (stamps + per-member `qr_issued_at`
-   prevent it).
+1. Merge `v2-build` → `main`, push (repo is public; the Pi pulls from GitHub).
+2. Fresh Pi setup per README; all three `scripts/preflight.py` lines PASS.
+3. Wipe test data once before the first real term (delete `clubbot.db`) —
+   `receipt_fingerprints` must never be cleared after that.
+4. Add the bot to both group chats; `/setgroup rec` and `/setgroup comp`
+   in each; paste the competitive team with `/roster`.
+5. Open the term:
+   `/newterm <name> <start> <end> deadline=YYYY-MM-DD comp=20 rec=25 recshirt=30 shirt=15`
+6. Retire the MS Form. Watch the first term: blast, reminders, group posts
+   fire once each; a mid-term reboot must not re-send.
 
 ## Ground rules
 
@@ -126,8 +103,8 @@ changing payment or verification logic.
 | `clubbot/qrgen.py` | payload → PNG |
 | `clubbot/gemini.py` | Gemini Flash structured extraction (swappable adapter) |
 | `clubbot/db.py` | SQLite schema + auto-migration + every query; relink; SGT source of truth |
-| `clubbot/scheduler.py` | Term-start blast, day-7 nudge, Sunday DB backup DM to the treasurer, daily self-heal re-arm, Sheet sync jobs |
-| `clubbot/sheets.py` | Read-only Google Sheet mirror (Members + Payments tabs) |
+| `clubbot/scheduler.py` | Hourly due-check (term-start blast, d3/7/10/13 + last-call reminders, Mon/Thu group posts; `term_events` stamps), Sunday DB backup DM, Gemini-failure retry, Sheet sync jobs |
+| `clubbot/sheets.py` | Read-only Google Sheet mirror (Members + Payments + Shirts tabs) |
 | `clubbot/config.py`, `__main__.py` | `.env` loading; entry point `python -m clubbot` |
 | `scripts/preflight.py` | Pre-launch connectivity check for all three secrets |
 | `deploy/clubbot.service` | systemd unit (Restart=always) |
@@ -167,7 +144,6 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   bot fully replaces the MS Form,
   competitive roster, deadline reminders, group progress posts, weekly audit
   DROPPED with a per-term FLYMAX count check instead, git-clone deploy).
-  **Awaiting treasurer confirmation; nothing built yet.** That file overrides
-  the "weekly audit" statements elsewhere in this file once built.
+  Treasurer confirmed; all of it built the same day on `v2-build` (see Status).
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).

@@ -114,6 +114,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Registered: {stats['registered']}\n"
         f"Paid: {stats['paid']}\n"
         f"Unpaid: {stats['unpaid']}\n"
+        f"Opted out: {stats['opted_out']}\n"
         f"Exceptions: {stats['exceptions']}"
     )
 
@@ -165,7 +166,6 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-GROUP_KEYS = {"rec": "rec_group_id", "comp": "comp_group_id"}
 
 
 async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,10 +181,10 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     kind = context.args[0].lower() if context.args else ""
-    if kind not in GROUP_KEYS:
+    if kind not in db.GROUP_KEYS:
         await update.message.reply_text("Usage: /setgroup rec or /setgroup comp")
         return
-    db.set_setting(conn, GROUP_KEYS[kind], str(update.effective_chat.id))
+    db.set_setting(conn, db.GROUP_KEYS[kind], str(update.effective_chat.id))
     await update.message.reply_text(
         f"This chat is now the {kind} group. Progress posts (counts only, no "
         "names) go here on Mondays and Thursdays until the deadline."
@@ -389,6 +389,7 @@ SETTING_KEYS = (
     "school_bill_number",
     "school_recipient_match",
 )
+ALL_SETTING_KEYS = SETTING_KEYS + ("group_posts",)
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -411,10 +412,10 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("\n".join(lines))
         return
     key = context.args[0]
-    if key not in SETTING_KEYS + ("group_posts",):
+    if key not in ALL_SETTING_KEYS:
         await update.message.reply_text(
             "Unknown setting. Available keys:\n"
-            + "\n".join(SETTING_KEYS + ("group_posts",))
+            + "\n".join(ALL_SETTING_KEYS)
         )
         return
     if len(context.args) < 2:

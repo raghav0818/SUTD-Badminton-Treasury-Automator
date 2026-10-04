@@ -40,7 +40,6 @@ ASK_NAME, ASK_SUTD_ID, CONFIRM = range(3)
 MAX_RECEIPT_BYTES = 8 * 1024 * 1024
 MAX_EXTRACT_ATTEMPTS = 4  # the first try plus three 15-minute retries
 # Settings written by /setgroup; registration requires being in one of them.
-CLUB_GROUP_KEYS = ("rec_group_id", "comp_group_id")
 IN_GROUP_STATUSES = {
     ChatMemberStatus.MEMBER,
     ChatMemberStatus.ADMINISTRATOR,
@@ -181,7 +180,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def _in_club_group(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """True if no club group is configured yet, or the user is in one of them."""
     group_ids = [
-        value for key in CLUB_GROUP_KEYS if (value := db.get_setting(_db(context), key))
+        value for key in db.GROUP_KEYS.values() if (value := db.get_setting(_db(context), key))
     ]
     if not group_ids:
         return True
@@ -312,13 +311,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text)
 
 
-def _parse_fee_cents(value: str) -> int:
+def _parse_fee_cents(value: str, *, allow_zero: bool = False) -> int:
     try:
         amount = Decimal(value)
     except InvalidOperation as exc:
         raise ValueError("fee must be a number") from exc
     # is_finite() first: NaN/Infinity pass Decimal() but break the checks below.
-    if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -2:
+    too_small = amount < 0 if allow_zero else amount <= 0
+    if not amount.is_finite() or too_small or amount.as_tuple().exponent < -2:
         raise ValueError("fee must be positive with at most 2 decimal places")
     return int(amount * 100)
 
@@ -329,7 +329,8 @@ NEWTERM_USAGE = (
     "Example: /newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 "
     "comp=20 rec=25 recshirt=30 shirt=15\n"
     "(comp = competitive fee, shirt = shirt add-on for competitive, "
-    "recshirt = recreational fee including the shirt)"
+    "recshirt = recreational fee including the shirt. No shirt this term? "
+    "Use shirt=0 and recshirt equal to rec.)"
 )
 NEWTERM_KEYS = ("deadline", "comp", "rec", "recshirt", "shirt")
 
@@ -354,7 +355,8 @@ def parse_newterm_args(args: list[str]) -> dict:
         "fee_cents": _parse_fee_cents(options["comp"]),
         "rec_fee_cents": _parse_fee_cents(options["rec"]),
         "recshirt_fee_cents": _parse_fee_cents(options["recshirt"]),
-        "shirt_fee_cents": _parse_fee_cents(options["shirt"]),
+        # shirt=0: no shirt for sale to competitive members this term.
+        "shirt_fee_cents": _parse_fee_cents(options["shirt"], allow_zero=True),
     }
 
 
@@ -421,6 +423,15 @@ def _shirt_prompt(
         return opened, None
     term, payment = opened
     category = payment["category"]
+    if not db.offers_shirt(term, category):
+        button = InlineKeyboardButton(
+            f"Get my QR ({money(db.term_fee(term, category))})",
+            callback_data="pay:shirt:no",
+        )
+        return (
+            f"{term['name']} membership ({category}).",
+            InlineKeyboardMarkup([[button]]),
+        )
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -738,6 +749,8 @@ async def _retry_one(context, extractor, payment: sqlite3.Row) -> None:
         extracted = await extractor.extract(image_bytes, mime_type or "image/jpeg")
     except Exception:
         log.warning("Extraction retry failed for payment %s", payment["id"], exc_info=True)
+        if not _still_waiting(conn, payment):
+            return
         if db.record_extract_failure(conn, payment["id"]) < MAX_EXTRACT_ATTEMPTS:
             return
         # Out of retries: a human checks it. Moving to 'exception' also stops
@@ -766,14 +779,20 @@ async def _retry_one(context, extractor, payment: sqlite3.Row) -> None:
         except Exception:
             log.exception("Treasurer notification failed for payment %s", payment["id"])
         return
-    # The member may have sent a new receipt while Gemini was working.
+    if _still_waiting(conn, payment):
+        await _finish_receipt(
+            context, db.get_payment(conn, payment["id"]), extracted, reply
+        )
+
+
+def _still_waiting(conn: sqlite3.Connection, payment: sqlite3.Row) -> bool:
+    """False if the member sent a new receipt while this retry was running."""
     current = db.get_payment(conn, payment["id"])
-    if (
-        current["status"] != "pending_verification"
-        or current["screenshot_file_id"] != payment["screenshot_file_id"]
-    ):
-        return
-    await _finish_receipt(context, current, extracted, reply)
+    return (
+        current["status"] == "pending_verification"
+        and current["last_extract_error_at"] is not None
+        and current["screenshot_file_id"] == payment["screenshot_file_id"]
+    )
 
 
 async def _notify_treasurer(
@@ -856,6 +875,9 @@ async def _ignore_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         raise ApplicationHandlerStop
 
 
+PRIVATE = filters.ChatType.PRIVATE
+
+
 def build_application(
     token: str,
     conn: sqlite3.Connection,
@@ -870,8 +892,10 @@ def build_application(
     # Every handler dereferences update.message; edited messages would arrive
     # with message=None and crash them, so drop edits before any other group.
     app.add_handler(TypeHandler(Update, _ignore_edited), group=-1)
+    # The bot also sits in the club groups (/setgroup, progress posts): keep
+    # registration, payments, receipts and admin output out of them.
     registration = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
+        entry_points=[CommandHandler("start", cmd_start, filters=PRIVATE)],
         states={
             ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_name)],
             ASK_SUTD_ID: [
@@ -882,22 +906,22 @@ def build_application(
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
     app.add_handler(registration)
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("newterm", cmd_newterm))
-    app.add_handler(CommandHandler("pay", cmd_pay))
-    app.add_handler(CommandHandler("unpaid", admin.cmd_unpaid))
-    app.add_handler(CommandHandler("stats", admin.cmd_stats))
-    app.add_handler(CommandHandler("members", admin.cmd_members))
-    app.add_handler(CommandHandler("markpaid", admin.cmd_markpaid))
-    app.add_handler(CommandHandler("remind", admin.cmd_remind))
-    app.add_handler(CommandHandler("revoke", admin.cmd_revoke))
-    app.add_handler(CommandHandler("addadmin", admin.cmd_addadmin))
-    app.add_handler(CommandHandler("removeadmin", admin.cmd_removeadmin))
-    app.add_handler(CommandHandler("transfertreasurer", admin.cmd_transfertreasurer))
-    app.add_handler(CommandHandler("relink", admin.cmd_relink))
-    app.add_handler(CommandHandler("settings", admin.cmd_settings))
-    app.add_handler(CommandHandler("roster", admin.cmd_roster))
+    app.add_handler(CommandHandler("status", cmd_status, filters=PRIVATE))
+    app.add_handler(CommandHandler("help", cmd_help, filters=PRIVATE))
+    app.add_handler(CommandHandler("newterm", cmd_newterm, filters=PRIVATE))
+    app.add_handler(CommandHandler("pay", cmd_pay, filters=PRIVATE))
+    app.add_handler(CommandHandler("unpaid", admin.cmd_unpaid, filters=PRIVATE))
+    app.add_handler(CommandHandler("stats", admin.cmd_stats, filters=PRIVATE))
+    app.add_handler(CommandHandler("members", admin.cmd_members, filters=PRIVATE))
+    app.add_handler(CommandHandler("markpaid", admin.cmd_markpaid, filters=PRIVATE))
+    app.add_handler(CommandHandler("remind", admin.cmd_remind, filters=PRIVATE))
+    app.add_handler(CommandHandler("revoke", admin.cmd_revoke, filters=PRIVATE))
+    app.add_handler(CommandHandler("addadmin", admin.cmd_addadmin, filters=PRIVATE))
+    app.add_handler(CommandHandler("removeadmin", admin.cmd_removeadmin, filters=PRIVATE))
+    app.add_handler(CommandHandler("transfertreasurer", admin.cmd_transfertreasurer, filters=PRIVATE))
+    app.add_handler(CommandHandler("relink", admin.cmd_relink, filters=PRIVATE))
+    app.add_handler(CommandHandler("settings", admin.cmd_settings, filters=PRIVATE))
+    app.add_handler(CommandHandler("roster", admin.cmd_roster, filters=PRIVATE))
     app.add_handler(CommandHandler("setgroup", admin.cmd_setgroup))
     app.add_handler(CallbackQueryHandler(on_pay_start, pattern=r"^pay:start$"))
     app.add_handler(CallbackQueryHandler(on_optout, pattern=r"^optout:\d+$"))
@@ -911,7 +935,7 @@ def build_application(
         CallbackQueryHandler(on_payment_review, pattern=r"^payment:(approve|reject):\d+$")
     )
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_receipt)
+        MessageHandler(PRIVATE & (filters.PHOTO | filters.Document.IMAGE), on_receipt)
     )
     if app.job_queue is not None:
         scheduler.schedule_all(app, conn)

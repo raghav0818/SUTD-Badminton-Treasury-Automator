@@ -514,6 +514,8 @@ def create_term(
 
 
 SHIRT_SIZES = ("XS", "S", "M", "L", "XL", "XXL")
+# /setgroup kind -> settings key holding that group chat's id.
+GROUP_KEYS = {"rec": "rec_group_id", "comp": "comp_group_id"}
 
 
 def term_fee(term: sqlite3.Row, category: str, *, with_shirt: bool = False) -> int:
@@ -521,6 +523,11 @@ def term_fee(term: sqlite3.Row, category: str, *, with_shirt: bool = False) -> i
     if category == "competitive":
         return term["comp_fee_cents"] + (term["shirt_fee_cents"] if with_shirt else 0)
     return term["recshirt_fee_cents"] if with_shirt else term["rec_fee_cents"]
+
+
+def offers_shirt(term: sqlite3.Row, category: str) -> bool:
+    """False when the term sells no shirt to this category (shirt price = base)."""
+    return term_fee(term, category, with_shirt=True) != term_fee(term, category)
 
 
 def valid_amounts(term: sqlite3.Row, category: str) -> set[int]:
@@ -611,18 +618,31 @@ def set_shirt_size(
 
 
 def _settle_shirt(conn: sqlite3.Connection, payment_id: int) -> None:
-    """On verification, the amount actually paid decides the shirt (no commit)."""
+    """On verification, decide the shirt and the amount on record (no commit).
+
+    Only the exact with-shirt fee counts as a shirt: a treasurer-approved
+    exception may carry any amount. With no amount at all (extraction kept
+    failing, so the treasurer approved from the screenshot), fall back to the
+    member's pay-flow choice and record the fee they were quoted.
+    """
     payment = get_payment(conn, payment_id)
-    if payment["amount_cents"] is None:
-        return
-    with_shirt = payment["amount_cents"] != term_fee(payment, payment["category"])
+    category = payment["category"]
+    amount = payment["amount_cents"]
+    if amount is None:
+        with_shirt = payment["shirt_size"] is not None and offers_shirt(payment, category)
+        amount = term_fee(payment, category, with_shirt=with_shirt)
+    else:
+        with_shirt = offers_shirt(payment, category) and amount == term_fee(
+            payment, category, with_shirt=True
+        )
     conn.execute(
         """
         UPDATE payments
-        SET with_shirt = ?, shirt_size = CASE WHEN ? THEN shirt_size END
+        SET amount_cents = ?, with_shirt = ?,
+            shirt_size = CASE WHEN ? THEN shirt_size END
         WHERE id = ?
         """,
-        (int(with_shirt), with_shirt, payment_id),
+        (amount, int(with_shirt), with_shirt, payment_id),
     )
 
 
@@ -739,6 +759,21 @@ def mark_payment_pending(
     screenshot_file_id: str,
     image_hash: str,
 ) -> None:
+    previous = get_payment(conn, payment_id)
+    if (
+        previous["status"] == "pending_verification"
+        and previous["last_extract_error_at"] is not None
+        and previous["image_hash"] not in (None, image_hash)
+    ):
+        # The receipt still waiting for an extraction retry is being replaced;
+        # it was never checked, so free its fingerprint for a later resend.
+        conn.execute(
+            """
+            DELETE FROM receipt_fingerprints
+            WHERE payment_id = ? AND image_hash = ? AND bank_txn_id IS NULL
+            """,
+            (payment_id, previous["image_hash"]),
+        )
     conn.execute(
         """
         UPDATE payments
@@ -949,7 +984,7 @@ def claim_term_event(conn: sqlite3.Connection, term_id: int, event: str) -> bool
 
 
 def get_term_payment_stats(conn: sqlite3.Connection, term_id: int) -> dict[str, int]:
-    """Headline counts for /stats. 'unpaid' = active members without a verified payment."""
+    """Headline counts for /stats; 'unpaid' matches /unpaid (opted-out excluded)."""
     registered = conn.execute(
         "SELECT COUNT(*) AS n FROM members WHERE active = 1"
     ).fetchone()["n"]
@@ -964,7 +999,8 @@ def get_term_payment_stats(conn: sqlite3.Connection, term_id: int) -> dict[str, 
     return {
         "registered": registered,
         "paid": paid,
-        "unpaid": max(registered - paid, 0),
+        "unpaid": len(list_unpaid_members(conn, term_id)),
+        "opted_out": count_opted_out(conn, term_id),
         "exceptions": exceptions,
     }
 
@@ -991,14 +1027,15 @@ def replace_roster(conn: sqlite3.Connection, rows: list[tuple[str, str]]) -> Non
         conn.execute("DELETE FROM roster")
         conn.executemany("INSERT INTO roster (name, sutd_id) VALUES (?, ?)", rows)
         # Payment rows are created early (e.g. by the term-start blast), so
-        # re-price any nobody has paid against yet under the new roster.
+        # re-price those with no QR out yet; a QR already issued keeps the
+        # category (and so the amount) printed on it.
         conn.execute(
             """
             UPDATE payments SET category = CASE WHEN EXISTS (
                 SELECT 1 FROM roster r JOIN members m ON m.sutd_id = r.sutd_id
                 WHERE m.telegram_user_id = payments.member_id
             ) THEN 'competitive' ELSE 'recreational' END
-            WHERE status = 'awaiting_payment'
+            WHERE status = 'awaiting_payment' AND qr_issued_at IS NULL
             """
         )
         conn.commit()
