@@ -16,6 +16,7 @@ import tempfile
 from datetime import date, datetime, time, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden
 
 from clubbot import db
 from clubbot.payments import SINGAPORE_TIME
@@ -27,7 +28,8 @@ GROUP_POST_HOUR = 12  # 12:00 SGT Mon/Thu group progress posts
 QUIET_HOUR = 22       # a catch-up after a late restart waits for the next morning
 REMINDER_DAYS = (3, 7, 10, 13)  # days after term start; only those before the deadline
 GROUP_POST_WEEKDAYS = (0, 3)    # Monday, Thursday
-BACKUP_HOUR = 3     # 03:00 SGT Sunday database backup to the treasurer
+BACKUP_HOUR = 3     # 03:00 SGT daily check; a backup goes out when one is due
+BACKUP_EVERY = timedelta(days=7)
 SHEET_HOUR = 2      # 02:30 SGT nightly full Sheet rebuild
 SHEET_SYNC_DELAY = timedelta(seconds=30)  # debounce for on-change syncs
 EXTRACT_RETRY_INTERVAL = timedelta(minutes=15)  # Gemini-failure receipt retries
@@ -83,7 +85,7 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
         f"(deadline {term['deadline']}).\n"
         "Tap Pay now to choose a shirt option and get your personal PayNow QR."
     )
-    attempted = sent = 0
+    retry_later = False
     for member in db.list_active_members(conn):
         payment = db.get_or_create_payment(
             conn, member_id=member["telegram_user_id"], term_id=term_id
@@ -98,34 +100,49 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
             or payment["notified_at"]
         ):
             continue
-        attempted += 1
-        try:
-            await bot.send_message(
-                chat_id=member["telegram_user_id"],
-                text=text,
-                reply_markup=reminder_keyboard(term_id),
-            )
-        except Exception:
-            log.warning(
-                "Term-start message failed for member %s",
-                member["telegram_user_id"],
-                exc_info=True,
-            )
-        else:
-            sent += 1
+        if await _deliver(bot, member["telegram_user_id"], text, term_id):
             db.mark_payment_notified(conn, payment["id"])
-    if attempted and not sent:
-        # Telegram was down for the whole loop: leave the term unstamped so
-        # the next hourly check retries the blast instead of dropping it.
-        log.error("Term-start blast for term %s failed for all members", term_id)
+        else:
+            retry_later = True
+    if retry_later:
+        # Leave the term unstamped: the next hourly check retries only the
+        # members still without a notified_at stamp.
+        log.warning("Term-start blast for term %s incomplete; will retry", term_id)
         return
     db.mark_term_start_notified(conn, term_id)
 
 
+async def _deliver(bot, chat_id: int, text: str, term_id: int | None = None) -> bool:
+    """Send one message. True = done (sent, or the chat blocked us for good);
+    False = a transient failure worth retrying."""
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reminder_keyboard(term_id) if term_id is not None else None,
+        )
+    except Forbidden:
+        log.info("Chat %s blocked or removed the bot; not retrying", chat_id)
+        return True
+    except Exception:
+        log.warning("Message to chat %s failed; will retry", chat_id, exc_info=True)
+        return False
+    return True
+
+
 async def send_unpaid_reminders(
-    bot, conn: sqlite3.Connection, term_id: int, *, last_call: bool = False
+    bot,
+    conn: sqlite3.Connection,
+    term_id: int,
+    *,
+    last_call: bool = False,
+    event: str | None = None,
 ) -> int:
-    """DM every unpaid, not-opted-out member a nudge; return the successful-send count."""
+    """DM every unpaid, not-opted-out member a nudge; return the successful-send count.
+
+    With `event`, each member is stamped '<event>:<id>' once delivered and
+    skipped if already stamped, so a re-run only retries the failures.
+    """
     term = db.get_term(conn, term_id)
     if last_call:
         text = (
@@ -141,19 +158,13 @@ async def send_unpaid_reminders(
         )
     sent = 0
     for member in db.list_unpaid_members(conn, term_id):
-        try:
-            await bot.send_message(
-                chat_id=member["telegram_user_id"],
-                text=text,
-                reply_markup=reminder_keyboard(term_id),
-            )
+        stamp = f"{event}:{member['telegram_user_id']}" if event else None
+        if stamp and db.term_event_claimed(conn, term_id, stamp):
+            continue
+        if await _deliver(bot, member["telegram_user_id"], text, term_id):
             sent += 1
-        except Exception:
-            log.warning(
-                "Reminder failed for member %s",
-                member["telegram_user_id"],
-                exc_info=True,
-            )
+            if stamp:
+                db.claim_term_event(conn, term_id, stamp)
     return sent
 
 
@@ -177,23 +188,31 @@ def group_post_texts(bot, conn: sqlite3.Connection, term) -> dict[str, str]:
     }
 
 
-async def post_group_progress(bot, conn: sqlite3.Connection, term) -> None:
-    """Post progress to each configured group chat. Failures are logged only."""
+async def post_group_progress(
+    bot, conn: sqlite3.Connection, term, event: str | None = None
+) -> None:
+    """Post progress to each configured group chat.
+
+    With `event`, each group is stamped '<event>:<key>' once delivered, so a
+    failed post is retried on the next hourly check (same day).
+    """
     for key, text in group_post_texts(bot, conn, term).items():
         chat_id = db.get_setting(conn, key)
         if chat_id is None:
             continue
-        try:
-            await bot.send_message(chat_id=int(chat_id), text=text)
-        except Exception:
-            log.warning("Group progress post to %s failed", key, exc_info=True)
+        stamp = f"{event}:{key}" if event else None
+        if stamp and db.term_event_claimed(conn, term["id"], stamp):
+            continue
+        if await _deliver(bot, int(chat_id), text) and stamp:
+            db.claim_term_event(conn, term["id"], stamp)
 
 
 async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
     """Send everything due today and not yet stamped, for every open term.
 
-    Reminders and group posts are claimed (stamped) before sending: a crash
-    mid-send loses the rest of that send rather than messaging anyone twice.
+    Reminders and group posts are stamped per recipient after delivery, so
+    failures retry hourly until the quiet hour. A crash between a send and its
+    stamp can repeat that one message (rare; better than losing it).
     """
     now = now.astimezone(SINGAPORE_TIME)
     today = now.date()
@@ -208,20 +227,17 @@ async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
             await do_term_start_blast(bot, conn, term["id"])
             blasted = True
         event = reminder_event(term, today)
-        # A same-day blast already invited everyone; the claim just retires
-        # today's reminder so nobody gets two messages in one day.
-        if event and db.claim_term_event(conn, term["id"], event) and not blasted:
+        if event and blasted:
+            # A same-day blast already invited everyone: retire today's
+            # reminder so nobody gets two messages in one day.
+            db.claim_term_event(conn, term["id"], event)
+        elif event and not db.term_event_claimed(conn, term["id"], event):
             await send_unpaid_reminders(
-                bot, conn, term["id"], last_call=event == "lastcall"
+                bot, conn, term["id"], last_call=event == "lastcall", event=event
             )
         event = group_post_event(term, today)
-        if (
-            event
-            and group_posts_on
-            and now.hour >= GROUP_POST_HOUR
-            and db.claim_term_event(conn, term["id"], event)
-        ):
-            await post_group_progress(bot, conn, term)
+        if event and group_posts_on and now.hour >= GROUP_POST_HOUR:
+            await post_group_progress(bot, conn, term, event)
 
 
 async def do_weekly_backup(bot, conn: sqlite3.Connection) -> bool:
@@ -251,6 +267,7 @@ async def do_weekly_backup(bot, conn: sqlite3.Connection) -> bool:
                     "member, payment and the receipt-reuse history."
                 ),
             )
+        db.set_setting(conn, "last_backup_at", datetime.now(SINGAPORE_TIME).isoformat())
         return True
     except Exception:
         log.exception("Weekly database backup failed")
@@ -301,12 +318,18 @@ def request_sheet_sync(app) -> None:
     app.job_queue.run_once(_job_sheet_sync, when=SHEET_SYNC_DELAY, name="sheet-sync")
 
 
+def backup_due(conn: sqlite3.Connection, now: datetime) -> bool:
+    """A week since the last successful backup (or never): send one."""
+    last = db.get_setting(conn, "last_backup_at")
+    return last is None or now - datetime.fromisoformat(last) >= BACKUP_EVERY
+
+
 async def _job_backup(context) -> None:
-    # run_daily fires every day; act only on Sundays so the backup is weekly
-    # without depending on PTB's day indexing.
-    if datetime.now(SINGAPORE_TIME).weekday() != 6:
-        return
-    await do_weekly_backup(context.bot, context.bot_data["db"])
+    # Checked daily and once at startup, so downtime delays the weekly backup
+    # instead of skipping it.
+    conn = context.bot_data["db"]
+    if backup_due(conn, datetime.now(SINGAPORE_TIME)):
+        await do_weekly_backup(context.bot, conn)
 
 
 async def _job_retry_extractions(context) -> None:
@@ -321,6 +344,9 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
     """Arm the recurring jobs. Called once at startup."""
     jq = app.job_queue
     now = datetime.now(SINGAPORE_TIME)
+    # Nothing is mid-extraction at startup: receipts a restart cut off become
+    # retryable instead of stuck pending (with their image hash reserved).
+    db.requeue_interrupted_extractions(conn)
     # Hourly due-check just after each full hour, plus one right away to catch
     # up on anything due while the bot was down. It also retries a blast that
     # failed outright.
@@ -336,6 +362,7 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
         time=time(hour=BACKUP_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
         name="weekly-backup",
     )
+    jq.run_once(_job_backup, when=timedelta(minutes=1), name="backup-catch-up")
     # Nightly Sheet rebuild; the job itself no-ops when no mirror is configured.
     jq.run_daily(
         _job_sheet_sync,

@@ -26,8 +26,11 @@ changing payment or verification logic.
   (15 min × 4, then treasurer review), audit/flag removed, consent line.
   Built by 4 parallel subagents in 2 waves and merged, then a full
   `/code-review` of `main...v2-build`: all 10 findings fixed (commit
-  `bc44238`); 198 tests pass. Member/admin commands only work in private
-  chats (the bot sits in the club groups).
+  `bc44238`), then a Codex review: all 11 findings fixed; 205 tests pass.
+  Member/admin commands only work in private chats (the bot sits in the club
+  groups, and must be a group ADMIN for /setgroup, since Telegram only
+  guarantees getChatMember lookups for admin bots). Reminders/group posts
+  are stamped per recipient after delivery (failures retry hourly that day).
 - **v1 (on `main`)** was live-proven on real Telegram (registration + a real
   S$0.05 auto-verified payment). Bot name **SUTD ShuttleBuddy**, handle
   `@MyClubFinanceBot`. Scheduled jobs never observed over a real term.
@@ -47,8 +50,8 @@ changing payment or verification logic.
 2. Fresh Pi setup per README; all three `scripts/preflight.py` lines PASS.
 3. Wipe test data once before the first real term (delete `clubbot.db`) —
    `receipt_fingerprints` must never be cleared after that.
-4. Add the bot to both group chats; `/setgroup rec` and `/setgroup comp`
-   in each; paste the competitive team with `/roster`.
+4. Add the bot to both group chats as an ADMIN; `/setgroup rec` and
+   `/setgroup comp` in each; paste the competitive team with `/roster`.
 5. Open the term:
    `/newterm <name> <start> <end> deadline=YYYY-MM-DD comp=20 rec=25 recshirt=30 shirt=15`
 6. Retire the MS Form. Watch the first term: blast, reminders, group posts

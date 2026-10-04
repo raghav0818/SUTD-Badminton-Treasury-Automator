@@ -73,8 +73,8 @@ class SheetMirror:
             ]
             for p in db.list_payments(conn)
         ]
-        # Active term's shirt orders, then a per-size count block for ordering.
-        term = db.get_active_term(conn)
+        # Latest term's shirt orders (kept after it ends), then per-size counts.
+        term = db.get_latest_started_term(conn)
         orders = db.list_shirt_orders(conn, term["id"]) if term else []
         shirts = [[o["full_name"], o["shirt_size"] or "?"] for o in orders]
         shirts.append(["", ""])

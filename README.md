@@ -27,9 +27,9 @@ Raspberry Pi 4.
 | Command | What it does |
 |---|---|
 | `/unpaid` | Who hasn't paid this term, plus roster people who never opened the bot, and how many opted out. |
-| `/setgroup rec` / `/setgroup comp` | Send **inside** the rec or competitive group chat (bot must be a member) to link it. The bot then posts paid counts (no names) plus a tap-to-pay link there on Mondays and Thursdays at 12:00 until the deadline. |
+| `/setgroup rec` / `/setgroup comp` | Send **inside** the rec or competitive group chat (make the bot a group **admin** first, so Telegram lets it check who is in the group at registration) to link it. The bot then posts paid counts (no names) plus a tap-to-pay link there on Mondays and Thursdays at 12:00 until the deadline. |
 | `/stats` | Term summary: count × price per category (compare once per term against FLYMAX), total, roster paid, registered / paid / unpaid / opted out / exceptions. |
-| `/roster` | Replace the competitive roster: `/roster` then one `Name, 1010xxx` line per person in the same message. `/roster` alone shows the current size. |
+| `/roster` | Replace the competitive roster: `/roster` then one `Name, 1010xxx` line per person in the same message. If any line is invalid nothing changes, so a typo can never drop a player. `/roster` alone shows the current size. |
 | `/members` | All registered members. |
 
 ### Treasurer only
@@ -129,7 +129,7 @@ port forwarding — home Wi-Fi is fine.
 
 ### Database backups (the DB is irreplaceable)
 
-Every Sunday at 03:00 the bot DMs the treasurer a copy of `clubbot.db` on
+Once a week (checked daily at 03:00 and at startup, so downtime delays it instead of skipping it) the bot DMs the treasurer a copy of `clubbot.db` on
 Telegram. Keep those files (don't delete the chat). For an extra daily copy on
 the Pi itself (replace `<user>` with your Pi username):
 

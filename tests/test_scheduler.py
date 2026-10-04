@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from telegram.error import Forbidden
+
 from clubbot import bot, db, scheduler
 
 SINGAPORE_TIME = timezone(timedelta(hours=8))
@@ -274,11 +276,47 @@ def test_term_start_blast_continues_after_send_failure(conn):
     term = _term(conn)
 
     fake_bot = make_bot()
-    fake_bot.send_message.side_effect = [Exception("blocked"), None]
+    fake_bot.send_message.side_effect = [Forbidden("blocked"), None]
     asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
 
     assert fake_bot.send_message.await_count == 2
     assert db.get_term(conn, term["id"])["start_notified_at"] is not None
+
+
+def test_term_start_blast_retries_only_transient_failures(conn):
+    _member(conn, 111, "1000001", "Alice")
+    _member(conn, 222, "1000002", "Bob")
+    term = _term(conn)
+    fake_bot = make_bot()
+    fake_bot.send_message.side_effect = [Exception("timeout"), None]
+    asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
+    assert db.get_term(conn, term["id"])["start_notified_at"] is None
+
+    fake_bot = make_bot()
+    asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
+    assert [c.kwargs["chat_id"] for c in fake_bot.send_message.call_args_list] == [111]
+    assert db.get_term(conn, term["id"])["start_notified_at"] is not None
+
+
+def test_reminder_retries_only_members_whose_send_failed(conn):
+    _member(conn, 111, "1000001", "Alice")
+    _member(conn, 222, "1000002", "Bob")
+    term = _term(conn)
+    fake_bot = make_bot()
+    fake_bot.send_message.side_effect = [Exception("timeout"), None]
+    asyncio.run(scheduler.send_unpaid_reminders(fake_bot, conn, term["id"], event="remind-d3"))
+    fake_bot = make_bot()
+    asyncio.run(scheduler.send_unpaid_reminders(fake_bot, conn, term["id"], event="remind-d3"))
+    assert [c.kwargs["chat_id"] for c in fake_bot.send_message.call_args_list] == [111]
+
+
+def test_backup_due_weekly_and_after_downtime(conn):
+    now = datetime(2026, 10, 4, 3, 0, tzinfo=SINGAPORE_TIME)
+    assert scheduler.backup_due(conn, now)  # never backed up
+    db.set_setting(conn, "last_backup_at", (now - timedelta(days=6)).isoformat())
+    assert not scheduler.backup_due(conn, now)
+    db.set_setting(conn, "last_backup_at", (now - timedelta(days=9)).isoformat())
+    assert scheduler.backup_due(conn, now)  # bot was down on the usual day
 
 
 # --- send_unpaid_reminders ----------------------------------------------------

@@ -551,3 +551,14 @@ def test_opted_out_member_is_not_unpaid_but_counted(conn):
     unpaid = db.list_unpaid_members(conn, term["id"])
     assert [m["telegram_user_id"] for m in unpaid] == [111]
     assert db.count_opted_out(conn, term["id"]) == 1
+
+
+def test_startup_requeues_interrupted_extraction(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _priced_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.reserve_receipt_image(conn, payment_id=payment["id"], image_hash="A")
+    db.mark_payment_pending(conn, payment["id"], screenshot_file_id="fa", image_hash="A")
+    assert db.list_extraction_retries(conn, 4) == []  # crashed mid-check
+    assert db.requeue_interrupted_extractions(conn) == 1
+    assert [p["id"] for p in db.list_extraction_retries(conn, 4)] == [payment["id"]]

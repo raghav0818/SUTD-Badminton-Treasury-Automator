@@ -156,14 +156,15 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if rejected
         else ""
     )
-    if not rows:
-        # Never wipe the roster because of a badly formatted paste.
-        await update.message.reply_text("Roster NOT changed." + rejected_text)
+    if rejected:
+        # A mistyped line would silently drop that player; change nothing.
+        await update.message.reply_text(
+            "Roster NOT changed. Fix these lines and send the whole list again."
+            + rejected_text
+        )
         return
     db.replace_roster(conn, rows)
-    await update.message.reply_text(
-        f"Roster replaced: {len(rows)} people." + rejected_text
-    )
+    await update.message.reply_text(f"Roster replaced: {len(rows)} people.")
 
 
 
@@ -183,6 +184,19 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     kind = context.args[0].lower() if context.args else ""
     if kind not in db.GROUP_KEYS:
         await update.message.reply_text("Usage: /setgroup rec or /setgroup comp")
+        return
+    try:
+        me = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+        is_admin = me.status in ("administrator", "creator")
+    except Exception:
+        is_admin = False
+    if not is_admin:
+        # Telegram only guarantees member lookups (the registration check)
+        # for bots that are group admins.
+        await update.message.reply_text(
+            "Make me an admin of this group first (no special permissions "
+            f"needed), then send /setgroup {kind} again."
+        )
         return
     db.set_setting(conn, db.GROUP_KEYS[kind], str(update.effective_chat.id))
     await update.message.reply_text(

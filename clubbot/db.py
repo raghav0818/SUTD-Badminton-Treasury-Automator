@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS payments (
     shirt_size         TEXT,
     opted_out_at       TEXT,
     notified_at        TEXT,
+    wants_shirt        INTEGER,
     extract_attempts   INTEGER NOT NULL DEFAULT 0,
     last_extract_error_at TEXT
 );
@@ -176,6 +177,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "shirt_size": "TEXT",
             "opted_out_at": "TEXT",
             "notified_at": "TEXT",
+            "wants_shirt": "INTEGER",
         },
     )
     # v2 D15: Gemini-failure retry bookkeeping.
@@ -201,6 +203,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "UPDATE payments SET category = 'recreational' WHERE category IS NULL"
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO term_events (term_id, event, sent_at)
+        SELECT id, 'remind-d7', reminder7_sent_at FROM terms
+        WHERE reminder7_sent_at IS NOT NULL
+        """
     )
     conn.execute(
         """
@@ -562,6 +571,14 @@ def get_active_term(
     ).fetchone()
 
 
+def get_latest_started_term(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    today = datetime.now(SINGAPORE_TIME).date().isoformat()
+    return conn.execute(
+        "SELECT * FROM terms WHERE start_date <= ? ORDER BY start_date DESC, id DESC LIMIT 1",
+        (today,),
+    ).fetchone()
+
+
 def _new_ref_code(term_id: int) -> str:
     return f"BDM-{term_id}-{secrets.token_hex(5).upper()}"
 
@@ -608,11 +625,21 @@ def mark_qr_issued(conn: sqlite3.Connection, payment_id: int) -> sqlite3.Row:
 def set_shirt_size(
     conn: sqlite3.Connection, payment_id: int, shirt_size: str | None
 ) -> None:
-    """Record the pay-flow shirt choice (None = no shirt)."""
+    """Record the pay-flow shirt choice (None = without shirt).
+
+    The size is kept when they later pick "without shirt": it is the size of
+    any shirt QR they already hold, and verification clears it if they end up
+    paying the no-shirt amount.
+    """
     if shirt_size is not None and shirt_size not in SHIRT_SIZES:
         raise ValueError("unknown shirt size")
     conn.execute(
-        "UPDATE payments SET shirt_size = ? WHERE id = ?", (shirt_size, payment_id)
+        """
+        UPDATE payments
+        SET wants_shirt = ?, shirt_size = COALESCE(?, shirt_size)
+        WHERE id = ?
+        """,
+        (int(shirt_size is not None), shirt_size, payment_id),
     )
     conn.commit()
 
@@ -629,7 +656,7 @@ def _settle_shirt(conn: sqlite3.Connection, payment_id: int) -> None:
     category = payment["category"]
     amount = payment["amount_cents"]
     if amount is None:
-        with_shirt = payment["shirt_size"] is not None and offers_shirt(payment, category)
+        with_shirt = bool(payment["wants_shirt"]) and offers_shirt(payment, category)
         amount = term_fee(payment, category, with_shirt=with_shirt)
     else:
         with_shirt = offers_shirt(payment, category) and amount == term_fee(
@@ -819,6 +846,21 @@ def record_extract_failure(conn: sqlite3.Connection, payment_id: int) -> int:
     return get_payment(conn, payment_id)["extract_attempts"]
 
 
+def requeue_interrupted_extractions(conn: sqlite3.Connection) -> int:
+    """Startup only: pending receipts a restart cut off mid-check join the retry queue."""
+    cursor = conn.execute(
+        """
+        UPDATE payments SET last_extract_error_at = ?
+        WHERE status = 'pending_verification'
+          AND last_extract_error_at IS NULL
+          AND screenshot_file_id IS NOT NULL
+        """,
+        (_utc_now(),),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 def list_extraction_retries(
     conn: sqlite3.Connection, max_attempts: int
 ) -> list[sqlite3.Row]:
@@ -983,6 +1025,12 @@ def claim_term_event(conn: sqlite3.Connection, term_id: int, event: str) -> bool
     return cursor.rowcount == 1
 
 
+def term_event_claimed(conn: sqlite3.Connection, term_id: int, event: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM term_events WHERE term_id = ? AND event = ?", (term_id, event)
+    ).fetchone() is not None
+
+
 def get_term_payment_stats(conn: sqlite3.Connection, term_id: int) -> dict[str, int]:
     """Headline counts for /stats; 'unpaid' matches /unpaid (opted-out excluded)."""
     registered = conn.execute(
@@ -1101,10 +1149,12 @@ def mark_paid_manual(
     """Treasurer override for cash / off-Telegram payments (logged as manual_override).
 
     Records the member's base fee, or the with-shirt fee if their last pay-flow
-    choice was a shirt size.
+    choice was a shirt.
     """
     payment = get_or_create_payment(conn, member_id=member_id, term_id=term_id)
-    with_shirt = payment["shirt_size"] is not None
+    with_shirt = bool(payment["wants_shirt"]) and offers_shirt(
+        payment, payment["category"]
+    )
     conn.execute(
         """
         UPDATE payments

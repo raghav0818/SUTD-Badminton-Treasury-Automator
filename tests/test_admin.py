@@ -224,10 +224,13 @@ def test_roster_replaces_list_and_reports_rejects(conn):
         user_id=999, text="/roster\nAlice Tan, 1010001\nBob Lim, 1010002\noops"
     ), make_context(conn)
     asyncio.run(admin.cmd_roster(update, context))
-    assert db.roster_size(conn) == 2
+    assert db.roster_size(conn) == 1  # one bad line: nothing changes
     text = reply_text_of(update)
-    assert "2 people" in text
-    assert "oops" in text
+    assert "NOT changed" in text and "oops" in text
+    update = make_update(user_id=999, text="/roster\nAlice Tan, 1010001\nBob Lim, 1010002")
+    asyncio.run(admin.cmd_roster(update, context))
+    assert db.roster_size(conn) == 2
+    assert "2 people" in reply_text_of(update)
 
 
 def test_roster_all_bad_lines_leave_roster_untouched(conn):
@@ -541,8 +544,21 @@ def test_setgroup_stores_chat_id_inside_a_group(conn):
         update.effective_chat.type = "supergroup"
         update.effective_chat.id = chat_id
         context.args = [kind]
+        context.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="administrator"))
         asyncio.run(admin.cmd_setgroup(update, context))
         assert db.get_setting(conn, key) == str(chat_id)
+
+
+def test_setgroup_requires_the_bot_to_be_group_admin(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    update.effective_chat.type = "supergroup"
+    update.effective_chat.id = -1002
+    context.args = ["rec"]
+    context.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="member"))
+    asyncio.run(admin.cmd_setgroup(update, context))
+    assert db.get_setting(conn, "rec_group_id") is None
+    assert "admin" in reply_text_of(update)
 
 
 def test_setgroup_rejects_private_chat_and_bad_args(conn):

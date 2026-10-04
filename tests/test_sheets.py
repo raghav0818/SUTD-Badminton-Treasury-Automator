@@ -94,6 +94,10 @@ def test_shirts_tab_lists_paid_shirt_orders_with_size_counts(conn):
         conn, telegram_user_id=333, full_name="Cara Ng", sutd_id="1010656", username=None
     )
     term = db.get_active_term(conn)
+    conn.execute(
+        "UPDATE terms SET recshirt_fee_cents = 3000, shirt_fee_cents = 1500 WHERE id = ?",
+        (term["id"],),
+    )
     for uid in (222, 333):
         payment = db.get_or_create_payment(conn, member_id=uid, term_id=term["id"])
         db.set_shirt_size(conn, payment["id"], "M")

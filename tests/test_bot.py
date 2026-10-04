@@ -103,7 +103,7 @@ def test_duplicate_sutd_id_blocked(conn):
         conn, telegram_user_id=999, full_name="Bob Lim", sutd_id="1010654", username=None
     )
     context = make_context(conn)
-    context.user_data["full_name"] = "Alice Tan"
+    context.user_data.update({"full_name": "Alice Tan", "in_club_group": True})
     update = make_update(text="1010654")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.ASK_SUTD_ID
     assert "already registered" in reply_text_of(update)
@@ -133,7 +133,7 @@ def test_relink_registration_moves_history(conn):
     db.arm_relink(conn, "1010654")
 
     context = make_context(conn)
-    context.user_data["full_name"] = "Alice Tan"
+    context.user_data.update({"full_name": "Alice Tan", "in_club_group": True})
     update = make_update(user_id=555, text="1010654", username="alice_new")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
 
@@ -157,7 +157,7 @@ def test_relink_confirm_after_disarm_is_blocked(conn):
     )
     db.arm_relink(conn, "1010654")
     context = make_context(conn)
-    context.user_data["full_name"] = "Attacker"
+    context.user_data.update({"full_name": "Attacker", "in_club_group": True})
     update = make_update(user_id=666, text="1010654", username="attacker")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
 
@@ -201,7 +201,7 @@ def test_relink_not_armed_still_blocks_duplicate_id(conn):
         conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     context = make_context(conn)
-    context.user_data["full_name"] = "Impostor"
+    context.user_data.update({"full_name": "Impostor", "in_club_group": True})
     update = make_update(user_id=555, text="1010654", username="impostor")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.ASK_SUTD_ID
     assert "already registered" in reply_text_of(update)
@@ -477,7 +477,8 @@ def test_choosing_again_reissues_qr_but_keeps_first_issue_time(conn):
     payment = db.get_current_payment(conn, 111)
     assert first is not None
     assert payment["qr_issued_at"] == "2000-01-01T00:00:00+00:00"  # COALESCE
-    assert payment["shirt_size"] is None
+    # The size stays with any shirt QR already out; the choice is what changed.
+    assert (payment["wants_shirt"], payment["shirt_size"]) == (0, "L")
     assert qr_amount(context) == "25.00"
 
 
@@ -1028,3 +1029,33 @@ def test_member_commands_are_ignored_in_group_chats(conn):
     app.bot._bot_user = User(id=1234567, first_name="Bot", is_bot=True, username="testbot")
     assert pay.check_update(_command_update(app, "private"))
     assert not pay.check_update(_command_update(app, "supergroup"))
+
+
+def test_relink_is_gated_like_registration(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username=None
+    )
+    db.arm_relink(conn, "1010654")
+    context = make_context(conn)
+    context.user_data.update({"full_name": "Outsider", "in_club_group": False})
+    update = make_update(user_id=666, text="1010654")
+    assert asyncio.run(bot.on_sutd_id(update, context)) == ConversationHandler.END
+    assert db.get_member(conn, 111) is not None  # Alice's account untouched
+
+
+def test_retry_gives_up_even_if_member_blocked_the_bot(conn):
+    setup_receipt(conn)
+    submit_failing_receipt(conn)
+    context = receipt_context(conn, FailingExtractor())
+
+    async def send(chat_id, text, **kwargs):
+        if chat_id == 111:
+            raise RuntimeError("Forbidden: bot was blocked by the user")
+
+    context.bot.send_message = AsyncMock(side_effect=send)
+    for _ in range(3):
+        asyncio.run(bot.retry_failed_extractions(context))
+    to_treasurer = [
+        c for c in context.bot.send_message.call_args_list if c.kwargs["chat_id"] == 999
+    ]
+    assert len(to_treasurer) == 1

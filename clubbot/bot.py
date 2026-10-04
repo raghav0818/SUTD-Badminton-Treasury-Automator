@@ -214,18 +214,18 @@ async def on_sutd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if sutd_id is None:
         await update.message.reply_text(BAD_SUTD_ID)
         return ASK_SUTD_ID
+    if not context.user_data.get("in_club_group") and (
+        db.member_category(_db(context), {"sutd_id": sutd_id}) != "competitive"
+    ):
+        # Neither in a club group nor on the roster (relinks included).
+        context.user_data.clear()
+        await update.message.reply_text(NOT_IN_CLUB)
+        return ConversationHandler.END
     if db.get_member_by_sutd_id(_db(context), sutd_id) is not None:
         if not db.relink_armed(_db(context), sutd_id):
             await update.message.reply_text(SUTD_ID_TAKEN)
             return ASK_SUTD_ID
         context.user_data["relink"] = True
-    elif not context.user_data.get("in_club_group") and (
-        db.member_category(_db(context), {"sutd_id": sutd_id}) != "competitive"
-    ):
-        # Neither in a club group nor on the roster.
-        context.user_data.clear()
-        await update.message.reply_text(NOT_IN_CLUB)
-        return ConversationHandler.END
     context.user_data["sutd_id"] = sutd_id
     await update.message.reply_text(
         CONFIRM_PROMPT.format(name=context.user_data["full_name"], sutd_id=sutd_id)
@@ -757,10 +757,13 @@ async def _retry_one(context, extractor, payment: sqlite3.Row) -> None:
         # further retries, so the treasurer is told exactly once.
         db.mark_payment_exception(conn, payment["id"])
         scheduler.request_sheet_sync(context.application)
-        await reply(
-            "I still couldn't check your receipt automatically, so the treasurer "
-            "will check it by hand. You'll be notified once it's done."
-        )
+        try:
+            await reply(
+                "I still couldn't check your receipt automatically, so the "
+                "treasurer will check it by hand. You'll be notified once it's done."
+            )
+        except Exception:
+            log.warning("Could not tell member about payment %s", payment["id"], exc_info=True)
         try:
             await context.bot.send_photo(
                 chat_id=db.get_treasurer_id(conn),
