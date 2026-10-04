@@ -1,4 +1,9 @@
-"""Restart-safe lifecycle jobs: term-start blast, day-7 reminder, weekly DB backup."""
+"""Restart-safe lifecycle jobs: term-start blast, deadline reminders, group
+progress posts, weekly DB backup, Sheet sync.
+
+One hourly due-check sends whatever is due today and not yet stamped, so a
+restart or a crashed run self-heals on the next check without re-sending.
+"""
 
 from __future__ import annotations
 
@@ -13,66 +18,60 @@ from datetime import date, datetime, time, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from clubbot import db
-from clubbot.format import money
 from clubbot.payments import SINGAPORE_TIME
 
 log = logging.getLogger(__name__)
 
-REMINDER_HOUR = 10  # 10:00 SGT for term-start blast and day-7 reminder
+REMINDER_HOUR = 10    # 10:00 SGT term-start blast and DM reminders
+GROUP_POST_HOUR = 12  # 12:00 SGT Mon/Thu group progress posts
+QUIET_HOUR = 22       # a catch-up after a late restart waits for the next morning
+REMINDER_DAYS = (3, 7, 10, 13)  # days after term start; only those before the deadline
+GROUP_POST_WEEKDAYS = (0, 3)    # Monday, Thursday
 BACKUP_HOUR = 3     # 03:00 SGT Sunday database backup to the treasurer
 SHEET_HOUR = 2      # 02:30 SGT nightly full Sheet rebuild
 SHEET_SYNC_DELAY = timedelta(seconds=30)  # debounce for on-change syncs
 
 
-# --- Pure run-time calculators (no I/O) ----------------------------------------
+# --- Pure due-date calculators (no I/O) ----------------------------------------
 
 
-def _at_reminder_hour(day: date) -> datetime:
-    """The given Singapore date at REMINDER_HOUR:00 SGT."""
-    return datetime(
-        day.year, day.month, day.day, REMINDER_HOUR, 0, tzinfo=SINGAPORE_TIME
-    )
-
-
-def term_start_run_time(term: sqlite3.Row, now: datetime) -> datetime:
-    """The term's start date at 10:00 SGT, or `now` if that moment already passed."""
-    when = _at_reminder_hour(date.fromisoformat(term["start_date"]))
-    return when if when > now else now
-
-
-def reminder7_run_time(term: sqlite3.Row) -> datetime:
-    """Seven days after the term's start date, at 10:00 SGT."""
+def reminder_event(term, day: date) -> str | None:
+    """The DM reminder due on `day` ('remind-d7' / 'lastcall'), if any."""
     start = date.fromisoformat(term["start_date"])
-    return _at_reminder_hour(start + timedelta(days=7))
+    deadline = date.fromisoformat(term["deadline"])
+    if day == deadline:
+        return "lastcall"
+    offset = (day - start).days
+    if day < deadline and offset in REMINDER_DAYS:
+        return f"remind-d{offset}"
+    return None
 
 
-def pending_term_jobs(
-    conn: sqlite3.Connection, now: datetime
-) -> list[tuple[str, sqlite3.Row, datetime]]:
-    """Outstanding ('start'/'reminder7') jobs for terms that have not yet ended."""
-    today = now.astimezone(SINGAPORE_TIME).date()
-    jobs: list[tuple[str, sqlite3.Row, datetime]] = []
-    for term in db.list_terms(conn):
-        if date.fromisoformat(term["end_date"]) < today:
-            continue
-        if term["start_notified_at"] is None:
-            jobs.append(("start", term, term_start_run_time(term, now)))
-        if term["reminder7_sent_at"] is None:
-            when = reminder7_run_time(term)
-            # A short term can end before day 7; don't nag after collection closed.
-            if when.date() <= date.fromisoformat(term["end_date"]):
-                jobs.append(("reminder7", term, when))
-    return jobs
+def group_post_event(term, day: date) -> str | None:
+    """'grouppost-<date>' on Mondays/Thursdays from term start to the deadline."""
+    start = date.fromisoformat(term["start_date"])
+    deadline = date.fromisoformat(term["deadline"])
+    if start <= day <= deadline and day.weekday() in GROUP_POST_WEEKDAYS:
+        return f"grouppost-{day.isoformat()}"
+    return None
 
 
 # --- Async actions (testable with a mock bot + in-memory conn) -----------------
 
 
-# The amount depends on the member's shirt choice, so blasts and reminders
-# carry a button into the /pay flow instead of a ready-made QR.
-PAY_NOW_KEYBOARD = InlineKeyboardMarkup(
-    [[InlineKeyboardButton("Pay now", callback_data="pay:start")]]
-)
+def reminder_keyboard(term_id: int) -> InlineKeyboardMarkup:
+    """The amount depends on the member's shirt choice, so blasts and reminders
+    carry a button into the /pay flow instead of a ready-made QR."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Pay now", callback_data="pay:start")],
+            [
+                InlineKeyboardButton(
+                    "Not continuing this term", callback_data=f"optout:{term_id}"
+                )
+            ],
+        ]
+    )
 
 
 async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> None:
@@ -88,67 +87,140 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
         payment = db.get_or_create_payment(
             conn, member_id=member["telegram_user_id"], term_id=term_id
         )
-        # Members who already got a QR via /pay need no invite. qr_issued_at is
-        # NOT stamped here (it bounds the payment-time check to the real QR).
-        # ponytail: a blast interrupted mid-loop re-invites the first half on
-        # retry; add a per-member stamp if that ever bites.
-        if payment["status"] == "verified" or payment["qr_issued_at"]:
+        # Skip anyone already paid, already holding a QR from /pay, opted out,
+        # or messaged before a mid-blast restart. qr_issued_at is NOT stamped
+        # here (it bounds the payment-time check to the real QR).
+        if (
+            payment["status"] == "verified"
+            or payment["qr_issued_at"]
+            or payment["opted_out_at"]
+            or payment["notified_at"]
+        ):
             continue
         attempted += 1
         try:
             await bot.send_message(
                 chat_id=member["telegram_user_id"],
                 text=text,
-                reply_markup=PAY_NOW_KEYBOARD,
+                reply_markup=reminder_keyboard(term_id),
             )
         except Exception:
             log.warning(
-                "Term-start QR failed for member %s",
+                "Term-start message failed for member %s",
                 member["telegram_user_id"],
                 exc_info=True,
             )
         else:
             sent += 1
+            db.mark_payment_notified(conn, payment["id"])
     if attempted and not sent:
         # Telegram was down for the whole loop: leave the term unstamped so
-        # the daily re-arm retries the blast instead of silently dropping it.
+        # the next hourly check retries the blast instead of dropping it.
         log.error("Term-start blast for term %s failed for all members", term_id)
         return
     db.mark_term_start_notified(conn, term_id)
 
 
 async def send_unpaid_reminders(
-    bot, conn: sqlite3.Connection, term_id: int
+    bot, conn: sqlite3.Connection, term_id: int, *, last_call: bool = False
 ) -> int:
-    """DM every unpaid active member a gentle nudge; return the successful-send count."""
+    """DM every unpaid, not-opted-out member a nudge; return the successful-send count."""
     term = db.get_term(conn, term_id)
-    text = (
-        f"Reminder: your {term['name']} membership fee is still unpaid "
-        f"(deadline {term['deadline']}). Tap Pay now to get your QR, "
-        "then send the payment screenshot here."
-    )
+    if last_call:
+        text = (
+            f"Last call: today ({term['deadline']}) is the deadline for your "
+            f"{term['name']} membership fee. Tap Pay now to get your QR, "
+            "then send the payment screenshot here."
+        )
+    else:
+        text = (
+            f"Reminder: your {term['name']} membership fee is still unpaid "
+            f"(deadline {term['deadline']}). Tap Pay now to get your QR, "
+            "then send the payment screenshot here."
+        )
     sent = 0
     for member in db.list_unpaid_members(conn, term_id):
         try:
             await bot.send_message(
                 chat_id=member["telegram_user_id"],
                 text=text,
-                reply_markup=PAY_NOW_KEYBOARD,
+                reply_markup=reminder_keyboard(term_id),
             )
             sent += 1
         except Exception:
             log.warning(
-                "Day-7 reminder failed for member %s",
+                "Reminder failed for member %s",
                 member["telegram_user_id"],
                 exc_info=True,
             )
     return sent
 
 
-async def do_reminder7(bot, conn: sqlite3.Connection, term_id: int) -> None:
-    """Send the single day-7 nudge to the still-unpaid, then stamp the term."""
-    await send_unpaid_reminders(bot, conn, term_id)
-    db.mark_term_reminder7_sent(conn, term_id)
+def group_post_texts(bot, conn: sqlite3.Connection, term) -> dict[str, str]:
+    """{settings key: message} for the progress posts. Counts only, never names."""
+    tail = (
+        f"\nDeadline: {term['deadline']}\n"
+        f"Tap to pay: https://t.me/{bot.username}?start=pay"
+    )
+    return {
+        "comp_group_id": (
+            f"{term['name']} membership - Competitive: "
+            f"{db.roster_paid_count(conn, term['id'])}/{db.roster_size(conn)} paid."
+            + tail
+        ),
+        "rec_group_id": (
+            f"{term['name']} membership - "
+            f"{db.recreational_paid_count(conn, term['id'])} rec members paid so far."
+            + tail
+        ),
+    }
+
+
+async def post_group_progress(bot, conn: sqlite3.Connection, term) -> None:
+    """Post progress to each configured group chat. Failures are logged only."""
+    for key, text in group_post_texts(bot, conn, term).items():
+        chat_id = db.get_setting(conn, key)
+        if chat_id is None:
+            continue
+        try:
+            await bot.send_message(chat_id=int(chat_id), text=text)
+        except Exception:
+            log.warning("Group progress post to %s failed", key, exc_info=True)
+
+
+async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
+    """Send everything due today and not yet stamped, for every open term.
+
+    Reminders and group posts are claimed (stamped) before sending: a crash
+    mid-send loses the rest of that send rather than messaging anyone twice.
+    """
+    now = now.astimezone(SINGAPORE_TIME)
+    today = now.date()
+    if not REMINDER_HOUR <= now.hour < QUIET_HOUR:
+        return
+    group_posts_on = db.get_setting(conn, "group_posts") != "off"
+    for term in db.list_terms(conn):
+        if not term["start_date"] <= today.isoformat() <= term["deadline"]:
+            continue
+        blasted = False
+        if term["start_notified_at"] is None:
+            await do_term_start_blast(bot, conn, term["id"])
+            blasted = True
+        event = reminder_event(term, today)
+        # A same-day blast already invited everyone; the claim just retires
+        # today's reminder so nobody gets two messages in one day.
+        if event and db.claim_term_event(conn, term["id"], event) and not blasted:
+            await send_unpaid_reminders(
+                bot, conn, term["id"], last_call=event == "lastcall"
+            )
+        event = group_post_event(term, today)
+        if (
+            event
+            and group_posts_on
+            and now.hour >= GROUP_POST_HOUR
+            and db.claim_term_event(conn, term["id"], event)
+        ):
+            await post_group_progress(bot, conn, term)
 
 
 async def do_weekly_backup(bot, conn: sqlite3.Connection) -> bool:
@@ -191,14 +263,10 @@ async def do_weekly_backup(bot, conn: sqlite3.Connection) -> bool:
 # --- JobQueue glue -------------------------------------------------------------
 
 
-async def _job_term_start(context) -> None:
-    conn = context.bot_data["db"]
-    await do_term_start_blast(context.bot, conn, context.job.data["term_id"])
-
-
-async def _job_reminder7(context) -> None:
-    conn = context.bot_data["db"]
-    await do_reminder7(context.bot, conn, context.job.data["term_id"])
+async def _job_due(context) -> None:
+    await run_due_events(
+        context.bot, context.bot_data["db"], datetime.now(SINGAPORE_TIME)
+    )
 
 
 async def _job_sheet_sync(context) -> None:
@@ -234,53 +302,24 @@ async def _job_backup(context) -> None:
     await do_weekly_backup(context.bot, context.bot_data["db"])
 
 
-def _arm_term_job(
-    jq, kind: str, term_id: int, when: datetime, now: datetime
-) -> None:
-    """Schedule one named one-shot term job, replacing any existing job of that name."""
-    name = f"{kind}-{term_id}"
-    for existing in jq.get_jobs_by_name(name):
-        existing.schedule_removal()
-    callback = _job_term_start if kind == "start" else _job_reminder7
-    jq.run_once(
-        callback,
-        when=max(when, now + timedelta(seconds=5)),
-        data={"term_id": term_id},
-        name=name,
-    )
-
-
-async def _job_rearm(context) -> None:
-    """Daily self-heal: re-arm any pending term job that is no longer queued.
-
-    run_once jobs are consumed even when they raise; without this, a crashed
-    blast/reminder would be lost until the next process restart.
-    """
-    conn = context.bot_data["db"]
-    now = datetime.now(SINGAPORE_TIME)
-    for kind, term, when in pending_term_jobs(conn, now):
-        if not context.job_queue.get_jobs_by_name(f"{kind}-{term['id']}"):
-            _arm_term_job(context.job_queue, kind, term["id"], when, now)
-
-
 def schedule_all(app, conn: sqlite3.Connection) -> None:
-    """Restore outstanding one-shot term jobs and arm the recurring jobs.
-
-    Called once at startup; restores any blast/reminder a restart would lose.
-    """
+    """Arm the recurring jobs. Called once at startup."""
     jq = app.job_queue
     now = datetime.now(SINGAPORE_TIME)
-    for kind, term, when in pending_term_jobs(conn, now):
-        _arm_term_job(jq, kind, term["id"], when, now)
+    # Hourly due-check just after each full hour, plus one right away to catch
+    # up on anything due while the bot was down. It also retries a blast that
+    # failed outright.
+    jq.run_repeating(
+        _job_due,
+        interval=timedelta(hours=1),
+        first=now.replace(minute=0, second=30, microsecond=0) + timedelta(hours=1),
+        name="due-check",
+    )
+    jq.run_once(_job_due, when=timedelta(seconds=5), name="due-check-now")
     jq.run_daily(
         _job_backup,
         time=time(hour=BACKUP_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
         name="weekly-backup",
-    )
-    jq.run_daily(
-        _job_rearm,
-        time=time(hour=REMINDER_HOUR, minute=5, tzinfo=SINGAPORE_TIME),
-        name="term-job-rearm",
     )
     # Nightly Sheet rebuild; the job itself no-ops when no mirror is configured.
     jq.run_daily(
@@ -291,15 +330,7 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
 
 
 def schedule_term_jobs(app, conn: sqlite3.Connection, term_id: int) -> None:
-    """Arm a single term's jobs right away.
-
-    Used by /newterm while the bot is already running, since schedule_all only
-    runs at startup. Safe to call repeatedly: each job replaces its prior self.
-    """
-    jq = app.job_queue
-    if jq is None:
+    """Run a due-check now, so /newterm on an already-started term blasts at once."""
+    if app.job_queue is None:
         return
-    now = datetime.now(SINGAPORE_TIME)
-    for kind, term, when in pending_term_jobs(conn, now):
-        if term["id"] == term_id:
-            _arm_term_job(jq, kind, term["id"], when, now)
+    app.job_queue.run_once(_job_due, when=timedelta(seconds=5), name="due-check-now")

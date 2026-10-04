@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS payments (
     category           TEXT    CHECK (category IN ('competitive','recreational')),
     with_shirt         INTEGER,
     shirt_size         TEXT,
-    opted_out_at       TEXT
+    opted_out_at       TEXT,
+    notified_at        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS admins (
@@ -93,6 +94,15 @@ CREATE TABLE IF NOT EXISTS receipt_fingerprints (
 CREATE TABLE IF NOT EXISTS roster (
     sutd_id TEXT PRIMARY KEY,
     name    TEXT NOT NULL
+);
+
+-- Restart-safe stamps for per-term scheduled sends ('remind-d3', 'lastcall',
+-- 'grouppost-2026-09-07', ...): a claimed event is never sent again.
+CREATE TABLE IF NOT EXISTS term_events (
+    term_id INTEGER NOT NULL REFERENCES terms(id),
+    event   TEXT    NOT NULL,
+    sent_at TEXT    NOT NULL,
+    PRIMARY KEY (term_id, event)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_member_term
@@ -163,6 +173,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "with_shirt": "INTEGER",
             "shirt_size": "TEXT",
             "opted_out_at": "TEXT",
+            "notified_at": "TEXT",
         },
     )
     # Pre-v2 terms had one price and no shirt: every category pays fee_cents.
@@ -827,19 +838,59 @@ def list_active_members(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def list_unpaid_members(
     conn: sqlite3.Connection, term_id: int
 ) -> list[sqlite3.Row]:
-    """Active members with no 'verified' payment for the term (the reminder set)."""
+    """Active members with no 'verified' payment for the term who have not
+    opted out of it (the reminder set)."""
     return conn.execute(
         """
         SELECT * FROM members
         WHERE active = 1
           AND telegram_user_id NOT IN (
               SELECT member_id FROM payments
-              WHERE term_id = ? AND status = 'verified'
+              WHERE term_id = ?
+                AND (status = 'verified' OR opted_out_at IS NOT NULL)
           )
         ORDER BY full_name
         """,
         (term_id,),
     ).fetchall()
+
+
+def count_opted_out(conn: sqlite3.Connection, term_id: int) -> int:
+    """Members who tapped "Not continuing this term" and have not paid since."""
+    return conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM payments
+        WHERE term_id = ? AND opted_out_at IS NOT NULL AND status != 'verified'
+        """,
+        (term_id,),
+    ).fetchone()["n"]
+
+
+def opt_out(conn: sqlite3.Connection, payment_id: int) -> None:
+    """Stop reminders for this member+term; paying later still works."""
+    conn.execute(
+        "UPDATE payments SET opted_out_at = COALESCE(opted_out_at, ?) WHERE id = ?",
+        (_utc_now(), payment_id),
+    )
+    conn.commit()
+
+
+def mark_payment_notified(conn: sqlite3.Connection, payment_id: int) -> None:
+    """Per-member term-start blast stamp, so a mid-blast restart skips them."""
+    conn.execute(
+        "UPDATE payments SET notified_at = ? WHERE id = ?", (_utc_now(), payment_id)
+    )
+    conn.commit()
+
+
+def claim_term_event(conn: sqlite3.Connection, term_id: int, event: str) -> bool:
+    """Stamp a scheduled send; False means it was already claimed (never resend)."""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO term_events (term_id, event, sent_at) VALUES (?, ?, ?)",
+        (term_id, event, _utc_now()),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
 
 
 def get_term_payment_stats(conn: sqlite3.Connection, term_id: int) -> dict[str, int]:
@@ -903,6 +954,16 @@ def replace_roster(conn: sqlite3.Connection, rows: list[tuple[str, str]]) -> Non
 
 def roster_size(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) AS n FROM roster").fetchone()["n"]
+
+
+def recreational_paid_count(conn: sqlite3.Connection, term_id: int) -> int:
+    return conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM payments
+        WHERE term_id = ? AND status = 'verified' AND category = 'recreational'
+        """,
+        (term_id,),
+    ).fetchone()["n"]
 
 
 def roster_paid_count(conn: sqlite3.Connection, term_id: int) -> int:
@@ -990,14 +1051,6 @@ def revoke_payment(
 def mark_term_start_notified(conn: sqlite3.Connection, term_id: int) -> None:
     conn.execute(
         "UPDATE terms SET start_notified_at = ? WHERE id = ?",
-        (_utc_now(), term_id),
-    )
-    conn.commit()
-
-
-def mark_term_reminder7_sent(conn: sqlite3.Connection, term_id: int) -> None:
-    conn.execute(
-        "UPDATE terms SET reminder7_sent_at = ? WHERE id = ?",
         (_utc_now(), term_id),
     )
     conn.commit()

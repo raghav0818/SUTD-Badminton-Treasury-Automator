@@ -266,7 +266,7 @@ def test_status_without_username_has_no_handle(conn):
 def test_build_application_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     assert app.bot_data["db"] is conn
-    assert len(app.handlers[0]) == 22
+    assert len(app.handlers[0]) == 24
 
 
 def create_active_term(conn, treasurer_id=999):
@@ -512,6 +512,34 @@ def test_pay_when_already_verified_or_no_term(conn):
     asyncio.run(bot.on_pay_size(update, context))
     assert "already verified" in update.callback_query.edit_message_text.call_args.args[0]
     assert context.bot.send_photo.await_count == 0
+
+
+def test_optout_button_stops_reminders_but_pay_still_works(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    term = create_priced_term(conn)  # no payment row yet: the button creates it
+    update = make_callback(f"optout:{term['id']}")
+    asyncio.run(bot.on_optout(update, make_context(conn)))
+    assert "no more reminders" in update.callback_query.edit_message_text.call_args.args[0]
+    assert db.get_current_payment(conn, 111)["opted_out_at"] is not None
+    assert db.list_unpaid_members(conn, term["id"]) == []
+
+    context = pay_context(conn)
+    asyncio.run(bot.on_pay_shirt(make_callback("pay:shirt:no"), context))
+    assert qr_amount(context) == "25.00"
+
+
+def test_optout_ignored_when_already_paid(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    term = create_priced_term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    update = make_callback(f"optout:{term['id']}")
+    asyncio.run(bot.on_optout(update, make_context(conn)))
+    assert "already verified" in update.callback_query.edit_message_text.call_args.args[0]
+    assert db.get_current_payment(conn, 111)["opted_out_at"] is None
 
 
 class FakeExtractor:

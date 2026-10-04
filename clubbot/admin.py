@@ -59,10 +59,8 @@ async def cmd_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     members = db.list_unpaid_members(conn, term["id"])
     never_opened = db.list_roster_unregistered(conn)
-    if not members and not never_opened:
-        await update.message.reply_text("Everyone has paid.")
-        return
-    sections = []
+    opted_out = db.count_opted_out(conn, term["id"])
+    sections = [] if members or never_opened else ["Everyone has paid."]
     if members:
         sections.append(
             f"Unpaid members for {term['name']}:\n"
@@ -73,6 +71,8 @@ async def cmd_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "On the roster but never opened the bot:\n"
             + "\n".join(f"- {r['name']} (SUTD ID {r['sutd_id']})" for r in never_opened)
         )
+    if opted_out:
+        sections.append(f"Opted out: {opted_out}")
     await update.message.reply_text("\n\n".join(sections))
 
 
@@ -162,6 +162,32 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     db.replace_roster(conn, rows)
     await update.message.reply_text(
         f"Roster replaced: {len(rows)} people." + rejected_text
+    )
+
+
+GROUP_KEYS = {"rec": "rec_group_id", "comp": "comp_group_id"}
+
+
+async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/setgroup rec|comp`, sent inside the club group chat it should name."""
+    conn = _db(context)
+    if not _is_admin(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            "Send this inside the group chat itself: add me to the group, "
+            "then send /setgroup rec or /setgroup comp there."
+        )
+        return
+    kind = context.args[0].lower() if context.args else ""
+    if kind not in GROUP_KEYS:
+        await update.message.reply_text("Usage: /setgroup rec or /setgroup comp")
+        return
+    db.set_setting(conn, GROUP_KEYS[kind], str(update.effective_chat.id))
+    await update.message.reply_text(
+        f"This chat is now the {kind} group. Progress posts (counts only, no "
+        "names) go here on Mondays and Thursdays until the deadline."
     )
 
 
@@ -379,19 +405,29 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             value = getattr(current, attr)
             suffix = " (default)" if value == getattr(defaults, attr) else ""
             lines.append(f"{key} = {value}{suffix}")
+        group_posts = db.get_setting(conn, "group_posts") or "on (default)"
+        lines.append(f"group_posts = {group_posts}")
         lines.append("\nChange with: /settings <key> <value>")
         await update.message.reply_text("\n".join(lines))
         return
     key = context.args[0]
-    if key not in SETTING_KEYS:
+    if key not in SETTING_KEYS + ("group_posts",):
         await update.message.reply_text(
-            "Unknown setting. Available keys:\n" + "\n".join(SETTING_KEYS)
+            "Unknown setting. Available keys:\n"
+            + "\n".join(SETTING_KEYS + ("group_posts",))
         )
         return
     if len(context.args) < 2:
         await update.message.reply_text(f"Usage: /settings {key} <value>")
         return
     value = " ".join(context.args[1:]).strip()
+    if key == "group_posts":
+        if value.lower() not in ("on", "off"):
+            await update.message.reply_text("Usage: /settings group_posts on|off")
+            return
+        db.set_setting(conn, key, value.lower())
+        await update.message.reply_text(f"Group progress posts turned {value.lower()}.")
+        return
     # Dry-run a QR with the candidate value; a bad UEN/merchant name/bill
     # number (non-ASCII, too long) would otherwise break /pay for everyone.
     candidate = replace(school_config(conn), **{key.removeprefix("school_"): value})

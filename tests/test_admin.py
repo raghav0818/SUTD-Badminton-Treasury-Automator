@@ -515,6 +515,73 @@ def test_settings_rejects_unknown_key(conn):
     assert "Unknown setting" in reply_text_of(update)
 
 
+def test_settings_group_posts_toggle(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_settings(update, context))
+    assert "group_posts = on (default)" in reply_text_of(update)
+
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["group_posts", "maybe"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert db.get_setting(conn, "group_posts") is None
+
+    context.args = ["group_posts", "OFF"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert db.get_setting(conn, "group_posts") == "off"
+
+
+# --- /setgroup ------------------------------------------------------------------
+
+
+def test_setgroup_stores_chat_id_inside_a_group(conn):
+    db.ensure_treasurer(conn, 999)
+    for kind, key, chat_id in (("rec", "rec_group_id", -1002), ("comp", "comp_group_id", -1001)):
+        update, context = make_update(user_id=999), make_context(conn)
+        update.effective_chat.type = "supergroup"
+        update.effective_chat.id = chat_id
+        context.args = [kind]
+        asyncio.run(admin.cmd_setgroup(update, context))
+        assert db.get_setting(conn, key) == str(chat_id)
+
+
+def test_setgroup_rejects_private_chat_and_bad_args(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    update.effective_chat.type = "private"
+    context.args = ["rec"]
+    asyncio.run(admin.cmd_setgroup(update, context))
+    assert "inside the group" in reply_text_of(update)
+
+    update.effective_chat.type = "group"
+    context.args = ["vip"]
+    asyncio.run(admin.cmd_setgroup(update, context))
+    assert "Usage" in reply_text_of(update)
+    assert db.get_setting(conn, "rec_group_id") is None
+
+
+def test_setgroup_denies_non_admin(conn):
+    update, context = make_update(user_id=111), make_context(conn)
+    update.effective_chat.type = "group"
+    context.args = ["rec"]
+    asyncio.run(admin.cmd_setgroup(update, context))
+    assert "club admins" in reply_text_of(update)
+    assert db.get_setting(conn, "rec_group_id") is None
+
+
+def test_unpaid_hides_opted_out_and_counts_them(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    term = create_active_term(conn)
+    db.opt_out(conn, db.get_or_create_payment(conn, member_id=222, term_id=term["id"])["id"])
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_unpaid(update, context))
+    text = reply_text_of(update)
+    assert "Alice Tan" in text
+    assert "Bob Lim" not in text
+    assert "Opted out: 1" in text
+
+
 def test_settings_denies_non_treasurer(conn):
     update, context = make_update(user_id=111), make_context(conn)
     asyncio.run(admin.cmd_settings(update, context))

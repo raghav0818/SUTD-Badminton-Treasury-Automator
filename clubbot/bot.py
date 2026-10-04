@@ -91,6 +91,7 @@ ADMIN_HELP = (
     "/newterm - open a new paying term\n"
     "/unpaid - who hasn't paid yet\n"
     "/roster - set the competitive roster (Name, SUTD ID lines)\n"
+    "/setgroup rec|comp - send inside a club group chat to link it\n"
     "/stats - payment summary for the term\n"
     "/members - list registered members\n"
     "/markpaid <sutd_id> - record a cash/manual payment\n"
@@ -100,7 +101,8 @@ ADMIN_HELP = (
     "/removeadmin <sutd_id> - remove an admin\n"
     "/transfertreasurer <sutd_id> - hand over the treasurer role\n"
     "/relink <sutd_id> - let a member re-register from a new Telegram account\n"
-    "/settings - view or change the PayNow/verification settings"
+    "/settings - view or change the PayNow/verification settings "
+    "and group_posts on|off"
 )
 
 
@@ -393,6 +395,29 @@ async def on_pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text, keyboard = _shirt_prompt(_db(context), update.effective_user.id)
     await context.bot.send_message(
         chat_id=update.effective_user.id, text=text, reply_markup=keyboard
+    )
+
+
+async def on_optout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """[Not continuing this term] button on blasts/reminders: stop the nagging."""
+    query = update.callback_query
+    await query.answer()
+    conn = _db(context)
+    user_id = update.effective_user.id
+    term = db.get_term(conn, int(query.data.removeprefix("optout:")))
+    if term is None or db.get_member(conn, user_id) is None:
+        await query.edit_message_text("This button is no longer valid.")
+        return
+    payment = db.get_or_create_payment(conn, member_id=user_id, term_id=term["id"])
+    if payment["status"] == "verified":
+        await query.edit_message_text(
+            f"Your {term['name']} payment is already verified. Nothing to change."
+        )
+        return
+    db.opt_out(conn, payment["id"])
+    await query.edit_message_text(
+        f"Noted: you're not continuing for {term['name']}, so no more reminders. "
+        "Changed your mind? You can still send /pay any time."
     )
 
 
@@ -716,7 +741,9 @@ def build_application(
     app.add_handler(CommandHandler("relink", admin.cmd_relink))
     app.add_handler(CommandHandler("settings", admin.cmd_settings))
     app.add_handler(CommandHandler("roster", admin.cmd_roster))
+    app.add_handler(CommandHandler("setgroup", admin.cmd_setgroup))
     app.add_handler(CallbackQueryHandler(on_pay_start, pattern=r"^pay:start$"))
+    app.add_handler(CallbackQueryHandler(on_optout, pattern=r"^optout:\d+$"))
     app.add_handler(
         CallbackQueryHandler(on_pay_shirt, pattern=r"^pay:shirt:(yes|no)$")
     )

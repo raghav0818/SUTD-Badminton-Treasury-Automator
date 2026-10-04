@@ -458,8 +458,24 @@ def test_term_notification_stamps(conn):
     term = _term(conn)
     assert term["start_notified_at"] is None
     db.mark_term_start_notified(conn, term["id"])
-    db.mark_term_reminder7_sent(conn, term["id"])
     refreshed = db.get_term(conn, term["id"])
     assert refreshed["start_notified_at"] is not None
-    assert refreshed["reminder7_sent_at"] is not None
     assert [t["id"] for t in db.list_terms(conn)] == [term["id"]]
+
+
+def test_claim_term_event_is_once_only(conn):
+    term = _term(conn)
+    assert db.claim_term_event(conn, term["id"], "remind-d3") is True
+    assert db.claim_term_event(conn, term["id"], "remind-d3") is False
+    assert db.claim_term_event(conn, term["id"], "lastcall") is True
+
+
+def test_opted_out_member_is_not_unpaid_but_counted(conn):
+    _member(conn, 111, "1000001", "Alice")
+    _member(conn, 222, "1000002", "Bob")
+    term = _term(conn)
+    payment = db.get_or_create_payment(conn, member_id=222, term_id=term["id"])
+    db.opt_out(conn, payment["id"])
+    unpaid = db.list_unpaid_members(conn, term["id"])
+    assert [m["telegram_user_id"] for m in unpaid] == [111]
+    assert db.count_opted_out(conn, term["id"]) == 1
