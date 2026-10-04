@@ -93,7 +93,7 @@ def normalise_transaction_id(value: str | None) -> str | None:
 def verify_extracted_payment(
     extracted: ExtractedPayment,
     *,
-    expected_fee_cents: int,
+    valid_amounts: set[int],
     term_start: str,
     term_end: str,
     qr_issued_at: str,
@@ -111,10 +111,9 @@ def verify_extracted_payment(
         )
 
     reasons: list[str] = []
-    if extracted.amount_cents != expected_fee_cents:
-        reasons.append(
-            f"Amount is not the expected S${expected_fee_cents / 100:.2f}."
-        )
+    if extracted.amount_cents not in valid_amounts:
+        expected = " or ".join(f"S${cents / 100:.2f}" for cents in sorted(valid_amounts))
+        reasons.append(f"Amount is not the expected {expected}.")
 
     recipient = _normalise_text(extracted.recipient)
     if _normalise_text(school.recipient_match) not in recipient:

@@ -9,7 +9,7 @@ from dataclasses import replace
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from clubbot import db, scheduler
+from clubbot import db, scheduler, validation
 from clubbot.format import money
 from clubbot.payments import SchoolConfig, build_member_qr, school_config
 
@@ -58,15 +58,42 @@ async def cmd_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(NO_TERM)
         return
     members = db.list_unpaid_members(conn, term["id"])
-    if not members:
+    never_opened = db.list_roster_unregistered(conn)
+    if not members and not never_opened:
         await update.message.reply_text("Everyone has paid.")
         return
-    lines = [
-        f"- {m['full_name']} (SUTD ID {m['sutd_id']})" for m in members
-    ]
-    await update.message.reply_text(
-        f"Unpaid members for {term['name']}:\n" + "\n".join(lines)
-    )
+    sections = []
+    if members:
+        sections.append(
+            f"Unpaid members for {term['name']}:\n"
+            + "\n".join(f"- {m['full_name']} (SUTD ID {m['sutd_id']})" for m in members)
+        )
+    if never_opened:
+        sections.append(
+            "On the roster but never opened the bot:\n"
+            + "\n".join(f"- {r['name']} (SUTD ID {r['sutd_id']})" for r in never_opened)
+        )
+    await update.message.reply_text("\n\n".join(sections))
+
+
+def _breakdown_lines(rows) -> list[str]:
+    """`Competitive+shirt S$35.00 × 3 = S$105.00` lines plus a total."""
+    lines = []
+    total = 0
+    for row in rows:
+        label = "Competitive" if row["category"] == "competitive" else "Rec"
+        if row["with_shirt"]:
+            label += "+shirt"
+        if row["amount_cents"] is None:
+            lines.append(f"{label} (amount unknown) × {row['n']}")
+            continue
+        subtotal = row["amount_cents"] * row["n"]
+        total += subtotal
+        lines.append(
+            f"{label} {money(row['amount_cents'])} × {row['n']} = {money(subtotal)}"
+        )
+    lines.append(f"Total: {money(total)}")
+    return lines
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -79,13 +106,63 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(NO_TERM)
         return
     stats = db.get_term_payment_stats(conn, term["id"])
+    breakdown = _breakdown_lines(db.get_term_amount_breakdown(conn, term["id"]))
     await update.message.reply_text(
-        f"{term['name']} ({money(term['fee_cents'])})\n"
+        f"{term['name']}\n"
+        + "\n".join(breakdown)
+        + f"\n{db.roster_paid_count(conn, term['id'])}/{db.roster_size(conn)} roster paid\n\n"
         f"Registered: {stats['registered']}\n"
         f"Paid: {stats['paid']}\n"
         f"Unpaid: {stats['unpaid']}\n"
         f"Exceptions: {stats['exceptions']}\n"
         f"Flagged: {stats['flagged']}"
+    )
+
+
+def parse_roster(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """`/roster` message → ([(name, sutd_id)], rejected lines). One `Name, ID` per line."""
+    parts = text.split(maxsplit=1)  # drop the /roster command itself
+    rows: dict[str, str] = {}
+    rejected = []
+    for line in (parts[1] if len(parts) > 1 else "").splitlines():
+        if not line.strip():
+            continue
+        name, _, raw_id = line.rpartition(",")
+        name = validation.normalize_full_name(name)
+        sutd_id = validation.normalize_sutd_id(raw_id)
+        if name is None or sutd_id is None or sutd_id in rows:
+            rejected.append(line.strip())
+            continue
+        rows[sutd_id] = name
+    return [(name, sutd_id) for sutd_id, name in rows.items()], rejected
+
+
+async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = _db(context)
+    if not _is_admin(conn, update.effective_user.id):
+        await update.message.reply_text(NOT_ADMIN)
+        return
+    rows, rejected = parse_roster(update.message.text or "")
+    if not rows and not rejected:
+        await update.message.reply_text(
+            f"Competitive roster size: {db.roster_size(conn)}\n"
+            "To replace it, send /roster followed by one line per person:\n"
+            "Alice Tan, 1010123\nBob Lim, 1010456"
+        )
+        return
+    rejected_text = (
+        "\n\nRejected lines (each must be: Name, 1010xxx; no duplicate IDs):\n"
+        + "\n".join(f"- {line}" for line in rejected)
+        if rejected
+        else ""
+    )
+    if not rows:
+        # Never wipe the roster because of a badly formatted paste.
+        await update.message.reply_text("Roster NOT changed." + rejected_text)
+        return
+    db.replace_roster(conn, rows)
+    await update.message.reply_text(
+        f"Roster replaced: {len(rows)} people." + rejected_text
     )
 
 
@@ -127,7 +204,7 @@ async def cmd_markpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await context.bot.send_message(
         chat_id=payment["telegram_user_id"],
         text=(
-            f"Your {money(payment['fee_cents'])} payment for "
+            f"Your {money(payment['amount_cents'])} payment for "
             f"{payment['term_name']} has been recorded by the treasurer."
         ),
     )

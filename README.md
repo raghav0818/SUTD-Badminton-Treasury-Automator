@@ -26,15 +26,16 @@ Raspberry Pi 4.
 
 | Command | What it does |
 |---|---|
-| `/unpaid` | Who hasn't paid this term. |
-| `/stats` | Term summary: registered / paid / unpaid / exceptions / flagged. |
+| `/unpaid` | Who hasn't paid this term, plus roster people who never opened the bot. |
+| `/stats` | Term summary: count × price per category (compare once per term against FLYMAX), total, roster paid, registered / paid / unpaid / exceptions. |
+| `/roster` | Replace the competitive roster: `/roster` then one `Name, 1010xxx` line per person in the same message. `/roster` alone shows the current size. |
 | `/members` | All registered members. |
 
 ### Treasurer only
 
 | Command | What it does |
 |---|---|
-| `/newterm <name> <fee> <start> <end>` | Open fee collection, e.g. `/newterm Term 1 20.00 2026-09-01 2026-12-01`. Members get their QR automatically at 10:00 on the start date, and unpaid members one reminder on day 7. |
+| `/newterm <name> <start> <end> deadline=… comp=… rec=… recshirt=… shirt=…` | Open fee collection, e.g. `/newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 comp=20 rec=25 recshirt=30 shirt=15` (competitive S$20, or S$35 with the S$15 shirt; rec S$25, or S$30 with shirt). Members get a "Pay now" message at 10:00 on the start date, and unpaid members one reminder on day 7; tapping it asks shirt yes/no (and size), then sends the QR at that amount. |
 | `/markpaid <sutd_id>` | Record a cash/manual payment. |
 | `/remind` | Nudge all unpaid members right now. |
 | `/audit` | Get the FLYMAX check-list now (also arrives automatically Monday 09:00). Tap "All found" after checking the bank app. |

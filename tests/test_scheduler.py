@@ -114,12 +114,17 @@ def test_term_start_blast_messages_unverified_only(conn):
     fake_bot = make_bot()
     asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
 
-    sent_to = {call.kwargs["chat_id"] for call in fake_bot.send_photo.await_args_list}
+    sent_to = {call.kwargs["chat_id"] for call in fake_bot.send_message.await_args_list}
     assert sent_to == {111, 222}
-    assert fake_bot.send_photo.await_count == 2
-    caption = fake_bot.send_photo.await_args_list[0].kwargs["caption"]
-    assert "S$20.00" in caption
+    assert fake_bot.send_message.await_count == 2
+    kwargs = fake_bot.send_message.await_args_list[0].kwargs
+    assert "Term 5" in kwargs["text"]
+    button = kwargs["reply_markup"].inline_keyboard[0][0]
+    assert (button.text, button.callback_data) == ("Pay now", "pay:start")
+    fake_bot.send_photo.assert_not_awaited()  # amount depends on shirt choice
     assert db.get_term(conn, term["id"])["start_notified_at"] is not None
+    # No QR went out, so the payment-time window must not have started.
+    assert db.get_current_payment(conn, 111)["qr_issued_at"] is None
 
 
 def test_term_start_blast_skips_members_who_already_got_a_qr(conn):
@@ -132,7 +137,7 @@ def test_term_start_blast_skips_members_who_already_got_a_qr(conn):
     fake_bot = make_bot()
     asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
 
-    sent_to = {call.kwargs["chat_id"] for call in fake_bot.send_photo.await_args_list}
+    sent_to = {call.kwargs["chat_id"] for call in fake_bot.send_message.await_args_list}
     assert sent_to == {222}
 
 
@@ -141,7 +146,7 @@ def test_term_start_blast_total_failure_leaves_term_unstamped(conn):
     term = _term(conn)
 
     fake_bot = make_bot()
-    fake_bot.send_photo.side_effect = Exception("telegram down")
+    fake_bot.send_message.side_effect = Exception("telegram down")
     asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
 
     assert db.get_term(conn, term["id"])["start_notified_at"] is None
@@ -155,10 +160,10 @@ def test_term_start_blast_continues_after_send_failure(conn):
     term = _term(conn)
 
     fake_bot = make_bot()
-    fake_bot.send_photo.side_effect = [Exception("blocked"), None]
+    fake_bot.send_message.side_effect = [Exception("blocked"), None]
     asyncio.run(scheduler.do_term_start_blast(fake_bot, conn, term["id"]))
 
-    assert fake_bot.send_photo.await_count == 2
+    assert fake_bot.send_message.await_count == 2
     assert db.get_term(conn, term["id"])["start_notified_at"] is not None
 
 
@@ -177,6 +182,8 @@ def test_send_unpaid_reminders_counts_and_skips_verified(conn):
     assert count == 1
     sent_to = {call.kwargs["chat_id"] for call in fake_bot.send_message.await_args_list}
     assert sent_to == {222}
+    markup = fake_bot.send_message.await_args.kwargs["reply_markup"]
+    assert markup.inline_keyboard[0][0].callback_data == "pay:start"
 
 
 def test_send_unpaid_reminders_counts_only_successful(conn):
