@@ -39,6 +39,9 @@ MAX_RECEIPT_BYTES = 8 * 1024 * 1024
 
 WELCOME = (
     "Welcome to the SUTD Badminton Club bot!\n\n"
+    "Privacy: to run club membership payments, this bot stores your Telegram "
+    "ID, name, SUTD ID, and the payment details read from your receipt "
+    "screenshot. The screenshot itself is never saved.\n\n"
     "Let's get you registered.\n"
     "What's your full name, as in SUTD records?"
 )
@@ -91,8 +94,6 @@ ADMIN_HELP = (
     "/members - list registered members\n"
     "/markpaid <sutd_id> - record a cash/manual payment\n"
     "/remind - nudge unpaid members now\n"
-    "/audit - get the FLYMAX check-list now\n"
-    "/flag <sutd_id> - mark a payment as unconfirmed in FLYMAX\n"
     "/revoke <sutd_id> - remove a membership\n"
     "/addadmin <sutd_id> - make a member an admin\n"
     "/removeadmin <sutd_id> - remove an admin\n"
@@ -582,8 +583,6 @@ def build_application(
     app.add_handler(CommandHandler("members", admin.cmd_members))
     app.add_handler(CommandHandler("markpaid", admin.cmd_markpaid))
     app.add_handler(CommandHandler("remind", admin.cmd_remind))
-    app.add_handler(CommandHandler("audit", admin.cmd_audit))
-    app.add_handler(CommandHandler("flag", admin.cmd_flag))
     app.add_handler(CommandHandler("revoke", admin.cmd_revoke))
     app.add_handler(CommandHandler("addadmin", admin.cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin", admin.cmd_removeadmin))
@@ -594,9 +593,6 @@ def build_application(
         CallbackQueryHandler(on_payment_review, pattern=r"^payment:(approve|reject):\d+$")
     )
     app.add_handler(
-        CallbackQueryHandler(admin.on_audit_allfound, pattern=r"^audit:allfound$")
-    )
-    app.add_handler(
         MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_receipt)
     )
     if app.job_queue is not None:
@@ -604,6 +600,6 @@ def build_application(
     else:
         log.warning(
             "JobQueue unavailable (install python-telegram-bot[job-queue]); "
-            "term-start blasts, reminders, and audit digests are disabled."
+            "term-start blasts, reminders, and backups are disabled."
         )
     return app

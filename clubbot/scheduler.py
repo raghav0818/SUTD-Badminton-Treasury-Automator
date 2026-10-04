@@ -1,11 +1,14 @@
-"""Restart-safe lifecycle jobs: term-start blast, day-7 reminder, weekly audit."""
+"""Restart-safe lifecycle jobs: term-start blast, day-7 reminder, weekly DB backup."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
+import os
 import sqlite3
+import tempfile
 from datetime import date, datetime, time, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,7 +20,7 @@ from clubbot.payments import SINGAPORE_TIME, build_member_qr, school_config
 log = logging.getLogger(__name__)
 
 REMINDER_HOUR = 10  # 10:00 SGT for term-start blast and day-7 reminder
-AUDIT_HOUR = 9      # 09:00 SGT for the weekly digest
+BACKUP_HOUR = 3     # 03:00 SGT Sunday database backup to the treasurer
 SHEET_HOUR = 2      # 02:30 SGT nightly full Sheet rebuild
 SHEET_SYNC_DELAY = timedelta(seconds=30)  # debounce for on-change syncs
 
@@ -143,38 +146,41 @@ async def do_reminder7(bot, conn: sqlite3.Connection, term_id: int) -> None:
     db.mark_term_reminder7_sent(conn, term_id)
 
 
-def _short_date(payment_timestamp: str | None) -> str:
-    if not payment_timestamp:
-        return "date n/a"
+async def do_weekly_backup(bot, conn: sqlite3.Connection) -> bool:
+    """DM the treasurer a consistent copy of the database. Never raises."""
+    path = None
     try:
-        return datetime.fromisoformat(payment_timestamp).date().isoformat()
-    except ValueError:
-        return "date n/a"
-
-
-async def do_audit_digest(bot, conn: sqlite3.Connection) -> bool:
-    """DM the treasurer the verified payments still awaiting a FLYMAX check."""
-    rows = db.list_unconfirmed_verified_payments(conn)
-    if not rows:
+        treasurer_id = db.get_treasurer_id(conn)
+        if treasurer_id is None:
+            log.error("Cannot send database backup: no treasurer is configured")
+            return False
+        fd, path = tempfile.mkstemp(prefix="clubbot-backup-", suffix=".db")
+        os.close(fd)
+        # backup() copies a consistent snapshot even while the bot is writing.
+        target = sqlite3.connect(path)
+        try:
+            conn.backup(target)
+        finally:
+            target.close()
+        stamp = datetime.now(SINGAPORE_TIME).date().isoformat()
+        with open(path, "rb") as file:
+            await bot.send_document(
+                chat_id=treasurer_id,
+                document=file,
+                filename=f"clubbot-{stamp}.db",
+                caption=(
+                    "Weekly database backup. Keep this file: it holds every "
+                    "member, payment and the receipt-reuse history."
+                ),
+            )
+        return True
+    except Exception:
+        log.exception("Weekly database backup failed")
         return False
-    treasurer_id = db.get_treasurer_id(conn)
-    if treasurer_id is None:
-        log.error("Cannot send audit digest: no treasurer is configured")
-        return False
-    lines = ["Weekly audit — confirm these in DBS FLYMAX:"]
-    for row in rows:
-        amount = row["amount_cents"] if row["amount_cents"] is not None else row["fee_cents"]
-        lines.append(
-            f"• {row['full_name']} — {money(amount)} — "
-            f"{_short_date(row['payment_timestamp'])}"
-        )
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✓ All found", callback_data="audit:allfound")]]
-    )
-    await bot.send_message(
-        chat_id=treasurer_id, text="\n".join(lines), reply_markup=keyboard
-    )
-    return True
+    finally:
+        if path is not None:
+            with contextlib.suppress(OSError):
+                os.remove(path)
 
 
 # --- JobQueue glue -------------------------------------------------------------
@@ -215,13 +221,12 @@ def request_sheet_sync(app) -> None:
     app.job_queue.run_once(_job_sheet_sync, when=SHEET_SYNC_DELAY, name="sheet-sync")
 
 
-async def _job_audit(context) -> None:
-    # run_daily fires every day; act only on Mondays so the digest is weekly
+async def _job_backup(context) -> None:
+    # run_daily fires every day; act only on Sundays so the backup is weekly
     # without depending on PTB's day indexing.
-    if datetime.now(SINGAPORE_TIME).weekday() != 0:
+    if datetime.now(SINGAPORE_TIME).weekday() != 6:
         return
-    conn = context.bot_data["db"]
-    await do_audit_digest(context.bot, conn)
+    await do_weekly_backup(context.bot, context.bot_data["db"])
 
 
 def _arm_term_job(
@@ -254,7 +259,7 @@ async def _job_rearm(context) -> None:
 
 
 def schedule_all(app, conn: sqlite3.Connection) -> None:
-    """Restore outstanding one-shot term jobs and arm the daily audit check.
+    """Restore outstanding one-shot term jobs and arm the recurring jobs.
 
     Called once at startup; restores any blast/reminder a restart would lose.
     """
@@ -263,9 +268,9 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
     for kind, term, when in pending_term_jobs(conn, now):
         _arm_term_job(jq, kind, term["id"], when, now)
     jq.run_daily(
-        _job_audit,
-        time=time(hour=AUDIT_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
-        name="audit-digest",
+        _job_backup,
+        time=time(hour=BACKUP_HOUR, minute=0, tzinfo=SINGAPORE_TIME),
+        name="weekly-backup",
     )
     jq.run_daily(
         _job_rearm,

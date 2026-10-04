@@ -305,35 +305,16 @@ def test_mark_paid_manual_sets_override(conn):
     assert payment["amount_cents"] == 2000
 
 
-def test_flag_then_revoke(conn):
+def test_revoke(conn):
     _member(conn, 111, "1000001", "Alice")
     term = _term(conn)
     with pytest.raises(ValueError, match="no payment"):
-        db.flag_payment(conn, member_id=111, term_id=term["id"])
+        db.revoke_payment(conn, member_id=111, term_id=term["id"])
     db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
-    flagged = db.flag_payment(conn, member_id=111, term_id=term["id"])
-    assert flagged["flagged_at"] is not None
-    assert db.get_term_payment_stats(conn, term["id"])["flagged"] == 1
     revoked = db.revoke_payment(conn, member_id=111, term_id=term["id"])
     assert revoked["status"] == "revoked"
     with pytest.raises(ValueError, match="only a verified"):
         db.revoke_payment(conn, member_id=111, term_id=term["id"])
-
-
-def test_audit_confirmation_watermark(conn):
-    _member(conn, 111, "1000001", "Alice")
-    _member(conn, 222, "1000002", "Bob")
-    term = _term(conn)
-    p1 = db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
-    db.mark_paid_manual(conn, member_id=222, term_id=term["id"])
-    assert len(db.list_unconfirmed_verified_payments(conn)) == 2
-    db.confirm_payments_audited(conn, [p1["id"]])
-    remaining = db.list_unconfirmed_verified_payments(conn)
-    assert [p["telegram_user_id"] for p in remaining] == [222]
-    db.record_audit(
-        conn, period_start=None, period_end="2026-06-20", payment_count=1, result="all_found"
-    )
-    assert conn.execute("SELECT COUNT(*) AS n FROM audits").fetchone()["n"] == 1
 
 
 def test_term_notification_stamps(conn):

@@ -3,7 +3,7 @@
 Telegram bot that collects club membership fees. Members register, get a
 personal PayNow QR, pay, and send back the payment screenshot — the bot
 verifies it automatically. You (the treasurer) only approve rare exceptions
-and confirm a weekly audit list against DBS FLYMAX.
+and, once a term, check the paid totals against DBS FLYMAX.
 
 Bot: **SUTD ShuttleBuddy** (handle: `@MyClubFinanceBot`) · Runs 24/7 on a
 Raspberry Pi 4.
@@ -37,8 +37,6 @@ Raspberry Pi 4.
 | `/newterm <name> <fee> <start> <end>` | Open fee collection, e.g. `/newterm Term 1 20.00 2026-09-01 2026-12-01`. Members get their QR automatically at 10:00 on the start date, and unpaid members one reminder on day 7. |
 | `/markpaid <sutd_id>` | Record a cash/manual payment. |
 | `/remind` | Nudge all unpaid members right now. |
-| `/audit` | Get the FLYMAX check-list now (also arrives automatically Monday 09:00). Tap "All found" after checking the bank app. |
-| `/flag <sutd_id>` | Mark a payment you couldn't find in FLYMAX (no member impact). |
 | `/revoke <sutd_id>` | Remove a verified membership (member is notified). |
 | `/addadmin <sutd_id>` / `/removeadmin <sutd_id>` | Manage exco admins. |
 | `/transfertreasurer <sutd_id>` | Hand over the treasurer role (you stay admin). |
@@ -70,7 +68,7 @@ Run the tests: `.venv\Scripts\python -m pytest`
 | `TREASURER_TELEGRAM_ID` | your numeric ID (@userinfobot) |
 | `DB_PATH` | leave as `clubbot.db` |
 | `GEMINI_API_KEY` | https://aistudio.google.com/apikey |
-| `GEMINI_MODEL` | leave as `gemini-2.5-flash` |
+| `GEMINI_MODEL` | leave as `gemini-3.1-flash-lite` |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | path to the service-account JSON key (optional, for the Sheet) |
 | `SHEET_ID` | long ID in the Google Sheet's URL (optional) |
 
@@ -84,31 +82,53 @@ changes nothing.
 
 ## Deploy / update on the Raspberry Pi 4 (24/7)
 
-The bot lives at `~/clubbot` on the Pi. The SAME two steps do both the first
-install and every later update — `setup_pi.sh` is safe to re-run.
+The bot lives at `~/clubbot` on the Pi, as a `git clone` of this (public)
+GitHub repo. Run every command below on the Pi, in an ssh window
+(e.g. `ssh blud@blud.local`).
 
-**Step 1 — copy the code + secrets from the PC** (run in THIS project folder;
-replace `<user>@<pi>` with your Pi login, e.g. `blud@blud.local`):
-
-```powershell
-ssh <user>@<pi> "mkdir -p clubbot"
-scp -r clubbot scripts deploy requirements.txt .env service-account.json <user>@<pi>:clubbot/
-```
-
-**Step 2 — install/restart on the Pi** (in an ssh window):
+### Updating (the normal case)
 
 ```bash
+bash ~/clubbot/deploy/update.sh
+```
+
+It downloads the latest code from GitHub, installs anything new, and restarts
+the bot. Your `.env`, `service-account.json` and `clubbot.db` are not in git,
+so updates never touch them. The script ends by printing the service status —
+look for `active (running)`.
+
+### First-time setup (or switching an old scp-copied `~/clubbot` to git)
+
+Run these one at a time. They put the old folder aside, download a fresh copy,
+and bring your secrets and database back:
+
+```bash
+sudo systemctl stop clubbot                 # "not loaded" on a brand-new Pi is fine
+sudo apt install -y git
+mv ~/clubbot ~/clubbot-old                  # skip on a brand-new Pi
+git clone https://github.com/raghav0818/SUTD-Badminton-Treasury-Automator.git ~/clubbot
+sudo cp ~/clubbot-old/.env ~/clubbot-old/service-account.json ~/clubbot/
+sudo cp ~/clubbot-old/clubbot.db ~/clubbot/   # "No such file" is fine: no data yet
+sudo chown -R "$USER:$USER" ~/clubbot
 bash ~/clubbot/deploy/setup_pi.sh
 ~/clubbot/.venv/bin/python ~/clubbot/scripts/preflight.py   # all lines PASS
 ```
 
-The script ends by printing the service status — look for `active (running)`.
+On a brand-new Pi there is no `~/clubbot-old`: instead of the two `sudo cp`
+lines, copy the secrets over from the PC (run in THIS project folder on the
+PC): `scp .env service-account.json blud@blud.local:clubbot/`
+
+Once the bot runs fine for a week, delete the old copy: `rm -rf ~/clubbot-old`
+(use `sudo rm -rf` if it says Permission denied).
+
 The service restarts itself after crashes and reboots. Long-polling means no
 port forwarding — home Wi-Fi is fine.
 
-### Daily database backup (do this — the DB is irreplaceable)
+### Database backups (the DB is irreplaceable)
 
-On the Pi (replace `<user>` with your Pi username):
+Every Sunday at 03:00 the bot DMs the treasurer a copy of `clubbot.db` on
+Telegram. Keep those files (don't delete the chat). For an extra daily copy on
+the Pi itself (replace `<user>` with your Pi username):
 
 ```bash
 mkdir -p ~/clubbot/backups
@@ -123,8 +143,8 @@ sudo systemctl restart clubbot        # restart
 sudo systemctl stop clubbot           # stop
 ```
 
-To update the code later: redo Step 1 + Step 2 above. Never run the bot on
-the PC while the Pi service is running — two copies fight over Telegram.
+Never run the bot on the PC while the Pi service is running — two copies
+fight over Telegram.
 
 ### Before the first real term
 
@@ -145,6 +165,7 @@ receipt-reuse protection.
 
 1. `/transfertreasurer <their sutd_id>` in Telegram.
 2. Give them the GitHub repo, the Pi login, and the secrets (`.env`,
-   `service-account.json`).
+   `service-account.json`). The weekly database backup DM goes to whoever
+   is treasurer, so it follows the handover automatically.
 3. Point them at `CLAUDE.md` (project status/decisions) and the design doc in
    `docs/superpowers/specs/`.

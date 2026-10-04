@@ -36,20 +36,6 @@ def reply_text_of(update) -> str:
     return update.message.reply_text.call_args.args[0]
 
 
-def make_callback_update(user_id=999):
-    update = MagicMock()
-    update.effective_user.id = user_id
-    update.callback_query = MagicMock()
-    update.callback_query.data = "audit:allfound"
-    update.callback_query.answer = AsyncMock()
-    update.callback_query.edit_message_text = AsyncMock()
-    return update
-
-
-def edit_text_of(update) -> str:
-    return update.callback_query.edit_message_text.call_args.args[0]
-
-
 def create_active_term(conn, treasurer_id=999, fee_cents=2000):
     today = date.today()
     return db.create_term(
@@ -97,13 +83,6 @@ def test_markpaid_denies_non_treasurer(conn):
     update, context = make_update(user_id=222), make_context(conn)
     context.args = ["1007654"]
     asyncio.run(admin.cmd_markpaid(update, context))
-    assert "Only the treasurer" in reply_text_of(update)
-
-
-def test_flag_denies_non_treasurer(conn):
-    update, context = make_update(user_id=111), make_context(conn)
-    context.args = ["1007654"]
-    asyncio.run(admin.cmd_flag(update, context))
     assert "Only the treasurer" in reply_text_of(update)
 
 
@@ -210,43 +189,6 @@ def test_markpaid_unknown_sutd_id(conn):
     assert context.bot.send_message.await_count == 0
 
 
-# --- flag ---------------------------------------------------------------------
-
-
-def test_flag_sets_flagged_at_without_dm(conn):
-    db.ensure_treasurer(conn, 999)
-    seed_members(conn)
-    term = create_active_term(conn)
-    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
-    update, context = make_update(user_id=999), make_context(conn)
-    context.args = ["1007654"]
-    asyncio.run(admin.cmd_flag(update, context))
-
-    payment = db.get_current_payment(conn, 111)
-    assert payment["flagged_at"] is not None
-    assert context.bot.send_message.await_count == 0
-    assert "Flagged" in reply_text_of(update)
-
-
-def test_flag_unknown_sutd_id(conn):
-    db.ensure_treasurer(conn, 999)
-    create_active_term(conn)
-    update, context = make_update(user_id=999), make_context(conn)
-    context.args = ["9999999"]
-    asyncio.run(admin.cmd_flag(update, context))
-    assert "No member" in reply_text_of(update)
-
-
-def test_flag_member_without_payment(conn):
-    db.ensure_treasurer(conn, 999)
-    seed_members(conn)
-    create_active_term(conn)
-    update, context = make_update(user_id=999), make_context(conn)
-    context.args = ["1007654"]
-    asyncio.run(admin.cmd_flag(update, context))
-    assert "Could not flag" in reply_text_of(update)
-
-
 # --- revoke -------------------------------------------------------------------
 
 
@@ -278,7 +220,7 @@ def test_revoke_non_verified_payment(conn):
     assert context.bot.send_message.await_count == 0
 
 
-# --- remind / audit (scheduler mocked) ----------------------------------------
+# --- remind (scheduler mocked) ------------------------------------------------
 
 
 def test_remind_invokes_scheduler(conn, monkeypatch):
@@ -296,55 +238,6 @@ def test_remind_denies_non_treasurer(conn):
     update, context = make_update(user_id=111), make_context(conn)
     asyncio.run(admin.cmd_remind(update, context))
     assert "Only the treasurer" in reply_text_of(update)
-
-
-def test_audit_sends_digest(conn, monkeypatch):
-    db.ensure_treasurer(conn, 999)
-    monkeypatch.setattr(
-        admin.scheduler, "do_audit_digest", AsyncMock(return_value=True)
-    )
-    update, context = make_update(user_id=999), make_context(conn)
-    asyncio.run(admin.cmd_audit(update, context))
-    assert "Audit digest sent" in reply_text_of(update)
-
-
-def test_audit_nothing_to_send(conn, monkeypatch):
-    db.ensure_treasurer(conn, 999)
-    monkeypatch.setattr(
-        admin.scheduler, "do_audit_digest", AsyncMock(return_value=False)
-    )
-    update, context = make_update(user_id=999), make_context(conn)
-    asyncio.run(admin.cmd_audit(update, context))
-    assert "waiting to be audited" in reply_text_of(update)
-
-
-# --- audit:allfound button ----------------------------------------------------
-
-
-def test_audit_allfound_confirms_payments(conn):
-    db.ensure_treasurer(conn, 999)
-    seed_members(conn)
-    term = create_active_term(conn)
-    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
-    db.mark_paid_manual(conn, member_id=222, term_id=term["id"])
-    assert len(db.list_unconfirmed_verified_payments(conn)) == 2
-
-    update, context = make_callback_update(user_id=999), make_context(conn)
-    asyncio.run(admin.on_audit_allfound(update, context))
-
-    assert db.list_unconfirmed_verified_payments(conn) == []
-    audits = conn.execute("SELECT * FROM audits").fetchall()
-    assert len(audits) == 1
-    assert audits[0]["payment_count"] == 2
-    assert audits[0]["result"] == "all_found"
-    assert "2 payment(s)" in edit_text_of(update)
-
-
-def test_audit_allfound_denies_non_treasurer(conn):
-    update, context = make_callback_update(user_id=111), make_context(conn)
-    asyncio.run(admin.on_audit_allfound(update, context))
-    assert "Only the treasurer" in edit_text_of(update)
-    assert conn.execute("SELECT COUNT(*) AS n FROM audits").fetchone()["n"] == 0
 
 
 # --- Phase 4: admin management --------------------------------------------------

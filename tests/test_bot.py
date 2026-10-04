@@ -263,7 +263,7 @@ def test_status_without_username_has_no_handle(conn):
 def test_build_application_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     assert app.bot_data["db"] is conn
-    assert len(app.handlers[0]) == 21
+    assert len(app.handlers[0]) == 18
 
 
 def create_active_term(conn, treasurer_id=999):

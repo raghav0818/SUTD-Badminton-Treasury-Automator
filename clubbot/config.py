@@ -30,7 +30,7 @@ def load_config() -> Config:
         treasurer_id=int(treasurer),
         db_path=os.environ.get("DB_PATH", "clubbot.db"),
         gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"),
         google_credentials=os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", ""),
         sheet_id=os.environ.get("SHEET_ID", ""),
     )

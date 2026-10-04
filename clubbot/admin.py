@@ -1,4 +1,4 @@
-"""Telegram handlers for treasurer/admin lifecycle and auditing commands."""
+"""Telegram handlers for treasurer/admin lifecycle commands."""
 
 from __future__ import annotations
 
@@ -146,44 +146,6 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"Reminder sent to {count} member(s).")
 
 
-async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = _db(context)
-    if not _is_treasurer(conn, update.effective_user.id):
-        await update.message.reply_text(NOT_TREASURER)
-        return
-    sent = await scheduler.do_audit_digest(context.bot, conn)
-    if not sent:
-        await update.message.reply_text(
-            "No verified payments are waiting to be audited."
-        )
-        return
-    await update.message.reply_text("Audit digest sent.")
-
-
-async def cmd_flag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = _db(context)
-    if not _is_treasurer(conn, update.effective_user.id):
-        await update.message.reply_text(NOT_TREASURER)
-        return
-    term = db.get_active_term(conn)
-    if term is None:
-        await update.message.reply_text(NO_TERM)
-        return
-    member = await _resolve_member(update, context)
-    if member is None:
-        return
-    try:
-        payment = db.flag_payment(
-            conn, member_id=member["telegram_user_id"], term_id=term["id"]
-        )
-    except ValueError as exc:
-        await update.message.reply_text(f"Could not flag: {exc}")
-        return
-    await update.message.reply_text(
-        f"Flagged {payment['full_name']}'s payment for {payment['term_name']}."
-    )
-
-
 async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conn = _db(context)
     if not _is_treasurer(conn, update.effective_user.id):
@@ -278,7 +240,7 @@ async def cmd_transfertreasurer(
         chat_id=member["telegram_user_id"],
         text=(
             "You are now the club treasurer. Send /help to see the treasurer "
-            "commands, including payment review and the weekly audit."
+            "commands, including payment review."
         ),
     )
 
@@ -368,27 +330,4 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"{key} set to: {value}\n"
         "This affects newly generated QRs and receipt verification immediately."
-    )
-
-
-async def on_audit_allfound(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    query = update.callback_query
-    await query.answer()
-    conn = _db(context)
-    if not _is_treasurer(conn, update.effective_user.id):
-        await query.edit_message_text(NOT_TREASURER)
-        return
-    payments = db.list_unconfirmed_verified_payments(conn)
-    db.confirm_payments_audited(conn, [p["id"] for p in payments])
-    db.record_audit(
-        conn,
-        period_start=None,
-        period_end=None,
-        payment_count=len(payments),
-        result="all_found",
-    )
-    await query.edit_message_text(
-        f"Marked {len(payments)} payment(s) as found in FLYMAX."
     )

@@ -669,7 +669,7 @@ def review_payment(
     return get_payment(conn, payment_id)
 
 
-# --- Phase 3: lifecycle, reminders, and auditing -------------------------------
+# --- Phase 3: lifecycle and reminders -----------------------------------------
 
 
 def list_members(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -746,21 +746,6 @@ def mark_paid_manual(
     return get_payment(conn, payment["id"])
 
 
-def flag_payment(
-    conn: sqlite3.Connection, *, member_id: int, term_id: int
-) -> sqlite3.Row:
-    """Mark a member's payment as unverified-against-FLYMAX. No member impact."""
-    payment = get_payment_for_member_term(conn, member_id=member_id, term_id=term_id)
-    if payment is None:
-        raise ValueError("this member has no payment for the active term")
-    conn.execute(
-        "UPDATE payments SET flagged_at = ? WHERE id = ?",
-        (_utc_now(), payment["id"]),
-    )
-    conn.commit()
-    return get_payment(conn, payment["id"])
-
-
 def revoke_payment(
     conn: sqlite3.Connection, *, member_id: int, term_id: int
 ) -> sqlite3.Row:
@@ -776,52 +761,6 @@ def revoke_payment(
     )
     conn.commit()
     return get_payment(conn, payment["id"])
-
-
-def list_unconfirmed_verified_payments(
-    conn: sqlite3.Connection,
-) -> list[sqlite3.Row]:
-    """Verified payments the treasurer has not yet ticked off against FLYMAX."""
-    rows = conn.execute(
-        """
-        SELECT id FROM payments
-        WHERE status = 'verified' AND audit_confirmed_at IS NULL
-        ORDER BY verified_at, id
-        """
-    ).fetchall()
-    return [get_payment(conn, row["id"]) for row in rows]
-
-
-def confirm_payments_audited(
-    conn: sqlite3.Connection, payment_ids: list[int]
-) -> None:
-    if not payment_ids:
-        return
-    placeholders = ",".join("?" for _ in payment_ids)
-    conn.execute(
-        f"UPDATE payments SET audit_confirmed_at = ?"
-        f" WHERE id IN ({placeholders})",
-        (_utc_now(), *payment_ids),
-    )
-    conn.commit()
-
-
-def record_audit(
-    conn: sqlite3.Connection,
-    *,
-    period_start: str | None,
-    period_end: str | None,
-    payment_count: int,
-    result: str,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO audits (period_start, period_end, payment_count, result)
-        VALUES (?, ?, ?, ?)
-        """,
-        (period_start, period_end, payment_count, result),
-    )
-    conn.commit()
 
 
 def mark_term_start_notified(conn: sqlite3.Connection, term_id: int) -> None:

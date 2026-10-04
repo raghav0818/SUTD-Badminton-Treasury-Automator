@@ -49,7 +49,7 @@ class GeminiExtractor:
         self,
         api_key: str,
         *,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.1-flash-lite",
         client: Any | None = None,
     ) -> None:
         if not api_key and client is None:

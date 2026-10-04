@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
@@ -201,40 +202,53 @@ def test_do_reminder7_stamps_term(conn):
     assert db.get_term(conn, term["id"])["reminder7_sent_at"] is not None
 
 
-# --- do_audit_digest -----------------------------------------------------------
+# --- do_weekly_backup ----------------------------------------------------------
 
 
-def test_audit_digest_returns_false_when_nothing(conn):
-    db.ensure_treasurer(conn, 999)
-    fake_bot = make_bot()
-    assert asyncio.run(scheduler.do_audit_digest(fake_bot, conn)) is False
-    fake_bot.send_message.assert_not_awaited()
+def _capture_document(sent):
+    async def send_document(*, chat_id, document, filename, caption):
+        sent.update(
+            chat_id=chat_id, path=document.name, data=document.read(), filename=filename
+        )
+
+    return send_document
 
 
-def test_audit_digest_returns_false_without_treasurer(conn):
-    _member(conn, 111, "1000001", "Alice")
-    term = _term(conn)
-    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
-    fake_bot = make_bot()
-    assert asyncio.run(scheduler.do_audit_digest(fake_bot, conn)) is False
-    fake_bot.send_message.assert_not_awaited()
-
-
-def test_audit_digest_dms_treasurer_with_button(conn):
+def test_weekly_backup_sends_db_copy_and_deletes_temp_file(conn):
     _member(conn, 111, "1000001", "Alice")
     db.ensure_treasurer(conn, 999)
-    term = _term(conn)
-    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    sent = {}
+    fake_bot = make_bot()
+    fake_bot.send_document = AsyncMock(side_effect=_capture_document(sent))
+
+    assert asyncio.run(scheduler.do_weekly_backup(fake_bot, conn)) is True
+
+    assert sent["chat_id"] == 999
+    assert sent["filename"].startswith("clubbot-") and sent["filename"].endswith(".db")
+    assert sent["data"].startswith(b"SQLite format 3\x00")
+    assert not os.path.exists(sent["path"])
+
+
+def test_weekly_backup_swallows_send_failure(conn):
+    db.ensure_treasurer(conn, 999)
+    sent = {}
+    capture = _capture_document(sent)
+
+    async def failing_send(**kwargs):
+        await capture(**kwargs)
+        raise RuntimeError("Telegram down")
 
     fake_bot = make_bot()
-    assert asyncio.run(scheduler.do_audit_digest(fake_bot, conn)) is True
+    fake_bot.send_document = AsyncMock(side_effect=failing_send)
 
-    kwargs = fake_bot.send_message.await_args.kwargs
-    assert kwargs["chat_id"] == 999
-    assert "Alice" in kwargs["text"]
-    assert "S$20.00" in kwargs["text"]
-    button = kwargs["reply_markup"].inline_keyboard[0][0]
-    assert button.callback_data == "audit:allfound"
+    assert asyncio.run(scheduler.do_weekly_backup(fake_bot, conn)) is False
+    assert not os.path.exists(sent["path"])
+
+
+def test_weekly_backup_without_treasurer(conn):
+    fake_bot = make_bot()
+    assert asyncio.run(scheduler.do_weekly_backup(fake_bot, conn)) is False
+    fake_bot.send_document.assert_not_awaited()
 
 
 # --- schedule_all smoke --------------------------------------------------------
@@ -246,7 +260,7 @@ def test_schedule_all_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     scheduler.schedule_all(app, conn)
     jobs = {job.name for job in app.job_queue.jobs()}
-    assert "audit-digest" in jobs
+    assert "weekly-backup" in jobs
     assert "term-job-rearm" in jobs
     assert len(app.job_queue.jobs()) >= 1
 

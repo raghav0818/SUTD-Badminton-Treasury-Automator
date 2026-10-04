@@ -4,7 +4,7 @@ Telegram bot that runs the club's membership fee collection end to end:
 members register, pay a per-term fee via a personal PayNow QR, send back the
 bank screenshot, and get verified automatically (Gemini Flash extracts the
 fields; deterministic Python code decides). The treasurer only handles rare
-exception taps and a weekly audit digest.
+exception taps and a once-per-term FLYMAX count check.
 
 **This file is the project's memory.** Read it fully at the start of every
 session, and **update the Status and History sections before ending any work
@@ -88,7 +88,7 @@ changing payment or verification logic.
 - Members are keyed by Telegram user ID, never by @username.
 - The school account is called **DBS FLYMAX**. The treasurer has view-only
   app access: no API, no export, no alerts — hence screenshot verification
-  plus a weekly human audit digest.
+  plus a once-per-term FLYMAX count check (the weekly audit was dropped in v2).
 - Keep fees configurable per term; never hardcode a fee amount.
 - `receipt_fingerprints` is permanent anti-reuse history. Never clear it
   between terms, and back up `clubbot.db`.
@@ -107,8 +107,8 @@ changing payment or verification logic.
   globally unique normalised bank reference (own-payment retries allowed).
 - **Accepted residual risk:** a receipt shows no member identity, so two
   colluding members could swap one unused receipt; the second still needs a
-  valid payment, and the weekly FLYMAX audit (payer name/amount/date) is the
-  backstop. The treasurer accepted this.
+  valid payment, and the per-term FLYMAX count check is the only backstop.
+  The treasurer accepted this.
 - All date/time logic uses explicit Singapore time (`db.SINGAPORE_TIME`);
   the host OS timezone (UTC on the Pi) must not matter.
 - SUTD IDs: 7 digits starting `1010`.
@@ -126,11 +126,12 @@ changing payment or verification logic.
 | `clubbot/qrgen.py` | payload → PNG |
 | `clubbot/gemini.py` | Gemini Flash structured extraction (swappable adapter) |
 | `clubbot/db.py` | SQLite schema + auto-migration + every query; relink; SGT source of truth |
-| `clubbot/scheduler.py` | Term-start blast, day-7 nudge, Monday audit digest, daily self-heal re-arm, Sheet sync jobs |
+| `clubbot/scheduler.py` | Term-start blast, day-7 nudge, Sunday DB backup DM to the treasurer, daily self-heal re-arm, Sheet sync jobs |
 | `clubbot/sheets.py` | Read-only Google Sheet mirror (Members + Payments tabs) |
 | `clubbot/config.py`, `__main__.py` | `.env` loading; entry point `python -m clubbot` |
 | `scripts/preflight.py` | Pre-launch connectivity check for all three secrets |
 | `deploy/clubbot.service` | systemd unit (Restart=always) |
+| `deploy/setup_pi.sh`, `deploy/update.sh` | Pi install/restart; update = `git pull` + setup |
 
 Stack: Python 3.12+ · python-telegram-bot v21+ (long-polling, JobQueue) ·
 SQLite · google-genai (Gemini Flash) · gspread · qrcode · pytest.
