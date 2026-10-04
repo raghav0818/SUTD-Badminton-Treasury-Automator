@@ -3,7 +3,7 @@ from datetime import date, timedelta
 import pytest
 
 from clubbot import db
-from clubbot.sheets import MEMBER_HEADERS, PAYMENT_HEADERS, SheetMirror
+from clubbot.sheets import MEMBER_HEADERS, PAYMENT_HEADERS, SHIRT_HEADERS, SheetMirror
 
 
 class FakeWorksheet:
@@ -67,8 +67,7 @@ def test_snapshot_and_push_rebuild_both_tabs(conn):
     spreadsheet = FakeSpreadsheet()
     mirror = SheetMirror(spreadsheet)
 
-    members, payments = mirror.snapshot(conn)
-    mirror.push(members, payments)
+    mirror.push(*mirror.snapshot(conn))
 
     members_tab = spreadsheet.worksheets["Members"]
     assert members_tab.cleared
@@ -83,6 +82,35 @@ def test_snapshot_and_push_rebuild_both_tabs(conn):
     assert row[3] == "verified"
     assert row[4] == "S$20.00"
     assert row[6] == "manual_override"
+    assert row[8:] == ["recreational", "no", ""]
+
+
+def test_shirts_tab_lists_paid_shirt_orders_with_size_counts(conn):
+    seed(conn)  # Alice: paid, no shirt
+    db.add_member(
+        conn, telegram_user_id=222, full_name="Bob Lim", sutd_id="1010655", username=None
+    )
+    db.add_member(
+        conn, telegram_user_id=333, full_name="Cara Ng", sutd_id="1010656", username=None
+    )
+    term = db.get_active_term(conn)
+    for uid in (222, 333):
+        payment = db.get_or_create_payment(conn, member_id=uid, term_id=term["id"])
+        db.set_shirt_size(conn, payment["id"], "M")
+    db.mark_paid_manual(conn, member_id=222, term_id=term["id"])  # Cara never paid
+
+    spreadsheet = FakeSpreadsheet()
+    mirror = SheetMirror(spreadsheet)
+    mirror.push(*mirror.snapshot(conn))
+
+    data = spreadsheet.worksheets["Shirts"].data
+    assert data[0] == SHIRT_HEADERS
+    assert data[1] == ["Bob Lim", "M"]
+    assert data[2] == ["", ""]
+    counts = dict(data[3:])
+    assert counts["M total"] == 1
+    assert counts["XS total"] == 0
+    assert len(counts) == len(db.SHIRT_SIZES)
 
 
 def test_push_reuses_existing_worksheets(conn):
@@ -101,10 +129,10 @@ def test_push_reuses_existing_worksheets(conn):
 
 def test_empty_database_pushes_headers_only(conn):
     mirror = SheetMirror(FakeSpreadsheet())
-    members, payments = mirror.snapshot(conn)
+    members, payments, shirts = mirror.snapshot(conn)
     assert members == []
     assert payments == []
-    mirror.push(members, payments)
+    mirror.push(members, payments, shirts)
 
 
 def test_tab_created_while_empty_still_accepts_growth(conn):

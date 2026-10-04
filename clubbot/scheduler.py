@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
 import logging
 import os
 import sqlite3
@@ -15,7 +14,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from clubbot import db
 from clubbot.format import money
-from clubbot.payments import SINGAPORE_TIME, build_member_qr, school_config
+from clubbot.payments import SINGAPORE_TIME
 
 log = logging.getLogger(__name__)
 
@@ -69,34 +68,38 @@ def pending_term_jobs(
 # --- Async actions (testable with a mock bot + in-memory conn) -----------------
 
 
+# The amount depends on the member's shirt choice, so blasts and reminders
+# carry a button into the /pay flow instead of a ready-made QR.
+PAY_NOW_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("Pay now", callback_data="pay:start")]]
+)
+
+
 async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> None:
-    """Send the membership QR to every active, not-yet-verified member, then stamp."""
+    """Invite every active, not-yet-verified member to pay, then stamp."""
     term = db.get_term(conn, term_id)
-    caption = (
-        f"{term['name']} membership fee: {money(term['fee_cents'])}\n"
-        "Pay using this QR, then send the successful-payment screenshot here. "
-        "Expand the transfer details so the amount, recipient, Billing ID, "
-        "payment time, and bank reference number are visible."
+    text = (
+        f"{term['name']} membership fee collection is open "
+        f"(deadline {term['deadline']}).\n"
+        "Tap Pay now to choose a shirt option and get your personal PayNow QR."
     )
-    school = school_config(conn)
     attempted = sent = 0
     for member in db.list_active_members(conn):
         payment = db.get_or_create_payment(
             conn, member_id=member["telegram_user_id"], term_id=term_id
         )
-        # qr_issued_at doubles as a per-member "already got a QR" marker, so a
-        # blast interrupted by a power cut does not re-DM the first half.
+        # Members who already got a QR via /pay need no invite. qr_issued_at is
+        # NOT stamped here (it bounds the payment-time check to the real QR).
+        # ponytail: a blast interrupted mid-loop re-invites the first half on
+        # retry; add a per-member stamp if that ever bites.
         if payment["status"] == "verified" or payment["qr_issued_at"]:
             continue
-        qr = build_member_qr(
-            fee_cents=term["fee_cents"], reference=payment["ref_code"], school=school
-        )
-        image = io.BytesIO(qr)
-        image.name = "membership-paynow.png"
         attempted += 1
         try:
-            await bot.send_photo(
-                chat_id=member["telegram_user_id"], photo=image, caption=caption
+            await bot.send_message(
+                chat_id=member["telegram_user_id"],
+                text=text,
+                reply_markup=PAY_NOW_KEYBOARD,
             )
         except Exception:
             log.warning(
@@ -106,8 +109,6 @@ async def do_term_start_blast(bot, conn: sqlite3.Connection, term_id: int) -> No
             )
         else:
             sent += 1
-            # Stamp only delivered members so a retry re-sends exactly the rest.
-            db.mark_qr_issued(conn, payment["id"])
     if attempted and not sent:
         # Telegram was down for the whole loop: leave the term unstamped so
         # the daily re-arm retries the blast instead of silently dropping it.
@@ -122,14 +123,18 @@ async def send_unpaid_reminders(
     """DM every unpaid active member a gentle nudge; return the successful-send count."""
     term = db.get_term(conn, term_id)
     text = (
-        f"Reminder: your {term['name']} membership fee of "
-        f"{money(term['fee_cents'])} is still unpaid. Send /pay to get your QR, "
+        f"Reminder: your {term['name']} membership fee is still unpaid "
+        f"(deadline {term['deadline']}). Tap Pay now to get your QR, "
         "then send the payment screenshot here."
     )
     sent = 0
     for member in db.list_unpaid_members(conn, term_id):
         try:
-            await bot.send_message(chat_id=member["telegram_user_id"], text=text)
+            await bot.send_message(
+                chat_id=member["telegram_user_id"],
+                text=text,
+                reply_markup=PAY_NOW_KEYBOARD,
+            )
             sent += 1
         except Exception:
             log.warning(
@@ -201,9 +206,9 @@ async def _job_sheet_sync(context) -> None:
     if mirror is None:
         return
     conn = context.bot_data["db"]
-    members, payments = mirror.snapshot(conn)
+    tabs = mirror.snapshot(conn)
     try:
-        await asyncio.to_thread(mirror.push, members, payments)
+        await asyncio.to_thread(mirror.push, *tabs)
     except Exception:
         log.warning("Google Sheet sync failed", exc_info=True)
 

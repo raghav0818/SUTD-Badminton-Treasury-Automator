@@ -1,11 +1,14 @@
 import asyncio
+import io
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import zxingcpp
+from PIL import Image
 from telegram.ext import ConversationHandler
 
-from clubbot import bot, db
+from clubbot import bot, db, paynow
 from clubbot.payments import SCHOOL_BILL_NUMBER, ExtractedPayment
 
 SINGAPORE_TIME = timezone(timedelta(hours=8))
@@ -263,7 +266,7 @@ def test_status_without_username_has_no_handle(conn):
 def test_build_application_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     assert app.bot_data["db"] is conn
-    assert len(app.handlers[0]) == 18
+    assert len(app.handlers[0]) == 22
 
 
 def create_active_term(conn, treasurer_id=999):
@@ -278,21 +281,102 @@ def create_active_term(conn, treasurer_id=999):
     )
 
 
-def test_treasurer_can_create_five_cent_term(conn):
+def create_priced_term(conn):
+    """comp S$20 (+S$15 shirt = S$35), rec S$25, rec with shirt S$30."""
+    today = date.today()
+    return db.create_term(
+        conn,
+        name="Term 1",
+        fee_cents=2000,
+        rec_fee_cents=2500,
+        recshirt_fee_cents=3000,
+        shirt_fee_cents=1500,
+        start_date=(today - timedelta(days=1)).isoformat(),
+        end_date=(today + timedelta(days=60)).isoformat(),
+        deadline=(today + timedelta(days=14)).isoformat(),
+        created_by=999,
+    )
+
+
+def newterm_args(start, end, deadline, *, name="Term 1"):
+    return name.split() + [
+        start,
+        end,
+        f"deadline={deadline}",
+        "comp=20",
+        "rec=25",
+        "recshirt=30",
+        "shirt=15",
+    ]
+
+
+def test_treasurer_creates_term_with_three_prices(conn):
     db.ensure_treasurer(conn, 999)
     update = make_update(user_id=999, text="/newterm")
     context = make_context(conn)
     today = date.today()
-    context.args = [
-        "Payment",
-        "Test",
-        "0.05",
+    context.args = newterm_args(
         today.isoformat(),
-        (today + timedelta(days=7)).isoformat(),
-    ]
+        (today + timedelta(days=90)).isoformat(),
+        (today + timedelta(days=14)).isoformat(),
+    )
     asyncio.run(bot.cmd_newterm(update, context))
-    assert db.get_active_term(conn)["fee_cents"] == 5
-    assert "S$0.05" in reply_text_of(update)
+    term = db.get_active_term(conn)
+    assert term["name"] == "Term 1"
+    assert term["fee_cents"] == term["comp_fee_cents"] == 2000
+    assert (term["rec_fee_cents"], term["recshirt_fee_cents"]) == (2500, 3000)
+    assert term["shirt_fee_cents"] == 1500
+    assert term["deadline"] == (today + timedelta(days=14)).isoformat()
+    assert db.valid_amounts(term, "competitive") == {2000, 3500}
+    assert db.valid_amounts(term, "recreational") == {2500, 3000}
+    text = reply_text_of(update)
+    assert "S$35.00 with shirt" in text and "S$30.00 with shirt" in text
+
+
+def test_parse_newterm_args_accepts_any_option_order():
+    parsed = bot.parse_newterm_args(
+        ["shirt=15", "Term", "1", "2026-09-01", "comp=20.50", "2026-12-01",
+         "rec=25", "recshirt=30", "deadline=2026-09-15"]
+    )
+    assert parsed == {
+        "name": "Term 1",
+        "start_date": "2026-09-01",
+        "end_date": "2026-12-01",
+        "deadline": "2026-09-15",
+        "fee_cents": 2050,
+        "rec_fee_cents": 2500,
+        "recshirt_fee_cents": 3000,
+        "shirt_fee_cents": 1500,
+    }
+
+
+@pytest.mark.parametrize(
+    "args, error",
+    [
+        (["Term", "2026-09-01", "2026-12-01", "comp=20"], "missing option"),
+        (newterm_args("2026-09-01", "2026-12-01", "2026-09-15") + ["fee=5"], "unknown option"),
+        (newterm_args("2026-09-01", "2026-12-01", "2026-09-15")[2:], "need a name"),
+        (["T", "2026-09-01", "2026-12-01", "deadline=2026-09-15", "comp=abc",
+          "rec=25", "recshirt=30", "shirt=15"], "number"),
+        (["T", "2026-09-01", "2026-12-01", "deadline=2026-09-15", "comp=0",
+          "rec=25", "recshirt=30", "shirt=15"], "positive"),
+    ],
+)
+def test_parse_newterm_args_rejects_bad_input(args, error):
+    with pytest.raises(ValueError, match=error):
+        bot.parse_newterm_args(args)
+
+
+def test_newterm_rejects_deadline_outside_term_with_usage(conn):
+    db.ensure_treasurer(conn, 999)
+    update = make_update(user_id=999, text="/newterm")
+    context = make_context(conn)
+    context.args = newterm_args("2026-09-01", "2026-12-01", "2026-12-15")
+    asyncio.run(bot.cmd_newterm(update, context))
+    assert db.list_terms(conn) == []
+    text = reply_text_of(update)
+    assert "deadline must be between" in text
+    assert "Usage: /newterm" in text
 
 
 def test_non_treasurer_cannot_create_term(conn):
@@ -303,19 +387,131 @@ def test_non_treasurer_cannot_create_term(conn):
     assert "Only the treasurer" in reply_text_of(update)
 
 
-def test_pay_sends_personal_qr(conn):
+def make_callback(data, user_id=111):
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.callback_query.data = data
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    return update
+
+
+def pay_context(conn):
+    context = make_context(conn)
+    context.bot.send_photo = AsyncMock()
+    return context
+
+
+def qr_amount(context) -> str:
+    """The amount locked into the QR the bot just sent, as a decimal string."""
+    png = context.bot.send_photo.call_args.kwargs["photo"].getvalue()
+    text = zxingcpp.read_barcode(Image.open(io.BytesIO(png))).text
+    return paynow.parse_tlv(text)["54"]
+
+
+def button_labels(markup) -> list[str]:
+    return [b.text for row in markup.inline_keyboard for b in row]
+
+
+def test_pay_offers_shirt_choice_at_category_prices(conn):
     db.add_member(
         conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
-    create_active_term(conn)
+    create_priced_term(conn)
     update, context = make_update(text="/pay"), make_context(conn)
     asyncio.run(bot.cmd_pay(update, context))
-    assert update.message.reply_photo.await_count == 1
-    caption = update.message.reply_photo.call_args.kwargs["caption"]
-    assert "S$0.05" in caption
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    assert button_labels(markup) == ["With shirt (S$30.00)", "Without shirt (S$25.00)"]
+    # Nothing is issued until a choice is made.
+    assert db.get_current_payment(conn, 111)["qr_issued_at"] is None
+
+
+def test_pay_without_shirt_issues_base_fee_qr(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    create_priced_term(conn)
+    context = pay_context(conn)
+    asyncio.run(bot.on_pay_shirt(make_callback("pay:shirt:no"), context))
+    assert qr_amount(context) == "25.00"
+    caption = context.bot.send_photo.call_args.kwargs["caption"]
+    assert "S$25.00" in caption and "Billing ID" in caption
     payment = db.get_current_payment(conn, 111)
     assert payment["qr_issued_at"] is not None
-    assert "Billing ID" in caption
+    assert payment["shirt_size"] is None
+
+
+def test_pay_with_shirt_asks_size_then_issues_shirt_qr(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    db.replace_roster(conn, [("Alice Tan", "1010654")])  # competitive
+    create_priced_term(conn)
+    context = pay_context(conn)
+
+    update = make_callback("pay:shirt:yes")
+    asyncio.run(bot.on_pay_shirt(update, context))
+    markup = update.callback_query.edit_message_text.call_args.kwargs["reply_markup"]
+    assert button_labels(markup) == list(db.SHIRT_SIZES)
+    assert context.bot.send_photo.await_count == 0
+
+    asyncio.run(bot.on_pay_size(make_callback("pay:size:M"), context))
+    assert qr_amount(context) == "35.00"
+    payment = db.get_current_payment(conn, 111)
+    assert payment["category"] == "competitive"
+    assert payment["shirt_size"] == "M"
+
+
+def test_choosing_again_reissues_qr_but_keeps_first_issue_time(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    create_priced_term(conn)
+    context = pay_context(conn)
+    asyncio.run(bot.on_pay_size(make_callback("pay:size:L"), context))
+    first = db.get_current_payment(conn, 111)["qr_issued_at"]
+    conn.execute("UPDATE payments SET qr_issued_at = '2000-01-01T00:00:00+00:00'")
+    conn.commit()
+    asyncio.run(bot.on_pay_shirt(make_callback("pay:shirt:no"), context))
+    payment = db.get_current_payment(conn, 111)
+    assert first is not None
+    assert payment["qr_issued_at"] == "2000-01-01T00:00:00+00:00"  # COALESCE
+    assert payment["shirt_size"] is None
+    assert qr_amount(context) == "25.00"
+
+
+def test_pay_now_button_and_deep_link_show_shirt_choice(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    create_priced_term(conn)
+    context = make_context(conn)
+    asyncio.run(bot.on_pay_start(make_callback("pay:start"), context))
+    markup = context.bot.send_message.call_args.kwargs["reply_markup"]
+    assert "Without shirt (S$25.00)" in button_labels(markup)
+
+    update, context = make_update(text="/start pay"), make_context(conn)
+    context.args = ["pay"]
+    assert asyncio.run(bot.cmd_start(update, context)) == ConversationHandler.END
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    assert "With shirt (S$30.00)" in button_labels(markup)
+
+
+def test_pay_when_already_verified_or_no_term(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    update, context = make_update(text="/pay"), make_context(conn)
+    asyncio.run(bot.cmd_pay(update, context))
+    assert "not currently open" in reply_text_of(update)
+
+    term = create_priced_term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    context = pay_context(conn)
+    update = make_callback("pay:size:S")
+    asyncio.run(bot.on_pay_size(update, context))
+    assert "already verified" in update.callback_query.edit_message_text.call_args.args[0]
+    assert context.bot.send_photo.await_count == 0
 
 
 class FakeExtractor:
@@ -359,6 +555,56 @@ def test_valid_receipt_is_auto_verified(conn):
     assert saved["verified_by"] == "auto"
     assert saved["bank_txn_id"] == "TXVALID1"
     assert "accepted" in reply_text_of(update)
+
+
+def submit_priced_receipt(conn, *, amount_cents, shirt_size, on_roster=False):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    db.ensure_treasurer(conn, 999)
+    if on_roster:
+        db.replace_roster(conn, [("Alice Tan", "1010654")])
+    term = create_priced_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_shirt_size(conn, payment["id"], shirt_size)
+    db.mark_qr_issued(conn, payment["id"])
+    extracted = ExtractedPayment(
+        readable=True,
+        is_success_screen=True,
+        amount_cents=amount_cents,
+        recipient="Singapore University of Technology and Design",
+        billing_id=SCHOOL_BILL_NUMBER,
+        payment_timestamp=datetime.now(SINGAPORE_TIME).isoformat(),
+        transaction_id="TX-SHIRT-1",
+    )
+    update = make_update()
+    update.message.photo = [MagicMock(file_id="FILE9", file_size=100)]
+    context = make_context(conn, FakeExtractor(extracted))
+    telegram_file = MagicMock()
+    telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"receipt-image"))
+    context.bot.get_file.return_value = telegram_file
+    asyncio.run(bot.on_receipt(update, context))
+    return db.get_payment(conn, payment["id"])
+
+
+def test_receipt_with_shirt_amount_records_shirt(conn):
+    saved = submit_priced_receipt(conn, amount_cents=3500, shirt_size="L", on_roster=True)
+    assert saved["status"] == "verified"
+    assert (saved["with_shirt"], saved["shirt_size"]) == (1, "L")
+
+
+def test_receipt_with_base_amount_clears_shirt_size(conn):
+    # Chose a shirt, then paid the plain rec fee: the payment decides.
+    saved = submit_priced_receipt(conn, amount_cents=2500, shirt_size="L")
+    assert saved["status"] == "verified"
+    assert (saved["with_shirt"], saved["shirt_size"]) == (0, None)
+
+
+def test_receipt_with_other_categorys_amount_is_exception(conn):
+    # S$20 is the competitive fee; a recreational member must pay 25 or 30.
+    saved = submit_priced_receipt(conn, amount_cents=2000, shirt_size=None)
+    assert saved["status"] == "exception"
+    assert saved["with_shirt"] is None
 
 
 def test_wrong_receipt_notifies_treasurer(conn):

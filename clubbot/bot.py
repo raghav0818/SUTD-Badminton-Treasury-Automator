@@ -90,6 +90,7 @@ ADMIN_HELP = (
     "\n\nTreasurer/admin commands:\n"
     "/newterm - open a new paying term\n"
     "/unpaid - who hasn't paid yet\n"
+    "/roster - set the competitive roster (Name, SUTD ID lines)\n"
     "/stats - payment summary for the term\n"
     "/members - list registered members\n"
     "/markpaid <sutd_id> - record a cash/manual payment\n"
@@ -123,8 +124,10 @@ def _status_text(conn: sqlite3.Connection, member: sqlite3.Row) -> str:
         conn, member_id=member["telegram_user_id"], term_id=term["id"]
     )
     status = payment["status"].replace("_", " ").title() if payment else "Not started"
+    category = payment["category"] if payment else db.member_category(conn, member)
     details = (
-        f"\n\nTerm: {term['name']}\nFee: {money(term['fee_cents'])}"
+        f"\n\nTerm: {term['name']}\nFee: {money(db.term_fee(term, category))}"
+        f" ({money(db.term_fee(term, category, with_shirt=True))} with shirt)"
         f"\nPayment: {status}"
     )
     if payment and payment["status"] == "verified":
@@ -143,7 +146,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     member = db.get_member(_db(context), update.effective_user.id)
     if member is not None:
         member = _refresh_username(_db(context), member, update.effective_user)
-        await update.message.reply_text(_status_text(_db(context), member))
+        if context.args and context.args[0] == "pay":  # t.me/<bot>?start=pay
+            await cmd_pay(update, context)
+        else:
+            await update.message.reply_text(_status_text(_db(context), member))
         return ConversationHandler.END
     await update.message.reply_text(WELCOME)
     return ASK_NAME
@@ -258,67 +264,183 @@ def _parse_fee_cents(value: str) -> int:
     return int(amount * 100)
 
 
+NEWTERM_USAGE = (
+    "Usage: /newterm <name> <start YYYY-MM-DD> <end YYYY-MM-DD> "
+    "deadline=YYYY-MM-DD comp=<fee> rec=<fee> recshirt=<fee> shirt=<fee>\n"
+    "Example: /newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 "
+    "comp=20 rec=25 recshirt=30 shirt=15\n"
+    "(comp = competitive fee, shirt = shirt add-on for competitive, "
+    "recshirt = recreational fee including the shirt)"
+)
+NEWTERM_KEYS = ("deadline", "comp", "rec", "recshirt", "shirt")
+
+
+def parse_newterm_args(args: list[str]) -> dict:
+    """Split /newterm args into create_term kwargs; ValueError on bad input."""
+    options = dict(arg.split("=", 1) for arg in args if "=" in arg)
+    positional = [arg for arg in args if "=" not in arg]
+    unknown = sorted(set(options) - set(NEWTERM_KEYS))
+    if unknown:
+        raise ValueError(f"unknown option(s): {', '.join(unknown)}")
+    missing = [key for key in NEWTERM_KEYS if key not in options]
+    if missing:
+        raise ValueError(f"missing option(s): {', '.join(missing)}")
+    if len(positional) < 3:
+        raise ValueError("need a name, a start date and an end date")
+    return {
+        "name": " ".join(positional[:-2]),
+        "start_date": positional[-2],
+        "end_date": positional[-1],
+        "deadline": options["deadline"],
+        "fee_cents": _parse_fee_cents(options["comp"]),
+        "rec_fee_cents": _parse_fee_cents(options["rec"]),
+        "recshirt_fee_cents": _parse_fee_cents(options["recshirt"]),
+        "shirt_fee_cents": _parse_fee_cents(options["shirt"]),
+    }
+
+
 async def cmd_newterm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if db.get_role(_db(context), update.effective_user.id) != "treasurer":
         await update.message.reply_text("Only the treasurer can create a term.")
         return
-    if len(context.args) < 4:
-        await update.message.reply_text(
-            "Usage: /newterm <name> <fee> <start YYYY-MM-DD> <end YYYY-MM-DD>\n"
-            "Example: /newterm Payment Test 0.05 2026-06-20 2026-07-20"
-        )
-        return
-    name = " ".join(context.args[:-3])
-    fee, start, end = context.args[-3:]
     try:
         term = db.create_term(
             _db(context),
-            name=name,
-            fee_cents=_parse_fee_cents(fee),
-            start_date=start,
-            end_date=end,
+            **parse_newterm_args(context.args),
             created_by=update.effective_user.id,
         )
     except ValueError as exc:
-        await update.message.reply_text(f"Could not create term: {exc}")
+        await update.message.reply_text(f"Could not create term: {exc}\n\n{NEWTERM_USAGE}")
         return
     scheduler.schedule_term_jobs(context.application, _db(context), term["id"])
     await update.message.reply_text(
         f"Term created: {term['name']}\n"
-        f"Fee: {money(term['fee_cents'])}\n"
-        f"Dates: {term['start_date']} to {term['end_date']}\n\n"
+        f"Dates: {term['start_date']} to {term['end_date']}\n"
+        f"Deadline: {term['deadline']}\n"
+        f"Competitive: {money(db.term_fee(term, 'competitive'))}"
+        f" ({money(db.term_fee(term, 'competitive', with_shirt=True))} with shirt)\n"
+        f"Recreational: {money(db.term_fee(term, 'recreational'))}"
+        f" ({money(db.term_fee(term, 'recreational', with_shirt=True))} with shirt)\n\n"
         "Members can now use /pay while the term is active."
     )
 
 
-async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = _db(context)
-    member = db.get_member(conn, update.effective_user.id)
-    if member is None:
-        await update.message.reply_text(NOT_REGISTERED)
-        return
+SIZE_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton(size, callback_data=f"pay:size:{size}")
+            for size in db.SHIRT_SIZES[:3]
+        ],
+        [
+            InlineKeyboardButton(size, callback_data=f"pay:size:{size}")
+            for size in db.SHIRT_SIZES[3:]
+        ],
+    ]
+)
+
+
+def _open_payment(
+    conn: sqlite3.Connection, user_id: int
+) -> tuple[sqlite3.Row, sqlite3.Row] | str:
+    """(term, payment) for a member who can pay now, else the reason they can't."""
+    if db.get_member(conn, user_id) is None:
+        return NOT_REGISTERED
     term = db.get_active_term(conn)
     if term is None:
-        await update.message.reply_text("Fee collection is not currently open.")
-        return
-    payment = db.get_or_create_payment(
-        conn, member_id=member["telegram_user_id"], term_id=term["id"]
-    )
+        return "Fee collection is not currently open."
+    payment = db.get_or_create_payment(conn, member_id=user_id, term_id=term["id"])
     if payment["status"] == "verified":
-        await update.message.reply_text("Your payment for this term is already verified.")
+        return "Your payment for this term is already verified."
+    return term, payment
+
+
+def _shirt_prompt(
+    conn: sqlite3.Connection, user_id: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    opened = _open_payment(conn, user_id)
+    if isinstance(opened, str):
+        return opened, None
+    term, payment = opened
+    category = payment["category"]
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"With shirt ({money(db.term_fee(term, category, with_shirt=True))})",
+                    callback_data="pay:shirt:yes",
+                ),
+                InlineKeyboardButton(
+                    f"Without shirt ({money(db.term_fee(term, category))})",
+                    callback_data="pay:shirt:no",
+                ),
+            ]
+        ]
+    )
+    return (
+        f"{term['name']} membership ({category}).\nDo you want the club shirt?",
+        keyboard,
+    )
+
+
+async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, keyboard = _shirt_prompt(_db(context), update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def on_pay_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """[Pay now] button on blasts/reminders: same as /pay, as a new message."""
+    await update.callback_query.answer()
+    text, keyboard = _shirt_prompt(_db(context), update.effective_user.id)
+    await context.bot.send_message(
+        chat_id=update.effective_user.id, text=text, reply_markup=keyboard
+    )
+
+
+async def on_pay_shirt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "pay:shirt:yes":
+        await query.edit_message_text("Pick your shirt size:", reply_markup=SIZE_KEYBOARD)
         return
+    await _issue_qr(update, context, shirt_size=None)
+
+
+async def on_pay_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    size = update.callback_query.data.removeprefix("pay:size:")
+    await _issue_qr(update, context, shirt_size=size)
+
+
+async def _issue_qr(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, shirt_size: str | None
+) -> None:
+    """Send the member's QR at the amount matching their shirt choice."""
+    conn = _db(context)
+    user_id = update.effective_user.id
+    opened = _open_payment(conn, user_id)
+    if isinstance(opened, str):
+        await update.callback_query.edit_message_text(opened)
+        return
+    term, payment = opened
+    db.set_shirt_size(conn, payment["id"], shirt_size)
     payment = db.mark_qr_issued(conn, payment["id"])
+    amount = db.term_fee(term, payment["category"], with_shirt=shirt_size is not None)
     qr = build_member_qr(
-        fee_cents=term["fee_cents"],
+        fee_cents=amount,
         reference=payment["ref_code"],
         school=school_config(conn),
     )
+    choice = f"with shirt (size {shirt_size})" if shirt_size else "without shirt"
+    await update.callback_query.edit_message_text(
+        f"You chose: {choice}. Changed your mind? Send /pay again."
+    )
     image = io.BytesIO(qr)
     image.name = "membership-paynow.png"
-    await update.message.reply_photo(
+    await context.bot.send_photo(
+        chat_id=user_id,
         photo=image,
         caption=(
-            f"{term['name']} membership fee: {money(term['fee_cents'])}\n"
+            f"{term['name']} membership fee: {money(amount)}\n"
             "Pay using this QR, then send the successful-payment screenshot here. "
             "Expand the transfer details so the amount, recipient, Billing ID, "
             "payment time, and bank reference number are visible."
@@ -417,7 +539,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
     result = verify_extracted_payment(
         extracted,
-        expected_fee_cents=term["fee_cents"],
+        valid_amounts=db.valid_amounts(term, payment["category"]),
         term_start=term["start_date"],
         term_end=term["end_date"],
         qr_issued_at=payment["qr_issued_at"],
@@ -457,7 +579,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if result.passed:
         await update.message.reply_text(
             f"Payment receipt accepted.\n\n{term['name']}\n"
-            f"Amount: {money(term['fee_cents'])}\nStatus: Verified"
+            f"Amount: {money(extracted.amount_cents)}\nStatus: Verified"
         )
         return
 
@@ -483,6 +605,10 @@ async def _notify_treasurer(
     if payment is None or row is None:
         log.error("Cannot notify treasurer for payment %s", payment_id)
         return
+    expected = " or ".join(
+        money(cents)
+        for cents in sorted(db.valid_amounts(payment, payment["category"]))
+    )
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -500,7 +626,7 @@ async def _notify_treasurer(
         text=(
             f"Payment exception\n\nMember: {payment['full_name']}\n"
             f"SUTD ID: {payment['sutd_id']}\nTerm: {payment['term_name']}\n"
-            f"Expected: {money(payment['fee_cents'])}\n\nReasons:\n- "
+            f"Expected: {expected} ({payment['category']})\n\nReasons:\n- "
             + "\n- ".join(reasons)
         ),
         reply_markup=keyboard,
@@ -589,6 +715,14 @@ def build_application(
     app.add_handler(CommandHandler("transfertreasurer", admin.cmd_transfertreasurer))
     app.add_handler(CommandHandler("relink", admin.cmd_relink))
     app.add_handler(CommandHandler("settings", admin.cmd_settings))
+    app.add_handler(CommandHandler("roster", admin.cmd_roster))
+    app.add_handler(CallbackQueryHandler(on_pay_start, pattern=r"^pay:start$"))
+    app.add_handler(
+        CallbackQueryHandler(on_pay_shirt, pattern=r"^pay:shirt:(yes|no)$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_pay_size, pattern=r"^pay:size:(XS|S|M|L|XL|XXL)$")
+    )
     app.add_handler(
         CallbackQueryHandler(on_payment_review, pattern=r"^payment:(approve|reject):\d+$")
     )

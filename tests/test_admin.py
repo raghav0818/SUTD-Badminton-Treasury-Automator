@@ -142,6 +142,118 @@ def test_stats_reports_counts(conn):
     assert "Unpaid: 1" in text
 
 
+def test_stats_breaks_down_count_times_price_and_roster(conn):
+    db.ensure_treasurer(conn, 999)
+    db.replace_roster(
+        conn, [("Alice Tan", "1010001"), ("Bob Lim", "1010002"), ("Ghost", "1010009")]
+    )
+    for uid, sid in ((111, "1010001"), (222, "1010002"), (333, "1010003"), (444, "1010004")):
+        db.add_member(conn, telegram_user_id=uid, full_name=f"M{uid}", sutd_id=sid, username=None)
+    today = date.today()
+    term = db.create_term(
+        conn, name="Term 1", fee_cents=2000, rec_fee_cents=2500,
+        recshirt_fee_cents=3000, shirt_fee_cents=1500,
+        start_date=(today - timedelta(days=1)).isoformat(),
+        end_date=(today + timedelta(days=60)).isoformat(), created_by=999,
+    )
+    shirt = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_shirt_size(conn, shirt["id"], "M")
+    for uid in (111, 222, 333, 444):
+        db.mark_paid_manual(conn, member_id=uid, term_id=term["id"])
+
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_stats(update, context))
+    text = reply_text_of(update)
+    assert "Competitive S$20.00 × 1 = S$20.00" in text
+    assert "Competitive+shirt S$35.00 × 1 = S$35.00" in text
+    assert "Rec S$25.00 × 2 = S$50.00" in text
+    assert "Total: S$105.00" in text
+    assert "2/3 roster paid" in text
+
+
+def test_breakdown_handles_unknown_amount():
+    rows = [{"category": "recreational", "with_shirt": 1, "amount_cents": None, "n": 1}]
+    assert admin._breakdown_lines(rows) == ["Rec+shirt (amount unknown) × 1", "Total: S$0.00"]
+
+
+def test_unpaid_lists_roster_people_who_never_opened_the_bot(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.replace_roster(conn, [("Alice Tan", "1007654"), ("Zed Koh", "1010999")])
+    term = create_active_term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    db.mark_paid_manual(conn, member_id=222, term_id=term["id"])
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_unpaid(update, context))
+    text = reply_text_of(update)
+    assert "never opened the bot" in text
+    assert "Zed Koh" in text
+    assert "Alice Tan" not in text
+
+
+# --- roster -------------------------------------------------------------------
+
+
+def test_parse_roster_accepts_good_lines_and_reports_bad_ones():
+    rows, rejected = admin.parse_roster(
+        "/roster Alice Tan, 1010001\n"
+        "Bob Lim,1010002\n"
+        "\n"
+        "  Tan, Ah Kow , 1010003  \n"
+        "No Id Here\n"
+        "Bad Id, 1007654\n"
+        "Dup Alice, 1010001\n"
+    )
+    assert rows == [
+        ("Alice Tan", "1010001"),
+        ("Bob Lim", "1010002"),
+        ("Tan, Ah Kow", "1010003"),
+    ]
+    assert rejected == ["No Id Here", "Bad Id, 1007654", "Dup Alice, 1010001"]
+
+
+def test_parse_roster_bare_command_is_empty():
+    assert admin.parse_roster("/roster") == ([], [])
+    assert admin.parse_roster("/roster@ShuttleBuddyBot") == ([], [])
+
+
+def test_roster_replaces_list_and_reports_rejects(conn):
+    db.ensure_treasurer(conn, 999)
+    db.replace_roster(conn, [("Old Person", "1010555")])
+    update, context = make_update(
+        user_id=999, text="/roster\nAlice Tan, 1010001\nBob Lim, 1010002\noops"
+    ), make_context(conn)
+    asyncio.run(admin.cmd_roster(update, context))
+    assert db.roster_size(conn) == 2
+    text = reply_text_of(update)
+    assert "2 people" in text
+    assert "oops" in text
+
+
+def test_roster_all_bad_lines_leave_roster_untouched(conn):
+    db.ensure_treasurer(conn, 999)
+    db.replace_roster(conn, [("Old Person", "1010555")])
+    update, context = make_update(user_id=999, text="/roster\njunk"), make_context(conn)
+    asyncio.run(admin.cmd_roster(update, context))
+    assert db.roster_size(conn) == 1
+    assert "NOT changed" in reply_text_of(update)
+
+
+def test_roster_without_lines_shows_count(conn):
+    db.ensure_treasurer(conn, 999)
+    db.replace_roster(conn, [("Old Person", "1010555")])
+    update, context = make_update(user_id=999, text="/roster"), make_context(conn)
+    asyncio.run(admin.cmd_roster(update, context))
+    assert "roster size: 1" in reply_text_of(update)
+
+
+def test_roster_denies_non_admin(conn):
+    update, context = make_update(user_id=111, text="/roster\nA B, 1010001"), make_context(conn)
+    asyncio.run(admin.cmd_roster(update, context))
+    assert "club admins" in reply_text_of(update)
+    assert db.roster_size(conn) == 0
+
+
 def test_members_lists_all(conn):
     db.ensure_treasurer(conn, 999)
     seed_members(conn)

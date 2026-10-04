@@ -222,16 +222,154 @@ def test_connect_migrates_existing_payment_database(tmp_path):
     }
     assert {"qr_issued_at", "payment_timestamp"} <= columns
     assert {"flagged_at", "audit_confirmed_at"} <= columns
+    assert {"category", "with_shirt", "shirt_size", "opted_out_at"} <= columns
     term_columns = {
         row["name"] for row in migrated.execute("PRAGMA table_info(terms)")
     }
     assert {"start_notified_at", "reminder7_sent_at"} <= term_columns
+    assert {
+        "comp_fee_cents",
+        "rec_fee_cents",
+        "recshirt_fee_cents",
+        "shirt_fee_cents",
+        "deadline",
+    } <= term_columns
+    assert migrated.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'roster'"
+    ).fetchone() is not None
     assert (
         migrated.execute(
             "SELECT name FROM sqlite_master WHERE name = 'receipt_fingerprints'"
         ).fetchone()
         is not None
     )
+
+
+def test_migration_backfills_legacy_term_as_single_price(tmp_path):
+    path = tmp_path / "legacy.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        CREATE TABLE terms (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, fee_cents INTEGER NOT NULL,
+            start_date TEXT NOT NULL, end_date TEXT NOT NULL, created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO terms (name, fee_cents, start_date, end_date)
+        VALUES ('Old', 2000, '2026-01-01', '2026-03-01');
+        """
+    )
+    old.commit()
+    old.close()
+    term = db.list_terms(db.connect(str(path)))[0]
+    assert db.valid_amounts(term, "competitive") == {2000}
+    assert db.valid_amounts(term, "recreational") == {2000}
+    assert term["deadline"] == "2026-03-01"
+
+
+# --- v2: prices, shirts, roster ---------------------------------------------------
+
+
+def _priced_term(conn, **overrides):
+    values = dict(
+        name="Term 1",
+        fee_cents=2000,
+        rec_fee_cents=2500,
+        recshirt_fee_cents=3000,
+        shirt_fee_cents=1500,
+        start_date="2026-09-01",
+        end_date="2026-12-01",
+        deadline="2026-09-15",
+        created_by=999,
+    )
+    values.update(overrides)
+    return db.create_term(conn, **values)
+
+
+def test_term_fees_and_valid_amounts(conn):
+    term = _priced_term(conn)
+    assert term["fee_cents"] == term["comp_fee_cents"] == 2000
+    assert db.term_fee(term, "competitive") == 2000
+    assert db.term_fee(term, "competitive", with_shirt=True) == 3500
+    assert db.term_fee(term, "recreational") == 2500
+    assert db.term_fee(term, "recreational", with_shirt=True) == 3000
+    assert db.valid_amounts(term, "competitive") == {2000, 3500}
+    assert db.valid_amounts(term, "recreational") == {2500, 3000}
+
+
+@pytest.mark.parametrize(
+    "overrides, error",
+    [
+        ({"deadline": "2026-08-31"}, "deadline"),
+        ({"deadline": "2026-12-02"}, "deadline"),
+        ({"rec_fee_cents": 0}, "positive"),
+        ({"recshirt_fee_cents": 2000}, "below the rec fee"),
+        ({"shirt_fee_cents": -1}, "negative"),
+    ],
+)
+def test_create_term_rejects_bad_prices_and_deadline(conn, overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _priced_term(conn, **overrides)
+
+
+def test_category_stored_when_payment_created(conn):
+    db.replace_roster(conn, [("Alice", "1010001")])
+    _member(conn, 111, "1010001", "Alice")
+    _member(conn, 222, "1010002", "Bob")
+    term = _priced_term(conn)
+    alice = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    bob = db.get_or_create_payment(conn, member_id=222, term_id=term["id"])
+    assert alice["category"] == "competitive"
+    assert bob["category"] == "recreational"
+
+
+def test_replace_roster_recategorises_only_unpaid_rows(conn):
+    _member(conn, 111, "1010001", "Alice")
+    _member(conn, 222, "1010002", "Bob")
+    term = _priced_term(conn)
+    db.get_or_create_payment(conn, member_id=111, term_id=term["id"])  # rec, unpaid
+    db.mark_paid_manual(conn, member_id=222, term_id=term["id"])  # rec, paid
+    db.replace_roster(conn, [("Alice", "1010001"), ("Bob", "1010002")])
+    assert db.get_payment_for_member_term(conn, member_id=111, term_id=term["id"])[
+        "category"
+    ] == "competitive"
+    assert db.get_payment_for_member_term(conn, member_id=222, term_id=term["id"])[
+        "category"
+    ] == "recreational"
+    db.replace_roster(conn, [("Cara", "1010003")])  # wholesale replace
+    assert db.roster_size(conn) == 1
+
+
+def test_mark_paid_manual_uses_category_and_shirt_choice(conn):
+    db.replace_roster(conn, [("Alice", "1010001")])
+    _member(conn, 111, "1010001", "Alice")
+    _member(conn, 222, "1010002", "Bob")
+    term = _priced_term(conn)
+    alice = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_shirt_size(conn, alice["id"], "XL")
+    alice = db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    bob = db.mark_paid_manual(conn, member_id=222, term_id=term["id"])
+    assert (alice["amount_cents"], alice["with_shirt"], alice["shirt_size"]) == (3500, 1, "XL")
+    assert (bob["amount_cents"], bob["with_shirt"]) == (2500, 0)
+
+
+def test_approved_exception_records_shirt_from_amount(conn):
+    _member(conn, 111, "1010001", "Alice")
+    term = _priced_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.set_shirt_size(conn, payment["id"], "S")
+    db.save_verification_result(
+        conn, payment["id"], status="exception", amount_cents=3000,
+        extracted_json="{}", bank_txn_id=None,
+    )
+    assert db.get_payment(conn, payment["id"])["with_shirt"] is None
+    reviewed = db.review_payment(conn, payment["id"], approve=True)
+    assert (reviewed["with_shirt"], reviewed["shirt_size"]) == (1, "S")
+
+
+def test_set_shirt_size_rejects_unknown_size(conn):
+    with pytest.raises(ValueError):
+        db.set_shirt_size(conn, 1, "XXXL")
 
 
 # --- Phase 3 -------------------------------------------------------------------
@@ -292,7 +430,6 @@ def test_term_payment_stats(conn):
         "paid": 1,
         "unpaid": 2,
         "exceptions": 1,
-        "flagged": 0,
     }
 
 

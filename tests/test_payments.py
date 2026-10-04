@@ -42,7 +42,7 @@ def test_member_qr_preserves_billing_id_and_uses_reference_label():
 def test_valid_receipt_is_verified():
     result = verify_extracted_payment(
         valid_extraction(),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
@@ -52,17 +52,36 @@ def test_valid_receipt_is_verified():
     assert result.reasons == ()
 
 
+def test_either_valid_amount_passes_and_others_fail():
+    def check(amount):
+        return verify_extracted_payment(
+            valid_extraction(amount_cents=amount),
+            valid_amounts={2000, 3500},
+            term_start="2026-06-01",
+            term_end="2026-06-30",
+            qr_issued_at="2026-06-20T02:30:00+00:00",
+            now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
+        )
+
+    assert check(2000).passed
+    assert check(3500).passed
+    wrong = check(2500)
+    assert wrong.outcome == "exception"
+    assert wrong.reasons == ("Amount is not the expected S$20.00 or S$35.00.",)
+    assert check(None).outcome == "exception"
+
+
 def test_unreadable_or_incomplete_screen_requests_retry():
     unreadable = verify_extracted_payment(
         valid_extraction(readable=False),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
     )
     incomplete = verify_extracted_payment(
         valid_extraction(is_success_screen=False),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
@@ -80,7 +99,7 @@ def test_wrong_fields_go_to_exception():
             payment_timestamp="2022-01-01T10:00:00+08:00",
             transaction_id=None,
         ),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
@@ -93,7 +112,7 @@ def test_wrong_fields_go_to_exception():
 def test_duplicate_transaction_goes_to_exception():
     result = verify_extracted_payment(
         valid_extraction(),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
@@ -107,7 +126,7 @@ def test_duplicate_transaction_goes_to_exception():
 def test_receipt_from_before_qr_issue_is_rejected():
     result = verify_extracted_payment(
         valid_extraction(payment_timestamp="2026-06-20T10:00:00+08:00"),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
@@ -120,7 +139,7 @@ def test_receipt_from_before_qr_issue_is_rejected():
 def test_timestamp_without_timezone_is_rejected():
     result = verify_extracted_payment(
         valid_extraction(payment_timestamp="2026-06-20T10:38:00"),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
@@ -134,7 +153,7 @@ def test_transaction_id_that_normalises_to_empty_is_treated_as_missing():
     # the missing-ID check and the (normalised) duplicate reservation.
     result = verify_extracted_payment(
         valid_extraction(transaction_id="ＴＸ－１２３"),  # fullwidth: normalises to ""
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
@@ -157,7 +176,7 @@ def test_school_config_defaults_and_settings_override():
     # Verification follows the override: the old default billing id now fails.
     result = verify_extracted_payment(
         valid_extraction(),
-        expected_fee_cents=5,
+        valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",

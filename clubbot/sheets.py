@@ -22,7 +22,15 @@ PAYMENT_HEADERS = [
     "Paid at",
     "Verified by",
     "Flagged",
+    "Category",
+    "Shirt",
+    "Size",
 ]
+SHIRT_HEADERS = ["Name", "Size"]
+
+
+def _yes_no(value: int | None) -> str:
+    return "" if value is None else ("yes" if value else "no")
 
 
 class SheetMirror:
@@ -36,7 +44,9 @@ class SheetMirror:
         client = gspread.service_account(filename=service_account_file)
         return cls(client.open_by_key(sheet_id))
 
-    def snapshot(self, conn: sqlite3.Connection) -> tuple[list[list], list[list]]:
+    def snapshot(
+        self, conn: sqlite3.Connection
+    ) -> tuple[list[list], list[list], list[list]]:
         members = [
             [
                 m["full_name"],
@@ -57,15 +67,30 @@ class SheetMirror:
                 p["payment_timestamp"] or "",
                 p["verified_by"] or "",
                 "yes" if p["flagged_at"] else "",
+                p["category"] or "",
+                _yes_no(p["with_shirt"]),
+                p["shirt_size"] or "",
             ]
             for p in db.list_payments(conn)
         ]
-        return members, payments
+        # Active term's shirt orders, then a per-size count block for ordering.
+        term = db.get_active_term(conn)
+        orders = db.list_shirt_orders(conn, term["id"]) if term else []
+        shirts = [[o["full_name"], o["shirt_size"] or "?"] for o in orders]
+        shirts.append(["", ""])
+        shirts += [
+            [f"{size} total", sum(o["shirt_size"] == size for o in orders)]
+            for size in db.SHIRT_SIZES
+        ]
+        return members, payments, shirts
 
-    def push(self, members: list[list], payments: list[list]) -> None:
-        """Full rebuild of both tabs; the Sheet is a mirror, never the database."""
+    def push(
+        self, members: list[list], payments: list[list], shirts: list[list]
+    ) -> None:
+        """Full rebuild of all tabs; the Sheet is a mirror, never the database."""
         self._write("Members", MEMBER_HEADERS, members)
         self._write("Payments", PAYMENT_HEADERS, payments)
+        self._write("Shirts", SHIRT_HEADERS, shirts)
 
     def _write(self, title: str, headers: list[str], rows: list[list]) -> None:
         try:

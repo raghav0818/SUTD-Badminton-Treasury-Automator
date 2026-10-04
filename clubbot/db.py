@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS terms (
     created_by        INTEGER,
     created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
     start_notified_at TEXT,
-    reminder7_sent_at TEXT
+    reminder7_sent_at TEXT,
+    comp_fee_cents     INTEGER,
+    rec_fee_cents      INTEGER,
+    recshirt_fee_cents INTEGER,
+    shirt_fee_cents    INTEGER,
+    deadline           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS payments (
@@ -49,7 +54,11 @@ CREATE TABLE IF NOT EXISTS payments (
     audit_confirmed_at TEXT,
     created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
     verified_at        TEXT,
-    verified_by        TEXT    CHECK (verified_by IN ('auto','treasurer','manual_override'))
+    verified_by        TEXT    CHECK (verified_by IN ('auto','treasurer','manual_override')),
+    category           TEXT    CHECK (category IN ('competitive','recreational')),
+    with_shirt         INTEGER,
+    shirt_size         TEXT,
+    opted_out_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS admins (
@@ -79,6 +88,11 @@ CREATE TABLE IF NOT EXISTS receipt_fingerprints (
     image_hash  TEXT    NOT NULL UNIQUE,
     bank_txn_id TEXT    UNIQUE,
     submitted_at TEXT   NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS roster (
+    sutd_id TEXT PRIMARY KEY,
+    name    TEXT NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_member_term
@@ -128,6 +142,43 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn,
         "terms",
         {"start_notified_at": "TEXT", "reminder7_sent_at": "TEXT"},
+    )
+    # v2: three prices + shirts + deadline.
+    _add_missing_columns(
+        conn,
+        "terms",
+        {
+            "comp_fee_cents": "INTEGER",
+            "rec_fee_cents": "INTEGER",
+            "recshirt_fee_cents": "INTEGER",
+            "shirt_fee_cents": "INTEGER",
+            "deadline": "TEXT",
+        },
+    )
+    _add_missing_columns(
+        conn,
+        "payments",
+        {
+            "category": "TEXT",
+            "with_shirt": "INTEGER",
+            "shirt_size": "TEXT",
+            "opted_out_at": "TEXT",
+        },
+    )
+    # Pre-v2 terms had one price and no shirt: every category pays fee_cents.
+    conn.execute(
+        """
+        UPDATE terms SET
+            comp_fee_cents = COALESCE(comp_fee_cents, fee_cents),
+            rec_fee_cents = COALESCE(rec_fee_cents, fee_cents),
+            recshirt_fee_cents = COALESCE(recshirt_fee_cents, fee_cents),
+            shirt_fee_cents = COALESCE(shirt_fee_cents, 0),
+            deadline = COALESCE(deadline, end_date)
+        WHERE comp_fee_cents IS NULL OR deadline IS NULL
+        """
+    )
+    conn.execute(
+        "UPDATE payments SET category = 'recreational' WHERE category IS NULL"
     )
     conn.execute(
         """
@@ -376,16 +427,36 @@ def create_term(
     start_date: str,
     end_date: str,
     created_by: int,
+    rec_fee_cents: int | None = None,
+    recshirt_fee_cents: int | None = None,
+    shirt_fee_cents: int = 0,
+    deadline: str | None = None,
 ) -> sqlite3.Row:
-    """Create a collection term after validating its basic invariants."""
+    """Create a collection term after validating its basic invariants.
+
+    `fee_cents` is the competitive fee (also kept in the legacy fee_cents
+    column). Omitted rec/recshirt/shirt/deadline give a single-price,
+    no-shirt term ending collection on the end date.
+    """
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date)
+    rec_fee_cents = fee_cents if rec_fee_cents is None else rec_fee_cents
+    recshirt_fee_cents = (
+        rec_fee_cents if recshirt_fee_cents is None else recshirt_fee_cents
+    )
+    due = end if deadline is None else date.fromisoformat(deadline)
     if not name.strip():
         raise ValueError("term name cannot be empty")
-    if fee_cents <= 0:
-        raise ValueError("term fee must be positive")
+    if min(fee_cents, rec_fee_cents, recshirt_fee_cents) <= 0:
+        raise ValueError("term fees must be positive")
+    if shirt_fee_cents < 0:
+        raise ValueError("shirt fee cannot be negative")
+    if recshirt_fee_cents < rec_fee_cents:
+        raise ValueError("rec-with-shirt fee cannot be below the rec fee")
     if end < start:
         raise ValueError("term end date cannot be before its start date")
+    if not start <= due <= end:
+        raise ValueError("deadline must be between the term start and end dates")
     overlap = conn.execute(
         """
         SELECT id FROM terms
@@ -398,13 +469,49 @@ def create_term(
         raise ValueError("term dates overlap an existing term")
     cursor = conn.execute(
         """
-        INSERT INTO terms (name, fee_cents, start_date, end_date, created_by)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO terms (name, fee_cents, start_date, end_date, created_by,
+                           comp_fee_cents, rec_fee_cents, recshirt_fee_cents,
+                           shirt_fee_cents, deadline)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (name.strip(), fee_cents, start.isoformat(), end.isoformat(), created_by),
+        (
+            name.strip(),
+            fee_cents,
+            start.isoformat(),
+            end.isoformat(),
+            created_by,
+            fee_cents,
+            rec_fee_cents,
+            recshirt_fee_cents,
+            shirt_fee_cents,
+            due.isoformat(),
+        ),
     )
     conn.commit()
     return get_term(conn, cursor.lastrowid)
+
+
+SHIRT_SIZES = ("XS", "S", "M", "L", "XL", "XXL")
+
+
+def term_fee(term: sqlite3.Row, category: str, *, with_shirt: bool = False) -> int:
+    """What a member of `category` pays this term; `term` may be a payment row."""
+    if category == "competitive":
+        return term["comp_fee_cents"] + (term["shirt_fee_cents"] if with_shirt else 0)
+    return term["recshirt_fee_cents"] if with_shirt else term["rec_fee_cents"]
+
+
+def valid_amounts(term: sqlite3.Row, category: str) -> set[int]:
+    """Amounts the verifier accepts: the base fee or the with-shirt fee."""
+    return {term_fee(term, category), term_fee(term, category, with_shirt=True)}
+
+
+def member_category(conn: sqlite3.Connection, member: sqlite3.Row) -> str:
+    """Competitive iff the member's SUTD ID is on the roster."""
+    on_roster = conn.execute(
+        "SELECT 1 FROM roster WHERE sutd_id = ?", (member["sutd_id"],)
+    ).fetchone()
+    return "competitive" if on_roster else "recreational"
 
 
 def get_term(conn: sqlite3.Connection, term_id: int) -> sqlite3.Row | None:
@@ -436,14 +543,15 @@ def get_or_create_payment(
     existing = get_payment_for_member_term(conn, member_id=member_id, term_id=term_id)
     if existing is not None:
         return existing
+    category = member_category(conn, get_member(conn, member_id))
     for _ in range(5):
         try:
             cursor = conn.execute(
                 """
-                INSERT INTO payments (member_id, term_id, ref_code, status)
-                VALUES (?, ?, ?, 'awaiting_payment')
+                INSERT INTO payments (member_id, term_id, ref_code, status, category)
+                VALUES (?, ?, ?, 'awaiting_payment', ?)
                 """,
-                (member_id, term_id, _new_ref_code(term_id)),
+                (member_id, term_id, _new_ref_code(term_id), category),
             )
             conn.commit()
             return get_payment(conn, cursor.lastrowid)
@@ -468,11 +576,41 @@ def mark_qr_issued(conn: sqlite3.Connection, payment_id: int) -> sqlite3.Row:
     return get_payment(conn, payment_id)
 
 
+def set_shirt_size(
+    conn: sqlite3.Connection, payment_id: int, shirt_size: str | None
+) -> None:
+    """Record the pay-flow shirt choice (None = no shirt)."""
+    if shirt_size is not None and shirt_size not in SHIRT_SIZES:
+        raise ValueError("unknown shirt size")
+    conn.execute(
+        "UPDATE payments SET shirt_size = ? WHERE id = ?", (shirt_size, payment_id)
+    )
+    conn.commit()
+
+
+def _settle_shirt(conn: sqlite3.Connection, payment_id: int) -> None:
+    """On verification, the amount actually paid decides the shirt (no commit)."""
+    payment = get_payment(conn, payment_id)
+    if payment["amount_cents"] is None:
+        return
+    with_shirt = payment["amount_cents"] != term_fee(payment, payment["category"])
+    conn.execute(
+        """
+        UPDATE payments
+        SET with_shirt = ?, shirt_size = CASE WHEN ? THEN shirt_size END
+        WHERE id = ?
+        """,
+        (int(with_shirt), with_shirt, payment_id),
+    )
+
+
 def get_payment(conn: sqlite3.Connection, payment_id: int) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT p.*, m.full_name, m.sutd_id, m.telegram_user_id,
-               t.name AS term_name, t.fee_cents, t.start_date, t.end_date
+               t.name AS term_name, t.fee_cents, t.start_date, t.end_date,
+               t.comp_fee_cents, t.rec_fee_cents, t.recshirt_fee_cents,
+               t.shirt_fee_cents, t.deadline
         FROM payments p
         JOIN members m ON m.telegram_user_id = p.member_id
         JOIN terms t ON t.id = p.term_id
@@ -642,6 +780,8 @@ def save_verification_result(
             payment_id,
         ),
     )
+    if status == "verified":
+        _settle_shirt(conn, payment_id)
     conn.commit()
 
 
@@ -665,6 +805,8 @@ def review_payment(
         """,
         (status, verified_at, "treasurer" if approve else None, payment_id),
     )
+    if approve:
+        _settle_shirt(conn, payment_id)
     conn.commit()
     return get_payment(conn, payment_id)
 
@@ -713,34 +855,116 @@ def get_term_payment_stats(conn: sqlite3.Connection, term_id: int) -> dict[str, 
         "SELECT COUNT(*) AS n FROM payments WHERE term_id = ? AND status = 'exception'",
         (term_id,),
     ).fetchone()["n"]
-    flagged = conn.execute(
-        "SELECT COUNT(*) AS n FROM payments"
-        " WHERE term_id = ? AND flagged_at IS NOT NULL",
-        (term_id,),
-    ).fetchone()["n"]
     return {
         "registered": registered,
         "paid": paid,
         "unpaid": max(registered - paid, 0),
         "exceptions": exceptions,
-        "flagged": flagged,
     }
+
+
+def get_term_amount_breakdown(
+    conn: sqlite3.Connection, term_id: int
+) -> list[sqlite3.Row]:
+    """Verified payments counted per (category, with_shirt, amount) for /stats."""
+    return conn.execute(
+        """
+        SELECT category, with_shirt, amount_cents, COUNT(*) AS n
+        FROM payments
+        WHERE term_id = ? AND status = 'verified'
+        GROUP BY category, with_shirt, amount_cents
+        ORDER BY category, with_shirt, amount_cents
+        """,
+        (term_id,),
+    ).fetchall()
+
+
+def replace_roster(conn: sqlite3.Connection, rows: list[tuple[str, str]]) -> None:
+    """Replace the whole competitive roster with (name, sutd_id) rows."""
+    try:
+        conn.execute("DELETE FROM roster")
+        conn.executemany("INSERT INTO roster (name, sutd_id) VALUES (?, ?)", rows)
+        # Payment rows are created early (e.g. by the term-start blast), so
+        # re-price any nobody has paid against yet under the new roster.
+        conn.execute(
+            """
+            UPDATE payments SET category = CASE WHEN EXISTS (
+                SELECT 1 FROM roster r JOIN members m ON m.sutd_id = r.sutd_id
+                WHERE m.telegram_user_id = payments.member_id
+            ) THEN 'competitive' ELSE 'recreational' END
+            WHERE status = 'awaiting_payment'
+            """
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def roster_size(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM roster").fetchone()["n"]
+
+
+def roster_paid_count(conn: sqlite3.Connection, term_id: int) -> int:
+    """Roster people whose registered account has a verified payment this term."""
+    return conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM roster r
+        JOIN members m ON m.sutd_id = r.sutd_id
+        JOIN payments p ON p.member_id = m.telegram_user_id
+        WHERE p.term_id = ? AND p.status = 'verified'
+        """,
+        (term_id,),
+    ).fetchone()["n"]
+
+
+def list_roster_unregistered(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Roster people who never registered with the bot."""
+    return conn.execute(
+        """
+        SELECT * FROM roster
+        WHERE sutd_id NOT IN (SELECT sutd_id FROM members)
+        ORDER BY name
+        """
+    ).fetchall()
+
+
+def list_shirt_orders(conn: sqlite3.Connection, term_id: int) -> list[sqlite3.Row]:
+    """(full_name, shirt_size) for verified payments that included a shirt."""
+    return conn.execute(
+        """
+        SELECT m.full_name, p.shirt_size FROM payments p
+        JOIN members m ON m.telegram_user_id = p.member_id
+        WHERE p.term_id = ? AND p.status = 'verified' AND p.with_shirt = 1
+        ORDER BY m.full_name
+        """,
+        (term_id,),
+    ).fetchall()
 
 
 def mark_paid_manual(
     conn: sqlite3.Connection, *, member_id: int, term_id: int
 ) -> sqlite3.Row:
-    """Treasurer override for cash / off-Telegram payments (logged as manual_override)."""
+    """Treasurer override for cash / off-Telegram payments (logged as manual_override).
+
+    Records the member's base fee, or the with-shirt fee if their last pay-flow
+    choice was a shirt size.
+    """
     payment = get_or_create_payment(conn, member_id=member_id, term_id=term_id)
-    term = get_term(conn, term_id)
+    with_shirt = payment["shirt_size"] is not None
     conn.execute(
         """
         UPDATE payments
-        SET status = 'verified', amount_cents = ?, verified_at = ?,
+        SET status = 'verified', amount_cents = ?, with_shirt = ?, verified_at = ?,
             verified_by = 'manual_override', flagged_at = NULL
         WHERE id = ?
         """,
-        (term["fee_cents"], _utc_now(), payment["id"]),
+        (
+            term_fee(payment, payment["category"], with_shirt=with_shirt),
+            int(with_shirt),
+            _utc_now(),
+            payment["id"],
+        ),
     )
     conn.commit()
     return get_payment(conn, payment["id"])
