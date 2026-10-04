@@ -158,5 +158,15 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   into this file; Phase 0 tooling, planning docs, and `image.png` (the
   school's original QR — its decoded payload lives in the PRD §4 and
   `tests/test_paynow.py`) removed. Full git history retains everything.
+- **2026-10-03** — Research: `docs/research/2026-10-03-payment-verification-alternatives.md`
+  (verdict: stay on a PAID cloud VLM; local OCR not worth it; Google now gates
+  `gemini-2.5-flash` to past users, so new keys need a 3.x model ID).
+- **2026-10-04** — Grilled the whole project with the treasurer. Outcome is
+  `docs/superpowers/specs/2026-10-04-v2-build-list.md` (comp/rec prices + shirts,
+  bot fully replaces the MS Form,
+  competitive roster, deadline reminders, group progress posts, weekly audit
+  DROPPED with a per-term FLYMAX count check instead, git-clone deploy).
+  **Awaiting treasurer confirmation; nothing built yet.** That file overrides
+  the "weekly audit" statements elsewhere in this file once built.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).
