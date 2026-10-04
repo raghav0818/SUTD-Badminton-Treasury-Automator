@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS payments (
     category           TEXT    CHECK (category IN ('competitive','recreational')),
     with_shirt         INTEGER,
     shirt_size         TEXT,
-    opted_out_at       TEXT
+    opted_out_at       TEXT,
+    extract_attempts   INTEGER NOT NULL DEFAULT 0,
+    last_extract_error_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS admins (
@@ -163,6 +165,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "with_shirt": "INTEGER",
             "shirt_size": "TEXT",
             "opted_out_at": "TEXT",
+        },
+    )
+    # v2 D15: Gemini-failure retry bookkeeping.
+    _add_missing_columns(
+        conn,
+        "payments",
+        {
+            "extract_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "last_extract_error_at": "TEXT",
         },
     )
     # Pre-v2 terms had one price and no shirt: every category pays fee_cents.
@@ -722,7 +733,8 @@ def mark_payment_pending(
         UPDATE payments
         SET status = 'pending_verification', screenshot_file_id = ?,
             image_hash = ?, extracted_json = NULL, bank_txn_id = NULL,
-            verified_at = NULL, verified_by = NULL
+            verified_at = NULL, verified_by = NULL,
+            extract_attempts = 0, last_extract_error_at = NULL
         WHERE id = ?
         """,
         (screenshot_file_id, image_hash, payment_id),
@@ -739,6 +751,49 @@ def reset_payment_for_retry(conn: sqlite3.Connection, payment_id: int) -> None:
         WHERE id = ?
         """,
         (payment_id,),
+    )
+    conn.commit()
+
+
+def record_extract_failure(conn: sqlite3.Connection, payment_id: int) -> int:
+    """Count a failed Gemini extraction; returns the attempts so far.
+
+    A non-NULL last_extract_error_at is what marks a pending payment as
+    waiting for a retry (a crash mid-check leaves it NULL).
+    """
+    conn.execute(
+        """
+        UPDATE payments
+        SET extract_attempts = extract_attempts + 1, last_extract_error_at = ?
+        WHERE id = ?
+        """,
+        (_utc_now(), payment_id),
+    )
+    conn.commit()
+    return get_payment(conn, payment_id)["extract_attempts"]
+
+
+def list_extraction_retries(
+    conn: sqlite3.Connection, max_attempts: int
+) -> list[sqlite3.Row]:
+    """Pending payments whose extraction failed and may be tried again."""
+    rows = conn.execute(
+        """
+        SELECT id FROM payments
+        WHERE status = 'pending_verification'
+          AND last_extract_error_at IS NOT NULL
+          AND extract_attempts < ?
+        ORDER BY id
+        """,
+        (max_attempts,),
+    ).fetchall()
+    return [get_payment(conn, row["id"]) for row in rows]
+
+
+def mark_payment_exception(conn: sqlite3.Connection, payment_id: int) -> None:
+    """Hand a payment to the treasurer's Approve/Reject review."""
+    conn.execute(
+        "UPDATE payments SET status = 'exception' WHERE id = ?", (payment_id,)
     )
     conn.commit()
 

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import zxingcpp
 from PIL import Image
+from telegram.constants import ChatMemberStatus
 from telegram.ext import ConversationHandler
 
 from clubbot import bot, db, paynow
@@ -728,3 +729,221 @@ def test_exact_receipt_image_cannot_be_reused(conn):
     asyncio.run(bot.on_receipt(update, context))
 
     assert "already been submitted" in reply_text_of(update)
+
+
+# --- Registration gate (club groups / roster) -----------------------------------
+
+
+def gate_context(conn, *, status=None, error=False):
+    """Context with both club groups configured and a stubbed getChatMember."""
+    db.set_setting(conn, "rec_group_id", "-100111")
+    db.set_setting(conn, "comp_group_id", "-100222")
+    context = make_context(conn)
+    if error:
+        context.bot.get_chat_member = AsyncMock(side_effect=RuntimeError("Forbidden"))
+    else:
+        context.bot.get_chat_member = AsyncMock(
+            return_value=MagicMock(status=status, is_member=False)
+        )
+    return context
+
+
+def register_until_sutd_id(context, sutd_id="1010654"):
+    assert asyncio.run(bot.cmd_start(make_update(text="/start"), context)) == bot.ASK_NAME
+    asyncio.run(bot.on_name(make_update(text="Alice Tan"), context))
+    update = make_update(text=sutd_id)
+    return asyncio.run(bot.on_sutd_id(update, context)), update
+
+
+def test_gate_allows_group_member(conn):
+    context = gate_context(conn, status=ChatMemberStatus.MEMBER)
+    assert register_until_sutd_id(context)[0] == bot.CONFIRM
+
+
+def test_gate_allows_restricted_only_if_still_member(conn):
+    context = gate_context(conn, status=ChatMemberStatus.RESTRICTED)
+    assert register_until_sutd_id(context)[0] == ConversationHandler.END
+    context = gate_context(conn, status=ChatMemberStatus.RESTRICTED)
+    context.bot.get_chat_member.return_value.is_member = True
+    assert register_until_sutd_id(context)[0] == bot.CONFIRM
+
+
+def test_gate_allows_roster_person_outside_groups(conn):
+    db.replace_roster(conn, [("Alice Tan", "1010654")])
+    context = gate_context(conn, status=ChatMemberStatus.LEFT)
+    assert register_until_sutd_id(context)[0] == bot.CONFIRM
+
+
+def test_gate_refuses_outsider_not_on_roster(conn):
+    context = gate_context(conn, status=ChatMemberStatus.LEFT)
+    state, update = register_until_sutd_id(context)
+    assert state == ConversationHandler.END
+    assert "join the club's Telegram group" in reply_text_of(update)
+    assert context.user_data == {}
+    assert db.get_member(conn, 111) is None
+
+
+def test_gate_api_error_counts_as_not_in_group(conn):
+    context = gate_context(conn, error=True)
+    assert register_until_sutd_id(context)[0] == ConversationHandler.END
+    assert context.bot.get_chat_member.await_count == 2  # tried both groups
+
+
+def test_gate_skipped_when_no_group_configured(conn):
+    context = make_context(conn)
+    context.bot.get_chat_member = AsyncMock()
+    assert register_until_sutd_id(context)[0] == bot.CONFIRM
+    context.bot.get_chat_member.assert_not_awaited()
+
+
+# --- Pay flow right after registration ------------------------------------------
+
+
+def confirm_registration(conn):
+    context = make_context(conn)
+    context.user_data.update({"full_name": "Alice Tan", "sutd_id": "1010654"})
+    update = make_update(text="yes")
+    assert asyncio.run(bot.on_confirm(update, context)) == ConversationHandler.END
+    return update
+
+
+def test_registration_mid_term_shows_shirt_choice(conn):
+    create_priced_term(conn)
+    update = confirm_registration(conn)
+    assert "collection is open" in update.message.reply_text.call_args_list[0].args[0]
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    assert button_labels(markup) == ["With shirt (S$30.00)", "Without shirt (S$25.00)"]
+
+
+def test_registration_without_term_shows_no_pay_flow(conn):
+    update = confirm_registration(conn)
+    assert update.message.reply_text.await_count == 1
+    assert "You're registered" in reply_text_of(update)
+
+
+# --- Gemini failure: keep pending, retry from file_id ---------------------------
+
+
+class FailingExtractor:
+    def __init__(self):
+        self.calls = 0
+
+    async def extract(self, image_bytes, mime_type):
+        self.calls += 1
+        raise RuntimeError("Gemini 503")
+
+
+def setup_receipt(conn):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    db.ensure_treasurer(conn, 999)
+    term = create_active_term(conn)
+    payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    return db.mark_qr_issued(conn, payment["id"])
+
+
+def valid_extraction():
+    return ExtractedPayment(
+        readable=True,
+        is_success_screen=True,
+        amount_cents=5,
+        recipient="Singapore University of Technology and Design",
+        billing_id=SCHOOL_BILL_NUMBER,
+        payment_timestamp=datetime.now(SINGAPORE_TIME).isoformat(),
+        transaction_id="TX-RETRY-1",
+    )
+
+
+def receipt_context(conn, extractor):
+    context = make_context(conn, extractor)
+    context.bot.send_photo = AsyncMock()
+    telegram_file = MagicMock(file_path="photos/file_1.jpg")
+    telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"receipt-image"))
+    context.bot.get_file.return_value = telegram_file
+    return context
+
+
+def submit_failing_receipt(conn):
+    update = make_update()
+    update.message.photo = [MagicMock(file_id="FILE-R", file_size=100)]
+    asyncio.run(bot.on_receipt(update, receipt_context(conn, FailingExtractor())))
+    return update
+
+
+IMAGE_HASH = "8e4998746c757d9ed5f2fb597c8be52ec501a71637d0cdf83a5c1068ce564f94"
+
+
+def test_extraction_failure_keeps_payment_pending_with_hash_reserved(conn):
+    payment = setup_receipt(conn)
+    update = submit_failing_receipt(conn)
+    saved = db.get_payment(conn, payment["id"])
+    assert saved["status"] == "pending_verification"
+    assert saved["screenshot_file_id"] == "FILE-R"
+    assert saved["extract_attempts"] == 1
+    assert saved["last_extract_error_at"] is not None
+    assert "verify it automatically shortly" in reply_text_of(update)
+    # The fingerprint stays reserved: nobody can reuse the image meanwhile.
+    assert not db.reserve_receipt_image(conn, payment_id=payment["id"], image_hash=IMAGE_HASH)
+    # Resending the same image is acknowledged, not rejected as reuse.
+    update = submit_failing_receipt(conn)
+    assert "already have this receipt" in reply_text_of(update)
+
+
+def test_retry_success_reaches_verification(conn):
+    payment = setup_receipt(conn)
+    submit_failing_receipt(conn)
+    context = receipt_context(conn, FakeExtractor(valid_extraction()))
+    asyncio.run(bot.retry_failed_extractions(context))
+    saved = db.get_payment(conn, payment["id"])
+    assert saved["status"] == "verified"
+    assert saved["bank_txn_id"] == "TXRETRY1"
+    context.bot.get_file.assert_awaited_with("FILE-R")
+    assert context.bot.send_message.call_args.kwargs["chat_id"] == 111
+    assert "accepted" in context.bot.send_message.call_args.kwargs["text"]
+
+
+def test_crash_stuck_pending_payment_is_not_retried(conn):
+    payment = setup_receipt(conn)
+    db.reserve_receipt_image(conn, payment_id=payment["id"], image_hash=IMAGE_HASH)
+    db.mark_payment_pending(conn, payment["id"], screenshot_file_id="F", image_hash=IMAGE_HASH)
+    assert db.list_extraction_retries(conn, bot.MAX_EXTRACT_ATTEMPTS) == []
+
+
+def test_retry_gives_up_after_four_attempts_and_notifies_treasurer_once(conn):
+    payment = setup_receipt(conn)
+    submit_failing_receipt(conn)  # attempt 1
+    context = receipt_context(conn, FailingExtractor())
+    for _ in range(5):  # attempts 2-4, then nothing is left to retry
+        asyncio.run(bot.retry_failed_extractions(context))
+    assert context.bot_data["extractor"].calls == 3
+    saved = db.get_payment(conn, payment["id"])
+    assert saved["status"] == "exception"
+    assert saved["extract_attempts"] == bot.MAX_EXTRACT_ATTEMPTS
+    sent = context.bot.send_message.call_args_list
+    to_treasurer = [c for c in sent if c.kwargs["chat_id"] == 999]
+    assert len(to_treasurer) == 1
+    assert to_treasurer[0].kwargs["reply_markup"] is not None  # Approve/Reject
+    assert context.bot.send_photo.call_args.kwargs["photo"] == "FILE-R"
+    to_member = [c for c in sent if c.kwargs["chat_id"] == 111]
+    assert len(to_member) == 1 and "treasurer" in to_member[0].kwargs["text"]
+    # Still reserved after giving up, and the treasurer can approve it.
+    assert not db.reserve_receipt_image(conn, payment_id=payment["id"], image_hash=IMAGE_HASH)
+    assert db.review_payment(conn, payment["id"], approve=True)["status"] == "verified"
+
+
+def test_both_paths_share_the_post_extraction_step(conn, monkeypatch):
+    calls = []
+
+    async def spy(context, payment, extracted, reply):
+        calls.append(payment["id"])
+
+    monkeypatch.setattr(bot, "_finish_receipt", spy)
+    payment = setup_receipt(conn)
+    update = make_update()
+    update.message.photo = [MagicMock(file_id="FILE-S", file_size=100)]
+    extractor = FakeExtractor(valid_extraction())
+    asyncio.run(bot.on_receipt(update, receipt_context(conn, extractor)))
+    db.record_extract_failure(conn, payment["id"])  # as if that check had failed
+    asyncio.run(bot.retry_failed_extractions(receipt_context(conn, extractor)))
+    assert calls == [payment["id"], payment["id"]]

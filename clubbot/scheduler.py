@@ -22,6 +22,7 @@ REMINDER_HOUR = 10  # 10:00 SGT for term-start blast and day-7 reminder
 BACKUP_HOUR = 3     # 03:00 SGT Sunday database backup to the treasurer
 SHEET_HOUR = 2      # 02:30 SGT nightly full Sheet rebuild
 SHEET_SYNC_DELAY = timedelta(seconds=30)  # debounce for on-change syncs
+EXTRACT_RETRY_INTERVAL = timedelta(minutes=15)  # Gemini-failure receipt retries
 
 
 # --- Pure run-time calculators (no I/O) ----------------------------------------
@@ -234,6 +235,14 @@ async def _job_backup(context) -> None:
     await do_weekly_backup(context.bot, context.bot_data["db"])
 
 
+async def _job_retry_extractions(context) -> None:
+    # Imported here: bot imports this module, and the shared verification
+    # path lives in bot.
+    from clubbot import bot
+
+    await bot.retry_failed_extractions(context)
+
+
 def _arm_term_job(
     jq, kind: str, term_id: int, when: datetime, now: datetime
 ) -> None:
@@ -287,6 +296,9 @@ def schedule_all(app, conn: sqlite3.Connection) -> None:
         _job_sheet_sync,
         time=time(hour=SHEET_HOUR, minute=30, tzinfo=SINGAPORE_TIME),
         name="sheet-nightly",
+    )
+    jq.run_repeating(
+        _job_retry_extractions, interval=EXTRACT_RETRY_INTERVAL, name="extract-retry"
     )
 
 

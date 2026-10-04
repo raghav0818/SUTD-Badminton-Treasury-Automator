@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import mimetypes
 import sqlite3
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -36,6 +38,14 @@ log = logging.getLogger(__name__)
 
 ASK_NAME, ASK_SUTD_ID, CONFIRM = range(3)
 MAX_RECEIPT_BYTES = 8 * 1024 * 1024
+MAX_EXTRACT_ATTEMPTS = 4  # the first try plus three 15-minute retries
+# Settings written by /setgroup; registration requires being in one of them.
+CLUB_GROUP_KEYS = ("rec_group_id", "comp_group_id")
+IN_GROUP_STATUSES = {
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.OWNER,
+}
 
 WELCOME = (
     "Welcome to the SUTD Badminton Club bot!\n\n"
@@ -71,6 +81,12 @@ RELINKED = (
 RELINK_EXPIRED = (
     "This relink is no longer active. Ask the treasurer to run /relink again, "
     "then re-register with /start."
+)
+REGISTERED_TERM_OPEN = "You're registered, {name}! Membership fee collection is open now."
+NOT_IN_CLUB = (
+    "Sorry, registration is only for club members. Please join the club's "
+    "Telegram group first, then send /start again.\n"
+    "(Competitive players on the roster can register with their SUTD ID.)"
 )
 REGISTRATION_FAILED = (
     "Registration could not be completed (the SUTD ID may have just been "
@@ -151,8 +167,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         else:
             await update.message.reply_text(_status_text(_db(context), member))
         return ConversationHandler.END
+    # Someone outside the club groups may still be on the roster, which needs
+    # their SUTD ID, so they continue and on_sutd_id makes the final call.
+    context.user_data["in_club_group"] = await _in_club_group(
+        context, update.effective_user.id
+    )
     await update.message.reply_text(WELCOME)
     return ASK_NAME
+
+
+async def _in_club_group(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """True if no club group is configured yet, or the user is in one of them."""
+    group_ids = [
+        value for key in CLUB_GROUP_KEYS if (value := db.get_setting(_db(context), key))
+    ]
+    if not group_ids:
+        return True
+    for chat_id in group_ids:
+        try:
+            member = await context.bot.get_chat_member(int(chat_id), user_id)
+        except Exception:
+            # Bot removed from the group, bad stored id, network: not in it.
+            log.warning("getChatMember failed for group %s", chat_id, exc_info=True)
+            continue
+        if member.status in IN_GROUP_STATUSES or (
+            member.status == ChatMemberStatus.RESTRICTED
+            and getattr(member, "is_member", False)
+        ):
+            return True
+    return False
 
 
 async def on_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -175,6 +218,13 @@ async def on_sutd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text(SUTD_ID_TAKEN)
             return ASK_SUTD_ID
         context.user_data["relink"] = True
+    elif not context.user_data.get("in_club_group") and (
+        db.member_category(_db(context), {"sutd_id": sutd_id}) != "competitive"
+    ):
+        # Neither in a club group nor on the roster.
+        context.user_data.clear()
+        await update.message.reply_text(NOT_IN_CLUB)
+        return ConversationHandler.END
     context.user_data["sutd_id"] = sutd_id
     await update.message.reply_text(
         CONFIRM_PROMPT.format(name=context.user_data["full_name"], sutd_id=sutd_id)
@@ -219,9 +269,16 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             context.user_data.clear()
             await update.message.reply_text(REGISTRATION_FAILED)
             return ConversationHandler.END
+        relinked = context.user_data.get("relink")
         context.user_data.clear()
         scheduler.request_sheet_sync(context.application)
-        await update.message.reply_text(reply)
+        if relinked or db.get_active_term(_db(context)) is None:
+            await update.message.reply_text(reply)
+            return ConversationHandler.END
+        # Registered while collection is open (usually after the term-start
+        # blast went out): go straight into the pay flow.
+        await update.message.reply_text(REGISTERED_TERM_OPEN.format(name=name))
+        await cmd_pay(update, context)
         return ConversationHandler.END
     if answer in ("no", "n"):
         context.user_data.clear()
@@ -500,6 +557,15 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("That image is too large. Please send one under 8 MB.")
         return
     image_hash = hashlib.sha256(image_bytes).hexdigest()
+    if (
+        payment["status"] == "pending_verification"
+        and payment["last_extract_error_at"]
+        and payment["image_hash"] == image_hash
+    ):
+        await update.message.reply_text(
+            "I already have this receipt and will verify it automatically shortly."
+        )
+        return
     if not db.reserve_receipt_image(
         conn, payment_id=payment["id"], image_hash=image_hash
     ):
@@ -519,15 +585,36 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         extracted = await extractor.extract(image_bytes, mime_type)
     except Exception:
         log.exception("Receipt extraction failed for payment %s", payment["id"])
-        db.release_receipt_image(
-            conn, payment_id=payment["id"], image_hash=image_hash
-        )
-        db.reset_payment_for_retry(conn, payment["id"])
+        # Stay pending with the hash reserved; the retry job re-downloads the
+        # image from screenshot_file_id (in memory) and finishes the check.
+        db.record_extract_failure(conn, payment["id"])
         await update.message.reply_text(
-            "The receipt service is temporarily unavailable. Please try the same image again later."
+            "Receipt received. The checker is busy right now, so I'll verify "
+            "it automatically shortly. No need to send it again."
         )
         return
+    await _finish_receipt(
+        context,
+        db.get_payment(conn, payment["id"]),
+        extracted,
+        update.message.reply_text,
+    )
 
+
+async def _finish_receipt(
+    context: ContextTypes.DEFAULT_TYPE,
+    payment: sqlite3.Row,
+    extracted,
+    reply,
+) -> None:
+    """Everything after a successful extraction: verify, save, notify.
+
+    Shared by fresh receipts (on_receipt) and the retry job. `payment` is a
+    db.get_payment row (it carries the term's dates and fees); `reply(text)`
+    messages the member.
+    """
+    conn = _db(context)
+    image_hash = payment["image_hash"]
     transaction_id = normalise_transaction_id(extracted.transaction_id)
     duplicate_txn = False
     if transaction_id:
@@ -539,9 +626,9 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
     result = verify_extracted_payment(
         extracted,
-        valid_amounts=db.valid_amounts(term, payment["category"]),
-        term_start=term["start_date"],
-        term_end=term["end_date"],
+        valid_amounts=db.valid_amounts(payment, payment["category"]),
+        term_start=payment["start_date"],
+        term_end=payment["end_date"],
         qr_issued_at=payment["qr_issued_at"],
         duplicate_transaction=duplicate_txn,
         school=school_config(conn),
@@ -555,7 +642,7 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             conn, payment_id=payment["id"], image_hash=image_hash
         )
         db.reset_payment_for_retry(conn, payment["id"])
-        await update.message.reply_text(
+        await reply(
             "I couldn't verify that image:\n- "
             + "\n- ".join(result.reasons)
             + "\n\nPlease send a clear completed-payment screenshot."
@@ -577,13 +664,13 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     scheduler.request_sheet_sync(context.application)
     if result.passed:
-        await update.message.reply_text(
-            f"Payment receipt accepted.\n\n{term['name']}\n"
+        await reply(
+            f"Payment receipt accepted.\n\n{payment['term_name']}\n"
             f"Amount: {money(extracted.amount_cents)}\nStatus: Verified"
         )
         return
 
-    await update.message.reply_text(
+    await reply(
         "Your receipt needs treasurer review. You will be notified after it is checked."
     )
     try:
@@ -592,6 +679,76 @@ async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # The payment stays in 'exception' (visible in /stats); don't crash the
         # handler just because the treasurer DM failed.
         log.exception("Treasurer notification failed for payment %s", payment["id"])
+
+
+async def retry_failed_extractions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Retry receipts whose Gemini extraction failed (run by the JobQueue).
+
+    The image is re-downloaded from the stored Telegram file_id into memory
+    only. After MAX_EXTRACT_ATTEMPTS failures the payment goes to the
+    treasurer's Approve/Reject review. Never raises.
+    """
+    conn = _db(context)
+    extractor = context.bot_data.get("extractor")
+    if extractor is None:
+        return
+    for payment in db.list_extraction_retries(conn, MAX_EXTRACT_ATTEMPTS):
+        try:
+            await _retry_one(context, extractor, payment)
+        except Exception:
+            log.exception("Extraction retry failed for payment %s", payment["id"])
+
+
+async def _retry_one(context, extractor, payment: sqlite3.Row) -> None:
+    conn = _db(context)
+    member_id = payment["telegram_user_id"]
+
+    async def reply(text: str) -> None:
+        await context.bot.send_message(chat_id=member_id, text=text)
+
+    try:
+        telegram_file = await context.bot.get_file(payment["screenshot_file_id"])
+        image_bytes = bytes(await telegram_file.download_as_bytearray())
+        mime_type = mimetypes.guess_type(telegram_file.file_path or "")[0]
+        extracted = await extractor.extract(image_bytes, mime_type or "image/jpeg")
+    except Exception:
+        log.warning("Extraction retry failed for payment %s", payment["id"], exc_info=True)
+        if db.record_extract_failure(conn, payment["id"]) < MAX_EXTRACT_ATTEMPTS:
+            return
+        # Out of retries: a human checks it. Moving to 'exception' also stops
+        # further retries, so the treasurer is told exactly once.
+        db.mark_payment_exception(conn, payment["id"])
+        scheduler.request_sheet_sync(context.application)
+        await reply(
+            "I still couldn't check your receipt automatically, so the treasurer "
+            "will check it by hand. You'll be notified once it's done."
+        )
+        try:
+            await context.bot.send_photo(
+                chat_id=db.get_treasurer_id(conn),
+                photo=payment["screenshot_file_id"],
+                caption=f"Receipt from {payment['full_name']} (automatic check failed)",
+            )
+        except Exception:
+            log.warning("Could not forward receipt %s", payment["id"], exc_info=True)
+        try:
+            await _notify_treasurer(
+                context,
+                payment["id"],
+                (f"automatic receipt check failed {MAX_EXTRACT_ATTEMPTS} times; "
+                 "check the screenshot above",),
+            )
+        except Exception:
+            log.exception("Treasurer notification failed for payment %s", payment["id"])
+        return
+    # The member may have sent a new receipt while Gemini was working.
+    current = db.get_payment(conn, payment["id"])
+    if (
+        current["status"] != "pending_verification"
+        or current["screenshot_file_id"] != payment["screenshot_file_id"]
+    ):
+        return
+    await _finish_receipt(context, current, extracted, reply)
 
 
 async def _notify_treasurer(

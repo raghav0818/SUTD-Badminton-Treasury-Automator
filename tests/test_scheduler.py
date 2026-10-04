@@ -269,6 +269,7 @@ def test_schedule_all_smoke(conn):
     jobs = {job.name for job in app.job_queue.jobs()}
     assert "weekly-backup" in jobs
     assert "term-job-rearm" in jobs
+    assert "extract-retry" in jobs
     assert len(app.job_queue.jobs()) >= 1
 
 
