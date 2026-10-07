@@ -12,10 +12,10 @@ session** — that is how sessions hand off. The full design/PRD is at
 `docs/superpowers/specs/2026-06-11-club-payment-bot-design.md`; read it before
 changing payment or verification logic.
 
-## Status (2026-10-04)
+## Status (2026-10-07)
 
-- **v2 is built on branch `v2-build` (not merged to `main`, not pushed, not
-  deployed).** It implements every item in
+- **v2 is merged to `main` and pushed (2026-10-07); not
+  yet deployed.** It implements every item in
   `docs/superpowers/specs/2026-10-04-v2-build-list.md` (A–D): Gemini
   `gemini-3.1-flash-lite`, git-clone deploy + `deploy/update.sh`, Sunday DB
   backup DM, four prices + shirt/size buttons, `/roster` (competitive =
@@ -32,7 +32,7 @@ changing payment or verification logic.
   guarantees getChatMember lookups for admin bots). Reminders/group posts
   are stamped per recipient after delivery (failures retry hourly that day).
   **v2 has never run on real Telegram** — only the test suite. Next step is
-  the treasurer's OK to merge + push (asked, not yet answered).
+  Pi setup (launch checklist step 2).
 - **v1 (on `main`)** was live-proven on real Telegram (registration + a real
   S$0.05 auto-verified payment). Bot name **SUTD ShuttleBuddy**, handle
   `@MyClubFinanceBot`. Scheduled jobs never observed over a real term.
@@ -42,13 +42,17 @@ changing payment or verification logic.
   copy of the secrets). Pi: user `blud`, host `blud.local`, service `clubbot`.
 - **Beware a stale parallel copy** at `Documents\SUTD Projects\Badmintion Tele Bot`
   (remote `badminton-tele-bot`). THIS repo is the source of truth.
-- **Treasurer-side open items:** turn on Gemini billing and put the new key
-  in `.env`; share the Google Sheet with the service account
-  (`firebase-adminsdk-fbsvc@clubsync-e7436.iam.gserviceaccount.com`).
+- **Google side moved (2026-10-07)** to its own Firebase project
+  `badminton-club-bot` (clubsync is the treasurer's other app — don't use it).
+  Service account `firebase-adminsdk-fbsvc@badminton-club-bot.iam.gserviceaccount.com`;
+  Sheet ID `1ftRLbA3kDXmMi5dyukQFgkwhMsv97ACSt7UNLeuUA1o`. On the laptop,
+  `.env` + `service-account.json` pass all three preflight checks; copy both
+  to the Pi. Open: whether the Gemini key is from the new project, and
+  whether billing (Firebase Blaze) is on — the bot works either way.
 
 ### Launch checklist (remaining user actions)
 
-1. Merge `v2-build` → `main`, push (repo is public; the Pi pulls from GitHub).
+1. ~~Merge + push~~ done 2026-10-07.
 2. Fresh Pi setup per README; all three `scripts/preflight.py` lines PASS.
 3. Smoke test on real Telegram: a short test term, register, one small
    real payment (with and without shirt), `/stats`, a `/setgroup` group post.
@@ -134,7 +138,8 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
 - Treasurer; email clubsync26@gmail.com; non-expert builder.
 - Wants zero recurring manual work beyond exception taps + the weekly digest.
 - Prefers Gemini (free tier) for the VLM; free-vs-paid decision still open.
-- Google side lives in the `clubsync-e7436` Cloud/Firebase project.
+- Google side lives in the `badminton-club-bot` Firebase project (chosen
+  over a plain Cloud project by the treasurer).
 
 ## History (condensed)
 
@@ -170,5 +175,8 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   no weekly-backup catch-up, v1 migration not seeding the d7 stamp, Shirts tab
   clearing after a term, `/setgroup` needing the bot to be group admin).
   205 tests pass. Not merged, pushed or live-tested.
+- **2026-10-07** — v2 merged to `main` and pushed (`3b693f1`). Google side
+  moved off clubsync to Firebase project `badminton-club-bot`; laptop
+  preflight 3/3 PASS. Next: Pi setup.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).
