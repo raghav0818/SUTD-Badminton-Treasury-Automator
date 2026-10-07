@@ -42,8 +42,10 @@ changing payment or verification logic.
   (`ssh blud@100.117.79.93` works from the laptop via Tailscale SSH; sudo
   needs the treasurer's password). Claude cloned `~/clubbot`, copied `.env`
   + `service-account.json` (chmod 600), built `.venv`; preflight 3/3 PASS on
-  the Pi. Remaining: treasurer runs `bash ~/clubbot/deploy/setup_pi.sh`
-  (needs sudo) to install + start the systemd service `clubbot`.
+  the Pi. Treasurer ran `setup_pi.sh`: service `clubbot` is enabled and
+  running v2 (first backup DM sent). Deploying later changes: Claude can
+  `git pull` + `pip install` over ssh, but the restart needs the
+  treasurer (`sudo systemctl restart clubbot`, or `bash ~/clubbot/deploy/update.sh`).
 - **Beware a stale parallel copy** at `Documents\SUTD Projects\Badmintion Tele Bot`
   (remote `badminton-tele-bot`). THIS repo is the source of truth.
 - **Google side moved (2026-10-07)** to its own Firebase project
@@ -120,7 +122,8 @@ changing payment or verification logic.
 | File | What it is |
 |---|---|
 | `clubbot/bot.py` | Telegram wiring: registration conversation, /pay, receipt intake, review buttons, edited-message guard |
-| `clubbot/admin.py` | All admin/treasurer commands |
+| `clubbot/admin.py` | All admin/treasurer commands except /newterm; per-role `/` menus; Confirm / tap-list callbacks (`cf:` `mp:` `ra:` `rl:x:`) |
+| `clubbot/newterm.py` | `/newterm`: one-line parser + the tap-through wizard (`nt:<key>:<value>` buttons) |
 | `clubbot/payments.py` | QR building + the deterministic verification rules; `SchoolConfig` (settings-overridable school values) |
 | `clubbot/paynow.py` | EMVCo/PayNow TLV payload builder/parser + CRC-16 (golden vector in `tests/test_paynow.py`) |
 | `clubbot/qrgen.py` | payload → PNG |
@@ -181,6 +184,17 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   205 tests pass. Not merged, pushed or live-tested.
 - **2026-10-07** — v2 merged to `main` and pushed (`3b693f1`). Google side
   moved off clubsync to Firebase project `badminton-club-bot`; laptop
-  preflight 3/3 PASS. Next: Pi setup.
+  preflight 3/3 PASS. Pi set up over Tailscale and running v2. Stopped
+  httpx from logging the bot token (`d39147a`). Then "tap instead of type"
+  (`docs/superpowers/specs/2026-10-07-easier-commands-plan.md`, research in
+  `docs/research/2026-10-07-easier-admin-commands.md`): `/newterm` alone =
+  button wizard in `clubbot/newterm.py` (one-time key per question so old
+  buttons are refused; nothing created until Create term); per-role `/`
+  menus via setMyCommands (synced at startup, on role changes, relink,
+  /help); Confirm buttons on /markpaid /revoke /transfertreasurer; Mark-paid
+  buttons on /unpaid (≤30); tap lists for /removeadmin and /relink; long
+  replies split under 4096 chars; PTB pinned `>=22.8,<23`. Codex review: 6
+  findings, all fixed (`80f9a8f`); 231 tests pass. Pulled onto the Pi;
+  needs a restart to go live. Real-Telegram test run still not done.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).
