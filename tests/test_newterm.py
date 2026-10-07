@@ -51,8 +51,14 @@ def last_sent(context) -> str:
 
 
 def buttons(context) -> list[tuple[str, str]]:
+    """(label, value) of the latest question's buttons."""
     markup = context.bot.send_message.call_args.kwargs["reply_markup"]
-    return [(row[0].text, row[0].callback_data) for row in markup.inline_keyboard]
+    return [(row[0].text, row[0].callback_data.split(":", 2)[2]) for row in markup.inline_keyboard]
+
+
+def tap(context, value):
+    """Tap a button on the latest question."""
+    return tapped(f"nt:{context.user_data['nt']['key']}:{value}")
 
 
 def run(handler, update, context):
@@ -77,20 +83,20 @@ def add_last_term(conn):
 def test_wizard_with_same_prices_as_last_term_is_all_taps(conn, context):
     add_last_term(conn)
     assert run(newterm.cmd_newterm, typed("/newterm"), context) == newterm.NAME
-    assert buttons(context) == [("Term 2", "nt:name:suggested")]
-    assert run(newterm.on_name, tapped("nt:name:suggested"), context) == newterm.START
+    assert buttons(context) == [("Term 2", "suggested")]
+    assert run(newterm.on_name, tap(context, "suggested"), context) == newterm.START
     assert run(newterm.on_start, typed("2026-09-07"), context) == newterm.END
     same_length = buttons(context)[0]
-    assert same_length == ("Same length as last term (Sun 6 Dec 2026)", "nt:end:2026-12-06")
-    assert run(newterm.on_end, tapped(same_length[1]), context) == newterm.DEADLINE
+    assert same_length == ("Same length as last term (Sun 6 Dec 2026)", "2026-12-06")
+    assert run(newterm.on_end, tap(context, same_length[1]), context) == newterm.DEADLINE
     two_weeks = buttons(context)[0][1]
-    assert two_weeks == "nt:deadline:2026-09-21"
-    assert run(newterm.on_deadline, tapped(two_weeks), context) == newterm.FEES
+    assert two_weeks == "2026-09-21"
+    assert run(newterm.on_deadline, tap(context, two_weeks), context) == newterm.FEES
     assert "All same as last term" in buttons(context)[0][0]
-    assert run(newterm.on_fee, tapped("nt:fee:all"), context) == newterm.CONFIRM
+    assert run(newterm.on_fee, tap(context, "all"), context) == newterm.CONFIRM
     assert "Name: Term 2" in last_sent(context)
     assert db.list_terms(conn)[-1]["name"] == "Term 1"  # nothing until Create
-    assert run(newterm.on_confirm, tapped("nt:confirm:create"), context) == ConversationHandler.END
+    assert run(newterm.on_confirm, tap(context, "create"), context) == ConversationHandler.END
     term = db.list_terms(conn)[-1]
     assert (term["name"], term["start_date"], term["end_date"], term["deadline"]) == (
         "Term 2", "2026-09-07", "2026-12-06", "2026-09-21"
@@ -110,7 +116,7 @@ def test_wizard_first_term_typed_prices_without_shirts(conn, context):
         state = run(newterm.on_fee, typed(amount), context)
     assert state == newterm.CONFIRM
     assert "No shirts this term" in last_sent(context)
-    run(newterm.on_confirm, tapped("nt:confirm:create"), context)
+    run(newterm.on_confirm, tap(context, "create"), context)
     term = db.list_terms(conn)[-1]
     assert newterm.last_term_fees(term) == (2000, 2500, 2500, 0)
     assert not db.offers_shirt(term, "competitive")
@@ -143,8 +149,8 @@ def test_wizard_cancel_creates_nothing(conn, context):
 
 def test_wizard_cancel_button_creates_nothing(conn, context):
     add_last_term(conn)
-    context.user_data["nt"] = {"fees": [1, 1, 1, 0]}
-    assert run(newterm.on_confirm, tapped("nt:confirm:cancel"), context) == ConversationHandler.END
+    context.user_data["nt"] = {"fees": [1, 1, 1, 0], "key": "k1"}
+    assert run(newterm.on_confirm, tapped("nt:k1:cancel"), context) == ConversationHandler.END
     assert "Nothing was created" in last_sent(context)
     assert len(db.list_terms(conn)) == 1
 
@@ -156,8 +162,8 @@ def test_wizard_create_reports_overlap_instead_of_crashing(conn, context):
     run(newterm.on_start, typed("2026-02-01"), context)
     run(newterm.on_end, typed("2026-03-01"), context)
     run(newterm.on_deadline, typed("2026-02-10"), context)
-    run(newterm.on_fee, tapped("nt:fee:all"), context)
-    assert run(newterm.on_confirm, tapped("nt:confirm:create"), context) == ConversationHandler.END
+    run(newterm.on_fee, tap(context, "all"), context)
+    assert run(newterm.on_confirm, tap(context, "create"), context) == ConversationHandler.END
     assert "overlap" in last_sent(context)
     assert len(db.list_terms(conn)) == 1
 
@@ -170,7 +176,7 @@ def test_wizard_is_treasurer_only(conn, context):
 
 
 def test_expired_wizard_button_is_answered(context):
-    update = tapped("nt:start:2026-09-01")
+    update = tapped("nt:abc123:2026-09-01")
     asyncio.run(newterm.on_expired(update, context))
     assert "expired" in update.callback_query.answer.call_args.args[0]
 
@@ -184,3 +190,40 @@ def test_helpers():
     assert newterm.nice(date(2026, 9, 1)) == "Tue 1 Sep 2026"
     with pytest.raises(ValueError):
         newterm.parse_date("2026/13/01")
+
+
+def _to_fees(conn, context, name="Term 2"):
+    run(newterm.cmd_newterm, typed("/newterm"), context)
+    run(newterm.on_name, typed(name), context)
+    run(newterm.on_start, typed("2026-09-07"), context)
+    run(newterm.on_end, typed("2026-12-06"), context)
+    run(newterm.on_deadline, typed("2026-09-21"), context)
+
+
+def test_old_price_buttons_cannot_override_a_typed_price(conn, context):
+    add_last_term(conn)
+    _to_fees(conn, context)
+    all_same = tap(context, "all")  # button on the first price question
+    assert run(newterm.on_fee, typed("22"), context) == newterm.FEES
+    assert run(newterm.on_fee, all_same, context) == newterm.FEES  # refused
+    assert "earlier step" in all_same.callback_query.answer.call_args.args[0]
+    assert context.user_data["nt"]["fees"] == [2200]
+
+
+def test_create_button_from_an_older_wizard_is_refused(conn, context):
+    add_last_term(conn)
+    _to_fees(conn, context, name="Form A")
+    run(newterm.on_fee, tap(context, "all"), context)
+    old_create = tap(context, "create")  # wizard A's Create button
+    _to_fees(conn, context, name="Form B")  # restart: wizard B
+    run(newterm.on_fee, tap(context, "all"), context)
+    assert run(newterm.on_confirm, old_create, context) == newterm.CONFIRM
+    assert len(db.list_terms(conn)) == 1  # nothing created
+
+
+def test_wizard_whose_data_was_cleared_ends_cleanly(conn, context):
+    handlers = newterm.build_handlers(None)
+    on_start = handlers[0].states[newterm.START][1].callback
+    context.user_data.clear()  # e.g. wiped by another flow
+    assert run(on_start, typed("2026-09-07"), context) == ConversationHandler.END
+    assert "expired" in last_sent(context)

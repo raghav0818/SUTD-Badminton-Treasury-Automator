@@ -756,9 +756,25 @@ def test_relink_cancel_button(conn):
     update, context = make_update(user_id=999), make_context(conn)
     asyncio.run(admin.cmd_relink(update, context))
     markup = update.message.reply_text.call_args.kwargs["reply_markup"]
-    tap = make_callback(markup.inline_keyboard[0][0].callback_data)
+    old_button = markup.inline_keyboard[0][0].callback_data
+    tap = make_callback(old_button)
     asyncio.run(admin.on_relink_cancel(tap, context))
     assert not db.relink_armed(conn, "1007654")
+
+
+def test_old_relink_cancel_button_keeps_a_newer_arming(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.set_setting(conn, "relink:1007654", "2026-10-07T01:00:00+00:00")
+    update, context = make_update(user_id=999), make_context(conn)
+    db.set_setting(conn, "relink:1007654", db._utc_now())
+    asyncio.run(admin.cmd_relink(update, context))
+    fresh_button = update.message.reply_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
+    stale = fresh_button.callback_data.rsplit(":", 1)[0] + ":1"
+    tap = make_callback(stale)
+    asyncio.run(admin.on_relink_cancel(tap, context))
+    assert db.relink_armed(conn, "1007654")
+    assert "re-armed" in tap.callback_query.edit_message_text.call_args.args[0]
 
 
 def test_command_menu_per_role(conn):

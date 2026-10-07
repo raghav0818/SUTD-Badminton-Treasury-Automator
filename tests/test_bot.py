@@ -39,6 +39,8 @@ def make_context(conn, extractor=None):
     context.args = []
     context.bot.get_file = AsyncMock()
     context.bot.send_message = AsyncMock()
+    context.bot.set_my_commands = AsyncMock()
+    context.bot.delete_my_commands = AsyncMock()
     # No real JobQueue in unit tests; /newterm's live scheduling is a no-op here
     # and is covered directly in test_scheduler.py.
     context.application.job_queue = None
@@ -147,6 +149,23 @@ def test_relink_registration_moves_history(conn):
     assert db.get_member(conn, 111) is None
     assert db.get_payment(conn, payment["id"])["telegram_user_id"] == 555
     assert not db.relink_armed(conn, "1010654")
+
+
+def test_relinked_admin_keeps_admin_menu_on_new_account(conn):
+    db.ensure_treasurer(conn, 999)
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    db.arm_relink(conn, "1010654")
+    context = make_context(conn)
+    context.user_data.update({"full_name": "Alice Tan", "in_club_group": True})
+    asyncio.run(bot.on_sutd_id(make_update(user_id=555, text="1010654"), context))
+    asyncio.run(bot.on_confirm(make_update(user_id=555, text="yes"), context))
+    assert db.get_role(conn, 555) == "admin"
+    new_scope = context.bot.set_my_commands.call_args.kwargs["scope"]
+    assert new_scope.chat_id == 555
+    assert context.bot.delete_my_commands.call_args.kwargs["scope"].chat_id == 111
 
 
 def test_relink_confirm_after_disarm_is_blocked(conn):

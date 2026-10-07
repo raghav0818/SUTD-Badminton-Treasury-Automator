@@ -250,6 +250,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     context.user_data.clear()
                     await update.message.reply_text(RELINK_EXPIRED)
                     return ConversationHandler.END
+                old_id = db.get_member_by_sutd_id(_db(context), sutd_id)["telegram_user_id"]
                 db.relink_member(
                     _db(context),
                     sutd_id=sutd_id,
@@ -258,6 +259,8 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     username=user.username,
                 )
                 db.disarm_relink(_db(context), sutd_id)
+                for user_id in (old_id, user.id):
+                    await admin.sync_command_menu(context.bot, _db(context), user_id)
                 reply = RELINKED.format(name=name)
             else:
                 db.add_member(
@@ -311,6 +314,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = HELP_TEXT
     if db.get_role(_db(context), update.effective_user.id) in ("treasurer", "admin"):
         text += ADMIN_HELP
+        # Re-sync this admin's / menu in case a role-change update failed.
+        await admin.sync_command_menu(context.bot, _db(context), update.effective_user.id)
     await update.message.reply_text(text)
 
 
@@ -830,6 +835,8 @@ def build_application(
     app.add_handler(TypeHandler(Update, _ignore_edited), group=-1)
     # The bot also sits in the club groups (/setgroup, progress posts): keep
     # registration, payments, receipts and admin output out of them.
+    for handler in newterm.build_handlers(PRIVATE):
+        app.add_handler(handler)
     registration = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start, filters=PRIVATE)],
         states={
@@ -844,8 +851,6 @@ def build_application(
     app.add_handler(registration)
     app.add_handler(CommandHandler("status", cmd_status, filters=PRIVATE))
     app.add_handler(CommandHandler("help", cmd_help, filters=PRIVATE))
-    for handler in newterm.build_handlers(PRIVATE):
-        app.add_handler(handler)
     app.add_handler(CommandHandler("pay", cmd_pay, filters=PRIVATE))
     app.add_handler(CommandHandler("unpaid", admin.cmd_unpaid, filters=PRIVATE))
     app.add_handler(CommandHandler("stats", admin.cmd_stats, filters=PRIVATE))
@@ -879,7 +884,7 @@ def build_application(
     )
     app.add_handler(CallbackQueryHandler(admin.on_markpaid_pick, pattern=r"^mp:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(admin.on_removeadmin_pick, pattern=r"^ra:\d+$"))
-    app.add_handler(CallbackQueryHandler(admin.on_relink_cancel, pattern=r"^rl:x:\d{7}$"))
+    app.add_handler(CallbackQueryHandler(admin.on_relink_cancel, pattern=r"^rl:x:\d{7}:\d+$"))
     app.add_handler(
         MessageHandler(PRIVATE & (filters.PHOTO | filters.Document.IMAGE), on_receipt)
     )

@@ -7,6 +7,7 @@ final [Create term] tap, so a restart or /cancel mid-way loses nothing.
 from __future__ import annotations
 
 import re
+import secrets
 import sqlite3
 import warnings
 from datetime import date, datetime, timedelta
@@ -30,6 +31,7 @@ NAME, START, END, DEADLINE, FEES, CONFIRM = range(6)
 NOT_TREASURER = "Only the treasurer can create a term."
 CANCELLED = "New term cancelled. Nothing was created."
 EXPIRED = "This button has expired. Send /newterm to start again."
+OLD_STEP = "That button is from an earlier step. Use the latest message."
 
 
 def _parse_fee_cents(value: str, *, allow_zero: bool = False) -> int:
@@ -169,25 +171,38 @@ def last_term_fees(term: sqlite3.Row) -> tuple[int, int, int, int]:
     )
 
 
-def _keyboard(*buttons: tuple[str, str]) -> InlineKeyboardMarkup | None:
-    rows = [[InlineKeyboardButton(text, callback_data=data)] for text, data in buttons]
-    return InlineKeyboardMarkup(rows) if rows else None
+async def _say(update: Update, context, text: str) -> None:
+    """A message with no buttons (errors, results); the current step stays valid."""
+    await context.bot.send_message(chat_id=update.effective_user.id, text=text)
 
 
 async def _send(update: Update, context, text: str, *buttons: tuple[str, str]) -> None:
+    """Ask the next question. Each question gets a fresh key, so buttons on any
+    earlier message (an older step or an older wizard) are refused."""
+    key = _wizard(context)["key"] = secrets.token_hex(3)
+    rows = [
+        [InlineKeyboardButton(text, callback_data=f"nt:{key}:{value}")]
+        for text, value in buttons
+    ]
     await context.bot.send_message(
-        chat_id=update.effective_user.id, text=text, reply_markup=_keyboard(*buttons)
+        chat_id=update.effective_user.id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
     )
 
 
-async def _answer(update: Update) -> str:
-    """The tapped button's value (keyboard removed) or the typed text."""
+async def _answer(update: Update, context) -> str | None:
+    """The typed text, or the tapped button's value; None for a stale button."""
     query = update.callback_query
     if query is None:
         return (update.message.text or "").strip()
-    await query.answer()
+    _, key, value = query.data.split(":", 2)
     await query.edit_message_reply_markup(reply_markup=None)
-    return query.data.split(":", 2)[2]
+    if key != _wizard(context).get("key"):
+        await query.answer(OLD_STEP, show_alert=True)
+        return None
+    await query.answer()
+    return value
 
 
 def _wizard(context) -> dict:
@@ -204,7 +219,7 @@ async def _start_wizard(update: Update, context) -> int:
             date.fromisoformat(last["end_date"]) - date.fromisoformat(last["start_date"])
         ).days
         nt["suggested_name"] = next_name(last["name"])
-    buttons = [(nt["suggested_name"], "nt:name:suggested")] if nt.get("suggested_name") else []
+    buttons = [(nt["suggested_name"], "suggested")] if nt.get("suggested_name") else []
     await _send(
         update,
         context,
@@ -217,10 +232,12 @@ async def _start_wizard(update: Update, context) -> int:
 
 async def on_name(update: Update, context) -> int:
     nt = _wizard(context)
-    value = await _answer(update)
+    value = await _answer(update, context)
+    if value is None:
+        return NAME
     name = nt.get("suggested_name") if value == "suggested" else value
     if not name:
-        await _send(update, context, "Please type a name for the term.")
+        await _say(update, context, "Please type a name for the term.")
         return NAME
     nt["name"] = name
     today = datetime.now(db.SINGAPORE_TIME).date()
@@ -230,26 +247,29 @@ async def on_name(update: Update, context) -> int:
         context,
         f"{name} — step 2 of 5. When does it start? Tap or type a date "
         "(e.g. 2026-09-01 or 1 Sep 2026).",
-        (f"Today ({nice(today)})", f"nt:start:{today}"),
-        (f"Next Monday ({nice(monday)})", f"nt:start:{monday}"),
+        (f"Today ({nice(today)})", f"{today}"),
+        (f"Next Monday ({nice(monday)})", f"{monday}"),
     )
     return START
 
 
 async def on_start(update: Update, context) -> int:
     nt = _wizard(context)
+    value = await _answer(update, context)
+    if value is None:
+        return START
     try:
-        start = parse_date(await _answer(update))
+        start = parse_date(value)
     except ValueError:
-        await _send(update, context, "I couldn't read that date. Try e.g. 2026-09-01 or 1 Sep 2026.")
+        await _say(update, context, "I couldn't read that date. Try e.g. 2026-09-01 or 1 Sep 2026.")
         return START
     nt["start"] = start
     choices = []
     if nt.get("last_days") is not None:
         end = start + timedelta(days=nt["last_days"])
-        choices.append((f"Same length as last term ({nice(end)})", f"nt:end:{end}"))
+        choices.append((f"Same length as last term ({nice(end)})", f"{end}"))
     end = start + timedelta(weeks=13, days=-1)
-    choices.append((f"13 weeks ({nice(end)})", f"nt:end:{end}"))
+    choices.append((f"13 weeks ({nice(end)})", f"{end}"))
     await _send(
         update, context, f"Starts {nice(start)} — step 3 of 5. When does the term end?", *choices
     )
@@ -258,17 +278,20 @@ async def on_start(update: Update, context) -> int:
 
 async def on_end(update: Update, context) -> int:
     nt = _wizard(context)
+    value = await _answer(update, context)
+    if value is None:
+        return END
     try:
-        end = parse_date(await _answer(update))
+        end = parse_date(value)
     except ValueError:
-        await _send(update, context, "I couldn't read that date. Try e.g. 2026-12-01 or 1 Dec 2026.")
+        await _say(update, context, "I couldn't read that date. Try e.g. 2026-12-01 or 1 Dec 2026.")
         return END
     if end < nt["start"]:
-        await _send(update, context, f"The end must be on or after the start ({nice(nt['start'])}). Try again.")
+        await _say(update, context, f"The end must be on or after the start ({nice(nt['start'])}). Try again.")
         return END
     nt["end"] = end
     choices = [
-        (f"{weeks} weeks after start ({nice(due)})", f"nt:deadline:{due}")
+        (f"{weeks} weeks after start ({nice(due)})", f"{due}")
         for weeks in (2, 3)
         if (due := nt["start"] + timedelta(weeks=weeks)) <= end
     ]
@@ -283,13 +306,16 @@ async def on_end(update: Update, context) -> int:
 
 async def on_deadline(update: Update, context) -> int:
     nt = _wizard(context)
+    value = await _answer(update, context)
+    if value is None:
+        return DEADLINE
     try:
-        due = parse_date(await _answer(update))
+        due = parse_date(value)
     except ValueError:
-        await _send(update, context, "I couldn't read that date. Try e.g. 2026-09-15 or 15 Sep 2026.")
+        await _say(update, context, "I couldn't read that date. Try e.g. 2026-09-15 or 15 Sep 2026.")
         return DEADLINE
     if not nt["start"] <= due <= nt["end"]:
-        await _send(
+        await _say(
             update,
             context,
             f"The deadline must be between {nice(nt['start'])} and {nice(nt['end'])}. Try again.",
@@ -307,9 +333,9 @@ async def _ask_fee(update: Update, context) -> int:
     choices = []
     if last and step == 0:
         same = " · ".join(f"{label} {money(c)}" for label, c in zip(FEE_LABELS, last))
-        choices.append((f"All same as last term: {same}", "nt:fee:all"))
+        choices.append((f"All same as last term: {same}", "all"))
     if last:
-        choices.append((f"Same as last term ({money(last[step])})", "nt:fee:same"))
+        choices.append((f"Same as last term ({money(last[step])})", "same"))
     header = "Step 5 of 5: prices. " if step == 0 else ""
     await _send(
         update,
@@ -322,7 +348,9 @@ async def _ask_fee(update: Update, context) -> int:
 
 async def on_fee(update: Update, context) -> int:
     nt = _wizard(context)
-    value = await _answer(update)
+    value = await _answer(update, context)
+    if value is None:
+        return FEES
     step = len(nt["fees"])
     last = nt.get("last_fees")
     if value == "all" and last:
@@ -333,7 +361,7 @@ async def on_fee(update: Update, context) -> int:
         try:
             cents = _parse_fee_cents(value.removeprefix("S$").removeprefix("$"), allow_zero=FEE_STEPS[step][2])
         except ValueError as exc:
-            await _send(update, context, f"Not a valid amount ({exc}). Type e.g. 20 or 7.50.")
+            await _say(update, context, f"Not a valid amount ({exc}). Type e.g. 20 or 7.50.")
             return FEES
         nt["fees"].append(cents)
     if len(nt["fees"]) < len(FEE_STEPS):
@@ -352,20 +380,23 @@ async def on_fee(update: Update, context) -> int:
         f"Dates: {nice(nt['start'])} to {nice(nt['end'])}\n"
         f"Deadline: {nice(nt['deadline'])}\n"
         f"Competitive: {money(comp)}\nRecreational: {money(rec)}\n{shirt_line}",
-        ("✅ Create term", "nt:confirm:create"),
-        ("Cancel", "nt:confirm:cancel"),
+        ("✅ Create term", "create"),
+        ("Cancel", "cancel"),
     )
     return CONFIRM
 
 
 async def on_confirm(update: Update, context) -> int:
+    value = await _answer(update, context)
+    if value is None:
+        return CONFIRM
     nt = context.user_data.pop("nt", {})
-    if await _answer(update) != "create":
-        await _send(update, context, CANCELLED)
+    if value != "create":
+        await _say(update, context, CANCELLED)
         return ConversationHandler.END
     conn = _db(context)
     if db.get_role(conn, update.effective_user.id) != "treasurer":
-        await _send(update, context, NOT_TREASURER)
+        await _say(update, context, NOT_TREASURER)
         return ConversationHandler.END
     comp, rec, recshirt, shirt = nt["fees"]
     try:
@@ -382,10 +413,10 @@ async def on_confirm(update: Update, context) -> int:
             created_by=update.effective_user.id,
         )
     except ValueError as exc:
-        await _send(update, context, f"Could not create term: {exc}\nSend /newterm to start again.")
+        await _say(update, context, f"Could not create term: {exc}\nSend /newterm to start again.")
         return ConversationHandler.END
     scheduler.schedule_term_jobs(context.application, conn, term["id"])
-    await _send(update, context, term_created_text(term))
+    await _say(update, context, term_created_text(term))
     return ConversationHandler.END
 
 
@@ -401,11 +432,24 @@ async def on_expired(update: Update, context) -> None:
     await update.callback_query.edit_message_reply_markup(reply_markup=None)
 
 
+def _guarded(callback):
+    async def run(update: Update, context) -> int:
+        if "key" not in context.user_data.get("nt", {}):
+            if update.callback_query is not None:
+                await update.callback_query.answer()
+            await _say(update, context, EXPIRED)
+            return ConversationHandler.END
+        return await callback(update, context)
+
+    return run
+
+
 def build_handlers(private) -> list:
     text = filters.TEXT & ~filters.COMMAND
 
-    def step(callback, prefix):
-        return [CallbackQueryHandler(callback, pattern=rf"^nt:{prefix}:"), MessageHandler(text, callback)]
+    def step(callback):
+        callback = _guarded(callback)
+        return [CallbackQueryHandler(callback, pattern=r"^nt:"), MessageHandler(text, callback)]
 
     # PTB warns that buttons aren't tracked per message; intended here (the
     # wizard mixes typed answers and buttons, so it must track per chat).
@@ -414,12 +458,12 @@ def build_handlers(private) -> list:
         wizard = ConversationHandler(
             entry_points=[CommandHandler("newterm", cmd_newterm, filters=private)],
             states={
-                NAME: step(on_name, "name"),
-                START: step(on_start, "start"),
-                END: step(on_end, "end"),
-                DEADLINE: step(on_deadline, "deadline"),
-                FEES: step(on_fee, "fee"),
-                CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^nt:confirm:")],
+                NAME: step(on_name),
+                START: step(on_start),
+                END: step(on_end),
+                DEADLINE: step(on_deadline),
+                FEES: step(on_fee),
+                CONFIRM: [CallbackQueryHandler(_guarded(on_confirm), pattern=r"^nt:")],
             },
             fallbacks=[CommandHandler("cancel", on_cancel)],
             allow_reentry=True,

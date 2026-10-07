@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import replace
+from datetime import datetime
 
 from telegram import (
     BotCommand,
@@ -631,8 +632,13 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton(f"Cancel {sutd_id}", callback_data=f"rl:x:{sutd_id}")]
-                    for sutd_id, _ in armed
+                    [
+                        InlineKeyboardButton(
+                            f"Cancel {sutd_id}",
+                            callback_data=f"rl:x:{sutd_id}:{_armed_stamp(when)}",
+                        )
+                    ]
+                    for sutd_id, when in armed
                 ]
             ),
         )
@@ -656,14 +662,27 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+def _armed_stamp(armed_at: str) -> int:
+    return int(datetime.fromisoformat(armed_at).timestamp())
+
+
 async def on_relink_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if not _is_treasurer(_db(context), update.effective_user.id):
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
         await query.edit_message_text(NOT_TREASURER)
         return
-    sutd_id = query.data.split(":")[2]
-    db.disarm_relink(_db(context), sutd_id)
+    _, _, sutd_id, stamp = query.data.split(":")
+    current = dict(db.list_armed_relinks(conn)).get(sutd_id)
+    # A newer /relink re-armed it: this old button must not cancel that one.
+    if current is None or _armed_stamp(current) != int(stamp):
+        await query.edit_message_text(
+            f"That relink for SUTD ID {sutd_id} already ended or was re-armed. "
+            "Send /relink to see the current list."
+        )
+        return
+    db.disarm_relink(conn, sutd_id)
     await query.edit_message_text(f"Relink cancelled for SUTD ID {sutd_id}.")
 
 
