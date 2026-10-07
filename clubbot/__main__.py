@@ -11,6 +11,8 @@ def main() -> None:
     logging.basicConfig(
         format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO
     )
+    # httpx logs every request URL at INFO, and Telegram URLs contain the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = config.load_config()
     conn = db.connect(cfg.db_path)
     db.ensure_treasurer(conn, cfg.treasurer_id)
