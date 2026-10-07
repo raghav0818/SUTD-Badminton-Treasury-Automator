@@ -12,6 +12,9 @@ Raspberry Pi 4.
 
 ## Telegram commands
 
+Tap `/` (or the Menu button) in the chat with the bot to see only the
+commands you can use; admins and the treasurer see theirs too.
+
 ### Everyone (members)
 
 | Command | What it does |
@@ -26,7 +29,7 @@ Raspberry Pi 4.
 
 | Command | What it does |
 |---|---|
-| `/unpaid` | Who hasn't paid this term, plus roster people who never opened the bot, and how many opted out. |
+| `/unpaid` | Who hasn't paid this term, plus roster people who never opened the bot, and how many opted out. The treasurer also gets a **Mark paid** button per person (lists of up to 30) for cash payments, each asking to confirm. |
 | `/setgroup rec` / `/setgroup comp` | Send **inside** the rec or competitive group chat (make the bot a group **admin** first, so Telegram lets it check who is in the group at registration) to link it. The bot then posts paid counts (no names) plus a tap-to-pay link there on Mondays and Thursdays at 12:00 until the deadline. |
 | `/stats` | Term summary: count × price per category (compare once per term against FLYMAX), total, roster paid, registered / paid / unpaid / opted out / exceptions. |
 | `/roster` | Replace the competitive roster: `/roster` then one `Name, 1010xxx` line per person in the same message. If any line is invalid nothing changes, so a typo can never drop a player. `/roster` alone shows the current size. |
@@ -36,13 +39,13 @@ Raspberry Pi 4.
 
 | Command | What it does |
 |---|---|
-| `/newterm <name> <start> <end> deadline=… comp=… rec=… recshirt=… shirt=…` | Open fee collection, e.g. `/newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 comp=20 rec=25 recshirt=30 shirt=15` (competitive S$20, or S$35 with the S$15 shirt; rec S$25, or S$30 with shirt). Members get a "Pay now" message at 10:00 on the start date; unpaid members get reminders at 10:00 on days 3, 7, 10 and 13 (only those before the deadline) plus a last call on the deadline day. Each has a "Not continuing this term" button that stops their reminders (they can still `/pay` later). Tapping Pay now asks shirt yes/no (and size), then sends the QR at that amount. No shirt on sale this term? Use `shirt=0` and set `recshirt` equal to `rec`, and the shirt question is skipped. |
-| `/markpaid <sutd_id>` | Record a cash/manual payment. |
+| `/newterm` | Open fee collection. Send it **on its own** and tap through 5 steps: name (suggests the next one, e.g. Term 2), start date (Today / Next Monday), end date (same length as last term / 13 weeks), deadline (2 or 3 weeks after start), prices (**All same as last term**, or one by one). Any step also accepts a typed answer (`2026-09-01`, `1/9/2026` or `1 Sep 2026`); `/cancel` stops; nothing is created until **Create term**. The one-line form still works, e.g. `/newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 comp=20 rec=25 recshirt=30 shirt=15` (competitive S$20, or S$35 with the S$15 shirt; rec S$25, or S$30 with shirt). Members get a "Pay now" message at 10:00 on the start date; unpaid members get reminders at 10:00 on days 3, 7, 10 and 13 (only those before the deadline) plus a last call on the deadline day. Each has a "Not continuing this term" button that stops their reminders (they can still `/pay` later). Tapping Pay now asks shirt yes/no (and size), then sends the QR at that amount. No shirt on sale this term? Use `shirt=0` and set `recshirt` equal to `rec`, and the shirt question is skipped. |
+| `/markpaid <sutd_id>` | Record a cash/manual payment (shows the name and asks you to confirm). |
 | `/remind` | Nudge all unpaid members right now. |
-| `/revoke <sutd_id>` | Remove a verified membership (member is notified). |
-| `/addadmin <sutd_id>` / `/removeadmin <sutd_id>` | Manage exco admins. |
-| `/transfertreasurer <sutd_id>` | Hand over the treasurer role (you stay admin). |
-| `/relink <sutd_id>` | Member changed Telegram account: arm this, they re-register with `/start` from the new account within 48 h and their history moves over. `/relink` alone lists armed relinks; `/relink <sutd_id> cancel` disarms. |
+| `/revoke <sutd_id>` | Remove a verified membership (asks you to confirm; member is notified). |
+| `/addadmin <sutd_id>` / `/removeadmin` | Manage exco admins. `/removeadmin` alone shows a button per admin. |
+| `/transfertreasurer <sutd_id>` | Hand over the treasurer role (asks you to confirm; you stay admin). |
+| `/relink <sutd_id>` | Member changed Telegram account: arm this, they re-register with `/start` from the new account within 48 h and their history moves over. `/relink` alone lists armed relinks with a Cancel button each. |
 | `/settings` | View/change the PayNow values (UEN, merchant name, Billing ID, recipient match). Only needed if the school ever changes its account. |
 | `/settings group_posts off` / `on` | Stop or resume the twice-weekly group progress posts (default on). |
 

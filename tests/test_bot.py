@@ -267,7 +267,7 @@ def test_status_without_username_has_no_handle(conn):
 def test_build_application_smoke(conn):
     app = bot.build_application("1234567:TESTTOKEN", conn)
     assert app.bot_data["db"] is conn
-    assert len(app.handlers[0]) == 24
+    assert len(app.handlers[0]) == 29
 
 
 def create_active_term(conn, treasurer_id=999):
@@ -377,7 +377,7 @@ def test_newterm_rejects_deadline_outside_term_with_usage(conn):
     assert db.list_terms(conn) == []
     text = reply_text_of(update)
     assert "deadline must be between" in text
-    assert "Usage: /newterm" in text
+    assert "Usage: send /newterm on its own" in text
 
 
 def test_non_treasurer_cannot_create_term(conn):

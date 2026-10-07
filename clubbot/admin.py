@@ -6,7 +6,15 @@ import logging
 import sqlite3
 from dataclasses import replace
 
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from clubbot import db, scheduler, validation
@@ -30,6 +38,106 @@ def _is_admin(conn: sqlite3.Connection, uid: int) -> bool:
 
 def _is_treasurer(conn: sqlite3.Connection, uid: int) -> bool:
     return db.get_role(conn, uid) == "treasurer"
+
+
+# --- the / command menu, per role (cosmetic: every command still checks roles) --
+
+MEMBER_COMMANDS = (
+    ("start", "Register or see your status"),
+    ("status", "Your membership and payment status"),
+    ("pay", "Get your PayNow QR"),
+    ("help", "List commands"),
+)
+ADMIN_COMMANDS = (
+    ("unpaid", "Who hasn't paid yet"),
+    ("stats", "Term payment summary"),
+    ("members", "All registered members"),
+    ("roster", "Set the competitive roster"),
+    ("setgroup", "Send inside a club group to link it"),
+)
+TREASURER_COMMANDS = (
+    ("newterm", "Open a new term (tap through the steps)"),
+    ("markpaid", "Record a cash payment: /markpaid <SUTD ID>"),
+    ("remind", "Nudge unpaid members now"),
+    ("revoke", "Remove a membership: /revoke <SUTD ID>"),
+    ("addadmin", "Make someone an admin: /addadmin <SUTD ID>"),
+    ("removeadmin", "Remove an admin (tap to choose)"),
+    ("transfertreasurer", "Hand over the treasurer role: /transfertreasurer <SUTD ID>"),
+    ("relink", "Member changed Telegram account"),
+    ("settings", "PayNow and group post settings"),
+)
+
+
+def menu_for(role: str | None) -> list[BotCommand]:
+    commands = MEMBER_COMMANDS
+    if role in ("treasurer", "admin"):
+        commands += ADMIN_COMMANDS
+    if role == "treasurer":
+        commands += TREASURER_COMMANDS
+    return [BotCommand(name, description) for name, description in commands]
+
+
+async def sync_command_menu(bot, conn: sqlite3.Connection, user_id: int) -> None:
+    """Give this person the / menu for their current role (a private chat's id
+    is the user's id)."""
+    role = db.get_role(conn, user_id)
+    scope = BotCommandScopeChat(user_id)
+    try:
+        if role is None:
+            await bot.delete_my_commands(scope=scope)
+        else:
+            await bot.set_my_commands(menu_for(role), scope=scope)
+    except TelegramError as exc:  # e.g. they never opened the bot
+        log.warning("Could not set the command menu for %s: %s", user_id, exc)
+
+
+async def sync_all_command_menus(bot, conn: sqlite3.Connection) -> None:
+    try:
+        await bot.set_my_commands(menu_for(None), scope=BotCommandScopeAllPrivateChats())
+    except TelegramError as exc:
+        log.warning("Could not set the member command menu: %s", exc)
+    for row in db.list_admins(conn):
+        await sync_command_menu(bot, conn, row["telegram_user_id"])
+
+
+async def _dm(context, chat_id: int, text: str) -> None:
+    """DM a member after an action already saved; a blocked bot must not hide
+    the result from the treasurer."""
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except TelegramError as exc:
+        log.warning("Could not DM %s: %s", chat_id, exc)
+
+
+def _confirm_keyboard(data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Confirm", callback_data=f"cf:{data}"),
+                InlineKeyboardButton("Cancel", callback_data="cf:cancel"),
+            ]
+        ]
+    )
+
+
+def _chunks(text: str, limit: int = 4000) -> list[str]:
+    """Split on line breaks so each piece fits one Telegram message (4096 max)."""
+    chunks, lines, size = [], [], 0
+    for line in text.split("\n"):
+        if lines and size + len(line) + 1 > limit:
+            chunks.append("\n".join(lines))
+            lines, size = [], 0
+        lines.append(line)
+        size += len(line) + 1
+    chunks.append("\n".join(lines))
+    return chunks
+
+
+async def _reply_long(update: Update, text: str, reply_markup=None) -> None:
+    pieces = _chunks(text)
+    for i, piece in enumerate(pieces):
+        last = i == len(pieces) - 1
+        await update.message.reply_text(piece, reply_markup=reply_markup if last else None)
 
 
 async def _resolve_member(
@@ -73,7 +181,47 @@ async def cmd_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
     if opted_out:
         sections.append(f"Opted out: {opted_out}")
-    await update.message.reply_text("\n\n".join(sections))
+    keyboard = None
+    if members and _is_treasurer(conn, update.effective_user.id):
+        if len(members) <= MARKPAID_BUTTONS:
+            sections.append("Paid you in cash? Tap their name to mark them paid.")
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"Mark paid: {m['full_name']}"[:60],
+                            callback_data=f"mp:{term['id']}:{m['telegram_user_id']}",
+                        )
+                    ]
+                    for m in members
+                ]
+            )
+        else:
+            sections.append("Paid you in cash? Use /markpaid <SUTD ID>.")
+    await _reply_long(update, "\n\n".join(sections), reply_markup=keyboard)
+
+
+# ponytail: buttons only for short lists; Telegram caps keyboard size (exact cap
+# undocumented), and early in a term everyone is unpaid anyway.
+MARKPAID_BUTTONS = 30
+
+
+async def on_markpaid_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """[Mark paid: Alice] under /unpaid: ask to confirm, like /markpaid."""
+    query = update.callback_query
+    await query.answer()
+    conn = _db(context)
+    if not _is_treasurer(conn, update.effective_user.id):
+        await context.bot.send_message(chat_id=update.effective_user.id, text=NOT_TREASURER)
+        return
+    _, term_id, member_id = query.data.split(":")
+    member = db.get_member(conn, int(member_id))
+    if member is None:
+        return
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        **_markpaid_prompt(conn, member, int(term_id)),
+    )
 
 
 def _breakdown_lines(rows) -> list[str]:
@@ -218,7 +366,7 @@ async def cmd_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for m in members:
         handle = f" @{m['username']}" if m["username"] else ""
         lines.append(f"- {m['full_name']} (SUTD ID {m['sutd_id']}){handle}")
-    await update.message.reply_text("Members:\n" + "\n".join(lines))
+    await _reply_long(update, "Members:\n" + "\n".join(lines))
 
 
 async def cmd_markpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -233,20 +381,103 @@ async def cmd_markpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     member = await _resolve_member(update, context)
     if member is None:
         return
-    payment = db.mark_paid_manual(
-        conn, member_id=member["telegram_user_id"], term_id=term["id"]
-    )
+    await update.message.reply_text(**_markpaid_prompt(conn, member, term["id"]))
+
+
+def _already_paid(conn: sqlite3.Connection, member_id: int, term_id: int) -> bool:
+    payment = db.get_payment_for_member_term(conn, member_id=member_id, term_id=term_id)
+    return payment is not None and payment["status"] == "verified"
+
+
+def _markpaid_prompt(conn: sqlite3.Connection, member: sqlite3.Row, term_id: int) -> dict:
+    """reply_text/send_message kwargs asking to confirm a manual payment."""
+    who = f"{member['full_name']} (SUTD ID {member['sutd_id']})"
+    if _already_paid(conn, member["telegram_user_id"], term_id):
+        return {"text": f"{who} has already paid this term."}
+    return {
+        "text": f"Mark {who} as paid for {db.get_term(conn, term_id)['name']}?",
+        "reply_markup": _confirm_keyboard(f"markpaid:{term_id}:{member['telegram_user_id']}"),
+    }
+
+
+async def _do_markpaid(context, member_id: int, term_id: int) -> str:
+    conn = _db(context)
+    if _already_paid(conn, member_id, term_id):
+        return "Already marked paid. Nothing changed."
+    payment = db.mark_paid_manual(conn, member_id=member_id, term_id=term_id)
     scheduler.request_sheet_sync(context.application)
-    await update.message.reply_text(
-        f"Marked {payment['full_name']} as paid for {payment['term_name']}."
+    await _dm(
+        context,
+        payment["telegram_user_id"],
+        f"Your {money(payment['amount_cents'])} payment for "
+        f"{payment['term_name']} has been recorded by the treasurer.",
     )
-    await context.bot.send_message(
-        chat_id=payment["telegram_user_id"],
-        text=(
-            f"Your {money(payment['amount_cents'])} payment for "
-            f"{payment['term_name']} has been recorded by the treasurer."
-        ),
+    return (
+        f"Marked {payment['full_name']} as paid for {payment['term_name']} "
+        f"({money(payment['amount_cents'])})."
     )
+
+
+async def _do_revoke(context, member_id: int, term_id: int) -> str:
+    try:
+        payment = db.revoke_payment(_db(context), member_id=member_id, term_id=term_id)
+    except ValueError as exc:
+        return f"Could not revoke: {exc}"
+    scheduler.request_sheet_sync(context.application)
+    await _dm(
+        context,
+        payment["telegram_user_id"],
+        f"Your membership payment for {payment['term_name']} has been revoked "
+        "because it could not be confirmed against the bank. "
+        "Please contact the treasurer.",
+    )
+    return f"Revoked {payment['full_name']}'s membership for {payment['term_name']}."
+
+
+async def _do_transfer(context, old_id: int, member_id: int) -> str:
+    conn = _db(context)
+    member = db.get_member(conn, member_id)
+    try:
+        db.transfer_treasurer(conn, new_treasurer_id=member_id)
+    except ValueError as exc:
+        return f"Could not transfer: {exc}"
+    for user_id in (old_id, member_id):
+        await sync_command_menu(context.bot, conn, user_id)
+    await _dm(
+        context,
+        member_id,
+        "You are now the club treasurer. Send /help to see the treasurer "
+        "commands, including payment review.",
+    )
+    return f"{member['full_name']} is now the treasurer. You remain an admin."
+
+
+async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """[Confirm]/[Cancel] under a /markpaid, /revoke or /transfertreasurer prompt."""
+    query = update.callback_query
+    await query.answer()
+    conn = _db(context)
+    action, *ids = query.data.split(":")[1:]
+    if action == "cancel":
+        await query.edit_message_text("Cancelled. Nothing changed.")
+        return
+    if not _is_treasurer(conn, update.effective_user.id):
+        await query.edit_message_text(NOT_TREASURER)
+        return
+    # Remove the buttons first so a double tap cannot run the action twice.
+    await query.edit_message_reply_markup(reply_markup=None)
+    if action == "treasurer":
+        result = await _do_transfer(context, update.effective_user.id, int(ids[0]))
+    else:
+        term_id, member_id = map(int, ids)
+        term = db.get_active_term(conn)
+        if term is None or term["id"] != term_id:
+            result = "That term is no longer the active one. Nothing changed."
+        elif action == "markpaid":
+            result = await _do_markpaid(context, member_id, term_id)
+        else:
+            result = await _do_revoke(context, member_id, term_id)
+    await query.edit_message_text(result)
 
 
 async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -274,24 +505,15 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     member = await _resolve_member(update, context)
     if member is None:
         return
-    try:
-        payment = db.revoke_payment(
-            conn, member_id=member["telegram_user_id"], term_id=term["id"]
+    who = f"{member['full_name']} (SUTD ID {member['sutd_id']})"
+    if not _already_paid(conn, member["telegram_user_id"], term["id"]):
+        await update.message.reply_text(
+            f"Could not revoke: {who} has no verified payment this term."
         )
-    except ValueError as exc:
-        await update.message.reply_text(f"Could not revoke: {exc}")
         return
-    scheduler.request_sheet_sync(context.application)
     await update.message.reply_text(
-        f"Revoked {payment['full_name']}'s membership for {payment['term_name']}."
-    )
-    await context.bot.send_message(
-        chat_id=payment["telegram_user_id"],
-        text=(
-            f"Your membership payment for {payment['term_name']} has been revoked "
-            "because it could not be confirmed against the bank. "
-            "Please contact the treasurer."
-        ),
+        f"Revoke {who}'s membership for {term['name']}? They will be told by DM.",
+        reply_markup=_confirm_keyboard(f"revoke:{term['id']}:{member['telegram_user_id']}"),
     )
 
 
@@ -315,6 +537,7 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except ValueError as exc:
         await update.message.reply_text(f"Could not add admin: {exc}")
         return
+    await sync_command_menu(context.bot, conn, member["telegram_user_id"])
     await update.message.reply_text(f"{member['full_name']} is now an admin.")
 
 
@@ -323,15 +546,50 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not _is_treasurer(conn, update.effective_user.id):
         await update.message.reply_text(NOT_TREASURER)
         return
+    if not context.args:
+        admins = [a for a in db.list_admins(conn) if a["role"] == "admin"]
+        if not admins:
+            await update.message.reply_text("There are no admins to remove.")
+            return
+        await update.message.reply_text(
+            "Tap the admin to remove:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            a["full_name"] or str(a["telegram_user_id"]),
+                            callback_data=f"ra:{a['telegram_user_id']}",
+                        )
+                    ]
+                    for a in admins
+                ]
+            ),
+        )
+        return
     member = await _resolve_member(update, context)
     if member is None:
         return
+    await update.message.reply_text(await _remove_admin(context, member["telegram_user_id"]))
+
+
+async def _remove_admin(context, user_id: int) -> str:
+    conn = _db(context)
     try:
-        db.remove_admin(conn, member["telegram_user_id"])
+        db.remove_admin(conn, user_id)
     except ValueError as exc:
-        await update.message.reply_text(f"Could not remove admin: {exc}")
+        return f"Could not remove admin: {exc}"
+    await sync_command_menu(context.bot, conn, user_id)
+    member = db.get_member(conn, user_id)
+    return f"{member['full_name'] if member else user_id} is no longer an admin."
+
+
+async def on_removeadmin_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_treasurer(_db(context), update.effective_user.id):
+        await query.edit_message_text(NOT_TREASURER)
         return
-    await update.message.reply_text(f"{member['full_name']} is no longer an admin.")
+    await query.edit_message_text(await _remove_admin(context, int(query.data.split(":")[1])))
 
 
 async def cmd_transfertreasurer(
@@ -344,20 +602,13 @@ async def cmd_transfertreasurer(
     member = await _resolve_member(update, context)
     if member is None:
         return
-    try:
-        db.transfer_treasurer(conn, new_treasurer_id=member["telegram_user_id"])
-    except ValueError as exc:
-        await update.message.reply_text(f"Could not transfer: {exc}")
+    if member["telegram_user_id"] == update.effective_user.id:
+        await update.message.reply_text("Could not transfer: this member is already the treasurer")
         return
     await update.message.reply_text(
-        f"{member['full_name']} is now the treasurer. You remain an admin."
-    )
-    await context.bot.send_message(
-        chat_id=member["telegram_user_id"],
-        text=(
-            "You are now the club treasurer. Send /help to see the treasurer "
-            "commands, including payment review."
-        ),
+        f"Make {member['full_name']} (SUTD ID {member['sutd_id']}) the treasurer? "
+        "You will become a normal admin and lose treasurer commands.",
+        reply_markup=_confirm_keyboard(f"treasurer:{member['telegram_user_id']}"),
     )
 
 
@@ -376,7 +627,15 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         lines = ["Armed relinks (each expires 48h after arming):"]
         lines += [f"- SUTD ID {sutd_id}, armed {when}" for sutd_id, when in armed]
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(f"Cancel {sutd_id}", callback_data=f"rl:x:{sutd_id}")]
+                    for sutd_id, _ in armed
+                ]
+            ),
+        )
         return
     member = await _resolve_member(update, context)
     if member is None:
@@ -395,6 +654,17 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "move over. Cancel with /relink "
         f"{member['sutd_id']} cancel."
     )
+
+
+async def on_relink_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_treasurer(_db(context), update.effective_user.id):
+        await query.edit_message_text(NOT_TREASURER)
+        return
+    sutd_id = query.data.split(":")[2]
+    db.disarm_relink(_db(context), sutd_id)
+    await query.edit_message_text(f"Relink cancelled for SUTD ID {sutd_id}.")
 
 
 SETTING_KEYS = (

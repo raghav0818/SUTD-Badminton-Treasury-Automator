@@ -295,6 +295,17 @@ def get_treasurer_id(conn: sqlite3.Connection) -> int | None:
     return row["telegram_user_id"] if row else None
 
 
+def list_admins(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Treasurer + admins with their member name (None if never registered)."""
+    return conn.execute(
+        """
+        SELECT a.telegram_user_id, a.role, m.full_name, m.sutd_id
+        FROM admins a LEFT JOIN members m ON m.telegram_user_id = a.telegram_user_id
+        ORDER BY a.role DESC, m.full_name
+        """
+    ).fetchall()
+
+
 def add_admin(conn: sqlite3.Connection, *, telegram_user_id: int, added_by: int) -> None:
     role = get_role(conn, telegram_user_id)
     if role == "treasurer":

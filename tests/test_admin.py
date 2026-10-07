@@ -27,13 +27,34 @@ def make_context(conn):
     context.user_data = {}
     context.args = []
     context.bot.send_message = AsyncMock()
+    context.bot.set_my_commands = AsyncMock()
+    context.bot.delete_my_commands = AsyncMock()
     context.application.job_queue = None
     context.application.bot_data = context.bot_data
     return context
 
 
 def reply_text_of(update) -> str:
-    return update.message.reply_text.call_args.args[0]
+    call = update.message.reply_text.call_args
+    return call.args[0] if call.args else call.kwargs["text"]
+
+
+def make_callback(data, user_id=999):
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.callback_query.data = data
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.edit_message_reply_markup = AsyncMock()
+    return update
+
+
+def tap_confirm(update, context, user_id=999):
+    """Tap [Confirm] on the prompt the command just replied with."""
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    tap = make_callback(markup.inline_keyboard[0][0].callback_data, user_id)
+    asyncio.run(admin.on_confirm(tap, context))
+    return tap.callback_query.edit_message_text.call_args.args[0]
 
 
 def create_active_term(conn, treasurer_id=999, fee_cents=2000):
@@ -285,6 +306,9 @@ def test_markpaid_verifies_and_dms(conn):
     update, context = make_update(user_id=999), make_context(conn)
     context.args = ["1007654"]
     asyncio.run(admin.cmd_markpaid(update, context))
+    assert "Mark Alice Tan (SUTD ID 1007654) as paid" in reply_text_of(update)
+    assert db.get_current_payment(conn, 111) is None  # nothing until Confirm
+    assert "Marked Alice Tan as paid" in tap_confirm(update, context)
 
     payment = db.get_current_payment(conn, 111)
     assert payment["status"] == "verified"
@@ -315,6 +339,8 @@ def test_revoke_verified_payment_dms_member(conn):
     update, context = make_update(user_id=999), make_context(conn)
     context.args = ["1007654"]
     asyncio.run(admin.cmd_revoke(update, context))
+    assert db.get_current_payment(conn, 111)["status"] == "verified"
+    assert "Revoked" in tap_confirm(update, context)
 
     payment = db.get_current_payment(conn, 111)
     assert payment["status"] == "revoked"
@@ -408,6 +434,8 @@ def test_transfertreasurer_swaps_roles_and_dms(conn):
     update, context = make_update(user_id=999), make_context(conn)
     context.args = ["1007654"]
     asyncio.run(admin.cmd_transfertreasurer(update, context))
+    assert db.get_role(conn, 111) is None  # nothing until Confirm
+    assert "now the treasurer" in tap_confirm(update, context)
     assert db.get_role(conn, 111) == "treasurer"
     assert db.get_role(conn, 999) == "admin"
     assert db.get_treasurer_id(conn) == 111
@@ -602,3 +630,158 @@ def test_settings_denies_non_treasurer(conn):
     update, context = make_update(user_id=111), make_context(conn)
     asyncio.run(admin.cmd_settings(update, context))
     assert "Only the treasurer" in reply_text_of(update)
+
+
+# --- tap instead of type ----------------------------------------------------------
+
+
+def test_confirm_cancel_changes_nothing(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    create_active_term(conn)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_markpaid(update, context))
+    tap = make_callback("cf:cancel")
+    asyncio.run(admin.on_confirm(tap, context))
+    assert "Nothing changed" in tap.callback_query.edit_message_text.call_args.args[0]
+    assert db.get_current_payment(conn, 111) is None
+
+
+def test_confirm_twice_marks_paid_once(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    create_active_term(conn)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_markpaid(update, context))
+    tap_confirm(update, context)
+    assert "Already" in tap_confirm(update, context)
+    assert context.bot.send_message.await_count == 1  # one DM only
+
+
+def test_confirm_requires_treasurer(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    term = create_active_term(conn)
+    context = make_context(conn)
+    tap = make_callback(f"cf:markpaid:{term['id']}:111", user_id=222)
+    asyncio.run(admin.on_confirm(tap, context))
+    assert "Only the treasurer" in tap.callback_query.edit_message_text.call_args.args[0]
+    assert db.get_current_payment(conn, 111) is None
+
+
+def test_confirm_refuses_a_stale_term(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    term = create_active_term(conn)
+    tap = make_callback(f"cf:markpaid:{term['id'] + 1}:111")
+    asyncio.run(admin.on_confirm(tap, make_context(conn)))
+    assert "no longer the active" in tap.callback_query.edit_message_text.call_args.args[0]
+
+
+def test_markpaid_already_paid_has_no_confirm(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    term = create_active_term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_markpaid(update, context))
+    assert "already paid" in reply_text_of(update)
+    assert "reply_markup" not in update.message.reply_text.call_args.kwargs
+
+
+def test_unpaid_buttons_for_treasurer_lead_to_confirm(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    term = create_active_term(conn)
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_unpaid(update, context))
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    data = [row[0].callback_data for row in markup.inline_keyboard]
+    assert data == [f"mp:{term['id']}:111", f"mp:{term['id']}:222"]
+    asyncio.run(admin.on_markpaid_pick(make_callback(data[0]), context))
+    prompt = context.bot.send_message.call_args.kwargs
+    assert "Mark Alice Tan" in prompt["text"]
+    assert prompt["reply_markup"].inline_keyboard[0][0].callback_data.startswith("cf:markpaid:")
+
+
+def test_unpaid_has_no_buttons_for_admins(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    create_active_term(conn)
+    update, context = make_update(user_id=111), make_context(conn)
+    asyncio.run(admin.cmd_unpaid(update, context))
+    assert update.message.reply_text.call_args.kwargs["reply_markup"] is None
+
+
+def test_long_lists_are_split_into_messages(conn):
+    for i in range(150):
+        db.add_member(
+            conn,
+            telegram_user_id=1000 + i,
+            full_name=f"Member Number {i:03d} With A Long Name",
+            sutd_id=f"1010{i:03d}",
+            username=f"user{i}",
+        )
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_members(update, context))
+    sent = [c.args[0] for c in update.message.reply_text.call_args_list]
+    assert len(sent) > 1
+    assert all(len(text) <= 4096 for text in sent)
+    assert sum(text.count("SUTD ID") for text in sent) == 150
+
+
+def test_removeadmin_without_id_lists_admins_to_tap(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_removeadmin(update, context))
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    assert [row[0].text for row in markup.inline_keyboard] == ["Alice Tan"]
+    tap = make_callback(markup.inline_keyboard[0][0].callback_data)
+    asyncio.run(admin.on_removeadmin_pick(tap, context))
+    assert db.get_role(conn, 111) is None
+    context.bot.delete_my_commands.assert_awaited()  # their menu shrinks back
+
+
+def test_relink_cancel_button(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.arm_relink(conn, "1007654")
+    update, context = make_update(user_id=999), make_context(conn)
+    asyncio.run(admin.cmd_relink(update, context))
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    tap = make_callback(markup.inline_keyboard[0][0].callback_data)
+    asyncio.run(admin.on_relink_cancel(tap, context))
+    assert not db.relink_armed(conn, "1007654")
+
+
+def test_command_menu_per_role(conn):
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    db.add_admin(conn, telegram_user_id=111, added_by=999)
+    bot = MagicMock()
+    bot.set_my_commands = AsyncMock()
+    bot.delete_my_commands = AsyncMock()
+    asyncio.run(admin.sync_all_command_menus(bot, conn))
+    menus = {
+        getattr(c.kwargs["scope"], "chat_id", "everyone"): [cmd.command for cmd in c.args[0]]
+        for c in bot.set_my_commands.call_args_list
+    }
+    assert menus["everyone"] == ["start", "status", "pay", "help"]
+    assert "unpaid" in menus[111] and "newterm" not in menus[111]
+    assert "newterm" in menus[999] and "unpaid" in menus[999]
+
+
+def test_command_menu_failure_is_only_logged(conn):
+    from telegram.error import BadRequest
+
+    db.ensure_treasurer(conn, 999)
+    bot = MagicMock()
+    bot.set_my_commands = AsyncMock(side_effect=BadRequest("chat not found"))
+    asyncio.run(admin.sync_all_command_menus(bot, conn))  # must not raise

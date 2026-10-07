@@ -7,8 +7,6 @@ import io
 import logging
 import mimetypes
 import sqlite3
-from datetime import date
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -25,7 +23,12 @@ from telegram.ext import (
     filters,
 )
 
-from clubbot import admin, db, scheduler, validation
+from clubbot import admin, db, newterm, scheduler, validation
+from clubbot.newterm import (  # noqa: F401  (re-exported for tests)
+    NEWTERM_USAGE,
+    cmd_newterm,
+    parse_newterm_args,
+)
 from clubbot.format import money
 from clubbot.payments import (
     build_member_qr,
@@ -103,8 +106,8 @@ HELP_TEXT = (
 )
 ADMIN_HELP = (
     "\n\nTreasurer/admin commands:\n"
-    "/newterm - open a new paying term\n"
-    "/unpaid - who hasn't paid yet\n"
+    "/newterm - open a new paying term (tap through the steps)\n"
+    "/unpaid - who hasn't paid yet (with Mark paid buttons)\n"
     "/roster - set the competitive roster (Name, SUTD ID lines)\n"
     "/setgroup rec|comp - send inside a club group chat to link it\n"
     "/stats - payment summary for the term\n"
@@ -113,7 +116,7 @@ ADMIN_HELP = (
     "/remind - nudge unpaid members now\n"
     "/revoke <sutd_id> - remove a membership\n"
     "/addadmin <sutd_id> - make a member an admin\n"
-    "/removeadmin <sutd_id> - remove an admin\n"
+    "/removeadmin - remove an admin (tap to choose)\n"
     "/transfertreasurer <sutd_id> - hand over the treasurer role\n"
     "/relink <sutd_id> - let a member re-register from a new Telegram account\n"
     "/settings - view or change the PayNow/verification settings "
@@ -309,81 +312,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if db.get_role(_db(context), update.effective_user.id) in ("treasurer", "admin"):
         text += ADMIN_HELP
     await update.message.reply_text(text)
-
-
-def _parse_fee_cents(value: str, *, allow_zero: bool = False) -> int:
-    try:
-        amount = Decimal(value)
-    except InvalidOperation as exc:
-        raise ValueError("fee must be a number") from exc
-    # is_finite() first: NaN/Infinity pass Decimal() but break the checks below.
-    too_small = amount < 0 if allow_zero else amount <= 0
-    if not amount.is_finite() or too_small or amount.as_tuple().exponent < -2:
-        raise ValueError("fee must be positive with at most 2 decimal places")
-    return int(amount * 100)
-
-
-NEWTERM_USAGE = (
-    "Usage: /newterm <name> <start YYYY-MM-DD> <end YYYY-MM-DD> "
-    "deadline=YYYY-MM-DD comp=<fee> rec=<fee> recshirt=<fee> shirt=<fee>\n"
-    "Example: /newterm Term 1 2026-09-01 2026-12-01 deadline=2026-09-15 "
-    "comp=20 rec=25 recshirt=30 shirt=15\n"
-    "(comp = competitive fee, shirt = shirt add-on for competitive, "
-    "recshirt = recreational fee including the shirt. No shirt this term? "
-    "Use shirt=0 and recshirt equal to rec.)"
-)
-NEWTERM_KEYS = ("deadline", "comp", "rec", "recshirt", "shirt")
-
-
-def parse_newterm_args(args: list[str]) -> dict:
-    """Split /newterm args into create_term kwargs; ValueError on bad input."""
-    options = dict(arg.split("=", 1) for arg in args if "=" in arg)
-    positional = [arg for arg in args if "=" not in arg]
-    unknown = sorted(set(options) - set(NEWTERM_KEYS))
-    if unknown:
-        raise ValueError(f"unknown option(s): {', '.join(unknown)}")
-    missing = [key for key in NEWTERM_KEYS if key not in options]
-    if missing:
-        raise ValueError(f"missing option(s): {', '.join(missing)}")
-    if len(positional) < 3:
-        raise ValueError("need a name, a start date and an end date")
-    return {
-        "name": " ".join(positional[:-2]),
-        "start_date": positional[-2],
-        "end_date": positional[-1],
-        "deadline": options["deadline"],
-        "fee_cents": _parse_fee_cents(options["comp"]),
-        "rec_fee_cents": _parse_fee_cents(options["rec"]),
-        "recshirt_fee_cents": _parse_fee_cents(options["recshirt"]),
-        # shirt=0: no shirt for sale to competitive members this term.
-        "shirt_fee_cents": _parse_fee_cents(options["shirt"], allow_zero=True),
-    }
-
-
-async def cmd_newterm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if db.get_role(_db(context), update.effective_user.id) != "treasurer":
-        await update.message.reply_text("Only the treasurer can create a term.")
-        return
-    try:
-        term = db.create_term(
-            _db(context),
-            **parse_newterm_args(context.args),
-            created_by=update.effective_user.id,
-        )
-    except ValueError as exc:
-        await update.message.reply_text(f"Could not create term: {exc}\n\n{NEWTERM_USAGE}")
-        return
-    scheduler.schedule_term_jobs(context.application, _db(context), term["id"])
-    await update.message.reply_text(
-        f"Term created: {term['name']}\n"
-        f"Dates: {term['start_date']} to {term['end_date']}\n"
-        f"Deadline: {term['deadline']}\n"
-        f"Competitive: {money(db.term_fee(term, 'competitive'))}"
-        f" ({money(db.term_fee(term, 'competitive', with_shirt=True))} with shirt)\n"
-        f"Recreational: {money(db.term_fee(term, 'recreational'))}"
-        f" ({money(db.term_fee(term, 'recreational', with_shirt=True))} with shirt)\n\n"
-        "Members can now use /pay while the term is active."
-    )
 
 
 SIZE_KEYBOARD = InlineKeyboardMarkup(
@@ -881,6 +809,11 @@ async def _ignore_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 PRIVATE = filters.ChatType.PRIVATE
 
 
+async def _post_init(app: Application) -> None:
+    """Show each person only the commands they can use in the / menu."""
+    await admin.sync_all_command_menus(app.bot, app.bot_data["db"])
+
+
 def build_application(
     token: str,
     conn: sqlite3.Connection,
@@ -888,7 +821,7 @@ def build_application(
     extractor: Any | None = None,
     sheet: Any | None = None,
 ) -> Application:
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_post_init).build()
     app.bot_data["db"] = conn
     app.bot_data["extractor"] = extractor
     app.bot_data["sheet"] = sheet
@@ -911,7 +844,8 @@ def build_application(
     app.add_handler(registration)
     app.add_handler(CommandHandler("status", cmd_status, filters=PRIVATE))
     app.add_handler(CommandHandler("help", cmd_help, filters=PRIVATE))
-    app.add_handler(CommandHandler("newterm", cmd_newterm, filters=PRIVATE))
+    for handler in newterm.build_handlers(PRIVATE):
+        app.add_handler(handler)
     app.add_handler(CommandHandler("pay", cmd_pay, filters=PRIVATE))
     app.add_handler(CommandHandler("unpaid", admin.cmd_unpaid, filters=PRIVATE))
     app.add_handler(CommandHandler("stats", admin.cmd_stats, filters=PRIVATE))
@@ -937,6 +871,15 @@ def build_application(
     app.add_handler(
         CallbackQueryHandler(on_payment_review, pattern=r"^payment:(approve|reject):\d+$")
     )
+    app.add_handler(
+        CallbackQueryHandler(
+            admin.on_confirm,
+            pattern=r"^cf:(cancel|markpaid:\d+:\d+|revoke:\d+:\d+|treasurer:\d+)$",
+        )
+    )
+    app.add_handler(CallbackQueryHandler(admin.on_markpaid_pick, pattern=r"^mp:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(admin.on_removeadmin_pick, pattern=r"^ra:\d+$"))
+    app.add_handler(CallbackQueryHandler(admin.on_relink_cancel, pattern=r"^rl:x:\d{7}$"))
     app.add_handler(
         MessageHandler(PRIVATE & (filters.PHOTO | filters.Document.IMAGE), on_receipt)
     )
