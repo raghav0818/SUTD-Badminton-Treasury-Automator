@@ -1,6 +1,6 @@
 # v2 build list (grilling outcome, 2026-10-03 → 2026-10-04)
 
-Status: **awaiting treasurer confirmation. Nothing here is built yet.**
+Status: **confirmed and built (2026-10-04) on branch `v2-build`; reviewed twice, not yet merged or live-tested.**
 Context: the bot works but nobody used it, and the real problem is members not
 paying. v2 makes it chase them, handles the three prices, and drops the weekly
 audit.

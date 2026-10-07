@@ -31,6 +31,8 @@ changing payment or verification logic.
   groups, and must be a group ADMIN for /setgroup, since Telegram only
   guarantees getChatMember lookups for admin bots). Reminders/group posts
   are stamped per recipient after delivery (failures retry hourly that day).
+  **v2 has never run on real Telegram** — only the test suite. Next step is
+  the treasurer's OK to merge + push (asked, not yet answered).
 - **v1 (on `main`)** was live-proven on real Telegram (registration + a real
   S$0.05 auto-verified payment). Bot name **SUTD ShuttleBuddy**, handle
   `@MyClubFinanceBot`. Scheduled jobs never observed over a real term.
@@ -48,13 +50,15 @@ changing payment or verification logic.
 
 1. Merge `v2-build` → `main`, push (repo is public; the Pi pulls from GitHub).
 2. Fresh Pi setup per README; all three `scripts/preflight.py` lines PASS.
-3. Wipe test data once before the first real term (delete `clubbot.db`) —
-   `receipt_fingerprints` must never be cleared after that.
-4. Add the bot to both group chats as an ADMIN; `/setgroup rec` and
+3. Smoke test on real Telegram: a short test term, register, one small
+   real payment (with and without shirt), `/stats`, a `/setgroup` group post.
+4. Wipe the test data once (delete `clubbot.db`) before the first real
+   term — `receipt_fingerprints` must never be cleared after that.
+5. Add the bot to both group chats as an ADMIN; `/setgroup rec` and
    `/setgroup comp` in each; paste the competitive team with `/roster`.
-5. Open the term:
+6. Open the term:
    `/newterm <name> <start> <end> deadline=YYYY-MM-DD comp=20 rec=25 recshirt=30 shirt=15`
-6. Retire the MS Form. Watch the first term: blast, reminders, group posts
+7. Retire the MS Form. Watch the first term: blast, reminders, group posts
    fire once each; a mid-term reboot must not re-send.
 
 ## Ground rules
@@ -93,6 +97,13 @@ changing payment or verification logic.
 - All date/time logic uses explicit Singapore time (`db.SINGAPORE_TIME`);
   the host OS timezone (UTC on the Pi) must not matter.
 - SUTD IDs: 7 digits starting `1010`.
+- **v2 design rules settled in review (keep them):** a Telegram `Forbidden`
+  (member blocked the bot) counts as delivered; any other send error retries.
+  Stamps (`term_events`, `payments.notified_at`) are written only after
+  delivery. A payment is a shirt only if it matches the exact with-shirt fee;
+  `wants_shirt` (latest choice) is separate from the sticky `shirt_size`.
+  `/roster` is all-or-nothing. Relinks pass the same registration gate.
+  `/roster` re-prices only payments whose QR has not been issued yet.
 - Treasurer bootstraps from `.env` only when the DB has none; after
   `/transfertreasurer` the DB wins.
 
@@ -148,6 +159,16 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   bot fully replaces the MS Form,
   competitive roster, deadline reminders, group progress posts, weekly audit
   DROPPED with a per-term FLYMAX count check instead, git-clone deploy).
-  Treasurer confirmed; all of it built the same day on `v2-build` (see Status).
+  Treasurer confirmed; all of it built the same day on `v2-build` (see Status)
+  by parallel subagents in 2 waves. Then two review passes: `/code-review`
+  (10 fixes, `bc44238` — e.g. private info leaking into groups, phantom
+  shirts, roster re-pricing issued QRs, orphaned receipt fingerprints, retry
+  races, double term-start blast) and a Codex review (11 fixes, `c96237f` —
+  relink gate bypass, receipts stuck after a restart, member-DM failure
+  blocking the treasurer alert, blast/reminders/group posts stamped before
+  delivery, partial `/roster` replace, shirt size from a later `/pay` choice,
+  no weekly-backup catch-up, v1 migration not seeding the d7 stamp, Shirts tab
+  clearing after a term, `/setgroup` needing the bot to be group admin).
+  205 tests pass. Not merged, pushed or live-tested.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).
