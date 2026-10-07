@@ -36,10 +36,14 @@ changing payment or verification logic.
 - **v1 (on `main`)** was live-proven on real Telegram (registration + a real
   S$0.05 auto-verified payment). Bot name **SUTD ShuttleBuddy**, handle
   `@MyClubFinanceBot`. Scheduled jobs never observed over a real term.
-- **Pi 4 is switched OFF** (nobody was using the bot). Its old `~/clubbot`
-  copy is half-updated and root-owned; plan is a fresh `git clone` per the
-  README (move the old folder aside, keep its `.env`, which may be the only
-  copy of the secrets). Pi: user `blud`, host `blud.local`, service `clubbot`.
+- **Pi 4 (2026-10-07):** OS was reinstalled (no old `~/clubbot`, no old
+  service). `blud.local` does not resolve from the laptop; reach it over
+  **Tailscale** as `raspberry-pi-4` / `100.117.79.93`, user `blud`
+  (`ssh blud@100.117.79.93` works from the laptop via Tailscale SSH; sudo
+  needs the treasurer's password). Claude cloned `~/clubbot`, copied `.env`
+  + `service-account.json` (chmod 600), built `.venv`; preflight 3/3 PASS on
+  the Pi. Remaining: treasurer runs `bash ~/clubbot/deploy/setup_pi.sh`
+  (needs sudo) to install + start the systemd service `clubbot`.
 - **Beware a stale parallel copy** at `Documents\SUTD Projects\Badmintion Tele Bot`
   (remote `badminton-tele-bot`). THIS repo is the source of truth.
 - **Google side moved (2026-10-07)** to its own Firebase project
