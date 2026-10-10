@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from clubbot import admin, db, newterm, scheduler, validation
+from clubbot import admin, db, newterm, scheduler, sessions, validation
 from clubbot.newterm import (  # noqa: F401  (re-exported for tests)
     NEWTERM_USAGE,
     cmd_newterm,
@@ -110,6 +110,7 @@ ADMIN_HELP = (
     "/unpaid - who hasn't paid yet (with Mark paid buttons)\n"
     "/roster - set the competitive roster (Name, SUTD ID lines)\n"
     "/setgroup rec|comp - send inside a club group chat to link it\n"
+    "/session - post a recre session for sign-ups (picks who brings the nets)\n"
     "/stats - payment summary for the term\n"
     "/members - list registered members\n"
     "/markpaid <sutd_id> - record a cash/manual payment\n"
@@ -836,6 +837,8 @@ def build_application(
     # The bot also sits in the club groups (/setgroup, progress posts): keep
     # registration, payments, receipts and admin output out of them.
     for handler in newterm.build_handlers(PRIVATE):
+        app.add_handler(handler)
+    for handler in sessions.build_handlers(PRIVATE):
         app.add_handler(handler)
     registration = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start, filters=PRIVATE)],

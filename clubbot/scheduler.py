@@ -287,7 +287,16 @@ _DUE_LOCK = asyncio.Lock()
 
 
 async def _job_due(context) -> None:
+    # Imported here: sessions imports newterm, which imports this module.
+    from clubbot import sessions
+
     async with _DUE_LOCK:
+        try:
+            await sessions.run_due_picks(
+                context.bot, context.bot_data["db"], datetime.now(SINGAPORE_TIME)
+            )
+        except Exception:  # a session bug must not block fee reminders
+            log.exception("Session pick check failed")
         await run_due_events(
             context.bot, context.bot_data["db"], datetime.now(SINGAPORE_TIME)
         )
