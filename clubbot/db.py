@@ -118,6 +118,38 @@ CREATE TABLE IF NOT EXISTS rec_group_people (
     keep             INTEGER NOT NULL DEFAULT 0
 );
 
+-- Recre sessions posted for sign-ups (Mitup replacement). message_id is NULL
+-- while the session is only a preview in the host's DM. primary_id collects
+-- the nets and shuttles; secondary_id steps in only if the primary can't.
+CREATE TABLE IF NOT EXISTS sessions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    title        TEXT    NOT NULL,
+    starts_at    TEXT    NOT NULL,
+    ends_at      TEXT    NOT NULL,
+    venue        TEXT    NOT NULL,
+    capacity     INTEGER NOT NULL,
+    host_id      INTEGER NOT NULL,
+    host_name    TEXT    NOT NULL,
+    chat_id      INTEGER,
+    message_id   INTEGER,
+    cancelled_at TEXT,
+    primary_id   INTEGER,
+    secondary_id INTEGER,
+    picked_at    TEXT,
+    announced_at TEXT,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One row per person per session; id order is join order (first `capacity`
+-- play, the rest wait). Leaving deletes the row, so rejoining goes to the back.
+CREATE TABLE IF NOT EXISTS session_signups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    user_id    INTEGER NOT NULL,
+    name       TEXT    NOT NULL,
+    UNIQUE (session_id, user_id)
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_member_term
     ON payments(member_id, term_id);
 """
@@ -1308,3 +1340,130 @@ def list_payments(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         ORDER BY t.start_date, t.id, m.full_name
         """
     ).fetchall()
+
+
+# --- Recre sessions -------------------------------------------------------------
+
+
+def create_session(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    starts_at: str,
+    ends_at: str,
+    venue: str,
+    capacity: int,
+    host_id: int,
+    host_name: str,
+) -> sqlite3.Row:
+    cursor = conn.execute(
+        """
+        INSERT INTO sessions (title, starts_at, ends_at, venue, capacity, host_id, host_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (title, starts_at, ends_at, venue, capacity, host_id, host_name),
+    )
+    conn.commit()
+    return get_session(conn, cursor.lastrowid)
+
+
+def get_session(conn: sqlite3.Connection, session_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+
+
+def last_posted_session(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM sessions WHERE message_id IS NOT NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def set_session_posted(
+    conn: sqlite3.Connection, session_id: int, chat_id: int, message_id: int
+) -> None:
+    conn.execute(
+        "UPDATE sessions SET chat_id = ?, message_id = ? WHERE id = ?",
+        (chat_id, message_id, session_id),
+    )
+    conn.commit()
+
+
+def cancel_session(conn: sqlite3.Connection, session_id: int) -> None:
+    conn.execute(
+        "UPDATE sessions SET cancelled_at = ? WHERE id = ? AND cancelled_at IS NULL",
+        (_utc_now(), session_id),
+    )
+    conn.commit()
+
+
+def sessions_awaiting_pick_announcement(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Posted, not cancelled, and the in-charge pick not yet announced."""
+    return conn.execute(
+        """
+        SELECT * FROM sessions
+        WHERE message_id IS NOT NULL AND cancelled_at IS NULL AND announced_at IS NULL
+        ORDER BY starts_at
+        """
+    ).fetchall()
+
+
+def set_session_pick(
+    conn: sqlite3.Connection,
+    session_id: int,
+    primary_id: int | None,
+    secondary_id: int | None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE sessions SET primary_id = ?, secondary_id = ?,
+            picked_at = COALESCE(picked_at, ?)
+        WHERE id = ?
+        """,
+        (primary_id, secondary_id, _utc_now(), session_id),
+    )
+    conn.commit()
+
+
+def mark_session_announced(conn: sqlite3.Connection, session_id: int) -> None:
+    conn.execute(
+        "UPDATE sessions SET announced_at = ? WHERE id = ?", (_utc_now(), session_id)
+    )
+    conn.commit()
+
+
+def list_signups(conn: sqlite3.Connection, session_id: int) -> list[sqlite3.Row]:
+    """Everyone signed up, in join order (players first, then the waitlist)."""
+    return conn.execute(
+        "SELECT * FROM session_signups WHERE session_id = ? ORDER BY id", (session_id,)
+    ).fetchall()
+
+
+def add_signup(conn: sqlite3.Connection, session_id: int, user_id: int, name: str) -> bool:
+    """False if they were already signed up (their place is kept)."""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO session_signups (session_id, user_id, name) VALUES (?, ?, ?)",
+        (session_id, user_id, name),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def remove_signup(conn: sqlite3.Connection, session_id: int, user_id: int) -> bool:
+    cursor = conn.execute(
+        "DELETE FROM session_signups WHERE session_id = ? AND user_id = ?",
+        (session_id, user_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def times_primary(conn: sqlite3.Connection, exclude_session_id: int) -> dict[int, int]:
+    """How often each person ended up collecting nets and shuttles (fair rotation)."""
+    rows = conn.execute(
+        """
+        SELECT primary_id, COUNT(*) AS n FROM sessions
+        WHERE primary_id IS NOT NULL AND cancelled_at IS NULL AND id != ?
+        GROUP BY primary_id
+        """,
+        (exclude_session_id,),
+    ).fetchall()
+    return {row["primary_id"]: row["n"] for row in rows}

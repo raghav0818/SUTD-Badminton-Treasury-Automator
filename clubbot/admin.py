@@ -51,6 +51,7 @@ MEMBER_COMMANDS = (
     ("help", "List commands"),
 )
 ADMIN_COMMANDS = (
+    ("session", "Post a recre session for sign-ups"),
     ("unpaid", "Who hasn't paid yet"),
     ("stats", "Term payment summary"),
     ("members", "All registered members"),

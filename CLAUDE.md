@@ -12,8 +12,20 @@ session** — that is how sessions hand off. The full design/PRD is at
 `docs/superpowers/specs/2026-06-11-club-payment-bot-design.md`; read it before
 changing payment or verification logic.
 
-## Status (2026-10-07)
+## Status (2026-10-10)
 
+- **Recre session sign-ups (replaces Mitup), branch
+  `automating-recre-announcements`, built 2026-10-10, not merged/deployed.**
+  Plan `docs/superpowers/specs/2026-10-10-session-signups-plan.md` (treasurer
+  approved D1–D5), research `docs/research/2026-10-10-session-announcements-rsvp.md`.
+  Admins (the vice captain @mikeclh, once `/addadmin`ed) DM `/session` →
+  preview → card in the rec group with Join/Leave, live list + waitlist
+  (default 30 spots: 4 courts × 6). Noon on the session day (noon the day
+  before if it starts by 2pm) the bot picks a primary (nets + shuttles from the
+  store room) and a backup, fair rotation by fewest past primaries; DMs both +
+  mentions in the group. Leave / "I can't make it" by the primary hands over
+  to the backup and picks a new backup. 255 tests pass. Next: review, merge,
+  deploy, then the vice captain registers and gets `/addadmin`.
 - **v2 is merged to `main` and pushed (2026-10-07); not
   yet deployed.** It implements every item in
   `docs/superpowers/specs/2026-10-04-v2-build-list.md` (A–D): Gemini
@@ -144,6 +156,7 @@ changing payment or verification logic.
 | `clubbot/scheduler.py` | Hourly due-check (term-start blast, d3/7/10/13 + last-call reminders, Mon/Thu group posts; `term_events` stamps), Sunday DB backup DM, Gemini-failure retry, Sheet sync jobs |
 | `clubbot/removal.py` | Rec chat only: remove unpaid people after deadline + grace (preview/warning/daily sweep), join-request gate, join tracking, `/keep` |
 | `scripts/import_rec_members.py` | One-off Telethon import of people already in the rec chat (bots can't list members) |
+| `clubbot/sessions.py` | `/session` recre sign-up cards (`ss:` buttons), waitlist, noon nets & shuttles pick + handoff |
 | `clubbot/sheets.py` | Read-only Google Sheet mirror (Members + Payments + Shirts tabs) |
 | `clubbot/config.py`, `__main__.py` | `.env` loading; entry point `python -m clubbot` |
 | `scripts/preflight.py` | Pre-launch connectivity check for all three secrets |
@@ -219,5 +232,10 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   `rec_group_people` table, `/keep`, `/settings remove_unpaid|removal_grace_days`,
   `/setgroup rec` rights check + join-request link, `run_polling(allowed_updates=ALL)`,
   `scripts/import_rec_members.py`. 250 tests pass. Not merged or live-tested.
+- **2026-10-10** — Recre session sign-ups to replace Mitup for the vice
+  captain: research → plan → self-grill (20 questions, waitlist / handoff /
+  cancel / noon pick added) → treasurer decisions (admin host, anyone in rec
+  group joins, noon pick, fair rotation, 30 spots) → built in
+  `clubbot/sessions.py` + `tests/test_sessions.py`. Not yet reviewed or live.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).
