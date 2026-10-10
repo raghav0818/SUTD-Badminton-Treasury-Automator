@@ -108,6 +108,16 @@ CREATE TABLE IF NOT EXISTS term_events (
     PRIMARY KEY (term_id, event)
 );
 
+-- Everyone the bot has seen in the REC group chat (joins, join requests, the
+-- one-off import), registered or not, so unpaid ones can be removed.
+-- first_seen_at never moves: leaving and rejoining earns no new grace period.
+CREATE TABLE IF NOT EXISTS rec_group_people (
+    telegram_user_id INTEGER PRIMARY KEY,
+    name             TEXT    NOT NULL,
+    first_seen_at    TEXT    NOT NULL,
+    keep             INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_member_term
     ON payments(member_id, term_id);
 """
@@ -1040,6 +1050,80 @@ def term_event_claimed(conn: sqlite3.Connection, term_id: int, event: str) -> bo
     return conn.execute(
         "SELECT 1 FROM term_events WHERE term_id = ? AND event = ?", (term_id, event)
     ).fetchone() is not None
+
+
+def term_event_sent_at(
+    conn: sqlite3.Connection, term_id: int, event: str
+) -> datetime | None:
+    row = conn.execute(
+        "SELECT sent_at FROM term_events WHERE term_id = ? AND event = ?",
+        (term_id, event),
+    ).fetchone()
+    return datetime.fromisoformat(row["sent_at"]) if row else None
+
+
+# --- Rec group chat: removing unpaid people ------------------------------------
+
+
+def note_rec_person(conn: sqlite3.Connection, telegram_user_id: int, name: str) -> None:
+    """Remember someone seen in the rec chat; first_seen_at is kept on repeats."""
+    conn.execute(
+        """
+        INSERT INTO rec_group_people (telegram_user_id, name, first_seen_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(telegram_user_id) DO UPDATE SET name = excluded.name
+        """,
+        (telegram_user_id, name, _utc_now()),
+    )
+    conn.commit()
+
+
+def get_rec_person(conn: sqlite3.Connection, telegram_user_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM rec_group_people WHERE telegram_user_id = ?", (telegram_user_id,)
+    ).fetchone()
+
+
+def set_rec_keep(
+    conn: sqlite3.Connection, telegram_user_id: int, name: str, keep: bool
+) -> None:
+    """Keep list: never removed from the rec chat (coaches, alumni helpers)."""
+    conn.execute(
+        """
+        INSERT INTO rec_group_people (telegram_user_id, name, first_seen_at, keep)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(telegram_user_id) DO UPDATE SET keep = excluded.keep
+        """,
+        (telegram_user_id, name, _utc_now(), int(keep)),
+    )
+    conn.commit()
+
+
+def list_rec_kept(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM rec_group_people WHERE keep = 1 ORDER BY name"
+    ).fetchall()
+
+
+def list_rec_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Everyone who might be in the rec chat: people seen there + registered members.
+
+    Columns: telegram_user_id, name, first_seen_at (NULL = never seen joining),
+    keep, sutd_id (NULL = never registered with the bot).
+    """
+    return conn.execute(
+        """
+        SELECT p.telegram_user_id, COALESCE(m.full_name, p.name) AS name,
+               p.first_seen_at, p.keep, m.sutd_id
+        FROM rec_group_people p
+        LEFT JOIN members m ON m.telegram_user_id = p.telegram_user_id
+        UNION ALL
+        SELECT m.telegram_user_id, m.full_name, NULL, 0, m.sutd_id
+        FROM members m
+        WHERE m.telegram_user_id NOT IN (SELECT telegram_user_id FROM rec_group_people)
+        ORDER BY name
+        """
+    ).fetchall()
 
 
 def get_term_payment_stats(conn: sqlite3.Connection, term_id: int) -> dict[str, int]:

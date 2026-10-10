@@ -30,7 +30,7 @@ commands you can use; admins and the treasurer see theirs too.
 | Command | What it does |
 |---|---|
 | `/unpaid` | Who hasn't paid this term, plus roster people who never opened the bot, and how many opted out. The treasurer also gets a **Mark paid** button per person (lists of up to 30) for cash payments, each asking to confirm. |
-| `/setgroup rec` / `/setgroup comp` | Send **inside** the rec or competitive group chat (make the bot a group **admin** first, so Telegram lets it check who is in the group at registration) to link it. The bot then posts paid counts (no names) plus a tap-to-pay link there on Mondays and Thursdays at 12:00 until the deadline. |
+| `/setgroup rec` / `/setgroup comp` | Send **inside** the rec or competitive group chat (make the bot a group **admin** first, so Telegram lets it check who is in the group at registration) to link it. The bot then posts paid counts (no names) plus a tap-to-pay link there on Mondays and Thursdays at 12:00 until the deadline. **Rec chat only:** the bot also needs the admin rights **Ban users** and **Invite users via link**; it then revokes the old main invite link and replies with a new **join link** (joining asks the bot, which welcomes the person by DM and lets them in, except people removed for not paying, until they pay). Revoke any other old links by hand. |
 | `/stats` | Term summary: count × price per category (compare once per term against FLYMAX), total, roster paid, registered / paid / unpaid / opted out / exceptions. |
 | `/roster` | Replace the competitive roster: `/roster` then one `Name, 1010xxx` line per person in the same message. If any line is invalid nothing changes, so a typo can never drop a player. `/roster` alone shows the current size. |
 | `/members` | All registered members. |
@@ -48,6 +48,9 @@ commands you can use; admins and the treasurer see theirs too.
 | `/relink <sutd_id>` | Member changed Telegram account: arm this, they re-register with `/start` from the new account within 48 h and their history moves over. `/relink` alone lists armed relinks with a Cancel button each. |
 | `/settings` | View/change the PayNow values (UEN, merchant name, Billing ID, recipient match). Only needed if the school ever changes its account. |
 | `/settings group_posts off` / `on` | Stop or resume the twice-weekly group progress posts (default on). |
+| `/settings remove_unpaid off` / `preview` / `on` | Removing unpaid people from the **rec chat only** (the comp chat is never touched). Default `preview`: 2 days before removal day you get the list, but nobody is removed. `on`: unpaid people also get a warning DM then, and on removal day (deadline + grace days, 10:00) everyone still unpaid is removed; late joiners are removed when their own grace runs out. A pending/under-review receipt, any verified payment (rec or comp), admins and the Keep list are never removed. Removed people can rejoin with the join link once they've paid. |
+| `/settings removal_grace_days <n>` | Days after the deadline before unpaid people are removed (default 7). |
+| `/keep` | People never removed from the rec chat (coaches, alumni). Add them with the **Keep** buttons in the removal preview; `/keep` shows an Unkeep button each. |
 
 When a receipt fails a check you get a DM with **Approve / Reject** buttons —
 that is the whole exception workflow.
@@ -151,6 +154,24 @@ sudo systemctl stop clubbot           # stop
 
 Never run the bot on the PC while the Pi service is running — two copies
 fight over Telegram.
+
+### One-time: record people already in the rec chat
+
+A Telegram bot cannot list a group's members, so people who were in the rec
+chat before the bot was watching (and never registered or rejoined) are
+invisible to it. Import them once, after `/setgroup rec`: get an `api_id` and
+`api_hash` at https://my.telegram.org ("API development tools"), then on the Pi:
+
+```bash
+sudo systemctl stop clubbot
+~/clubbot/.venv/bin/pip install telethon
+cd ~/clubbot && TELEGRAM_API_ID=... TELEGRAM_API_HASH=... .venv/bin/python scripts/import_rec_members.py
+sudo systemctl start clubbot
+```
+
+It prints how many it imported vs the chat's member count. If they're far
+apart, make the next term's rec chat the last new group (add the bot before
+anyone joins). Imported people get the normal grace period from the import day.
 
 ### Before the first real term
 

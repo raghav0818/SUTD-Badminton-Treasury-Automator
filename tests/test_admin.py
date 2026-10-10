@@ -573,8 +573,47 @@ def test_setgroup_stores_chat_id_inside_a_group(conn):
         update.effective_chat.id = chat_id
         context.args = [kind]
         context.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="administrator"))
+        context.bot.export_chat_invite_link = AsyncMock()
+        context.bot.create_chat_invite_link = AsyncMock(
+            return_value=MagicMock(invite_link="https://t.me/+join")
+        )
         asyncio.run(admin.cmd_setgroup(update, context))
         assert db.get_setting(conn, key) == str(chat_id)
+    # Rec: the old main link is revoked and a join-request link replaces it.
+    assert db.get_setting(conn, "rec_join_link") == "https://t.me/+join"
+
+
+def test_setgroup_rec_needs_ban_and_invite_rights(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    update.effective_chat.type = "supergroup"
+    update.effective_chat.id = -1002
+    context.args = ["rec"]
+    context.bot.get_chat_member = AsyncMock(
+        return_value=MagicMock(
+            status="administrator", can_restrict_members=False, can_invite_users=True
+        )
+    )
+    asyncio.run(admin.cmd_setgroup(update, context))
+    assert db.get_setting(conn, "rec_group_id") is None
+    assert "Ban users" in reply_text_of(update)
+
+
+def test_settings_remove_unpaid_and_grace_days(conn):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["remove_unpaid", "ON"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert db.get_setting(conn, "remove_unpaid") == "on"
+    context.args = ["remove_unpaid", "maybe"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert db.get_setting(conn, "remove_unpaid") == "on"
+    context.args = ["removal_grace_days", "10"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert db.get_setting(conn, "removal_grace_days") == "10"
+    context.args = ["removal_grace_days", "-1"]
+    asyncio.run(admin.cmd_settings(update, context))
+    assert db.get_setting(conn, "removal_grace_days") == "10"
 
 
 def test_setgroup_requires_the_bot_to_be_group_admin(conn):

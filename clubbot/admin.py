@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 from dataclasses import replace
@@ -18,7 +19,7 @@ from telegram import (
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from clubbot import db, scheduler, validation
+from clubbot import db, removal, scheduler, validation
 from clubbot.format import money
 from clubbot.payments import SchoolConfig, build_member_qr, school_config
 
@@ -65,7 +66,8 @@ TREASURER_COMMANDS = (
     ("removeadmin", "Remove an admin (tap to choose)"),
     ("transfertreasurer", "Hand over the treasurer role: /transfertreasurer <SUTD ID>"),
     ("relink", "Member changed Telegram account"),
-    ("settings", "PayNow and group post settings"),
+    ("keep", "People never removed from the rec chat"),
+    ("settings", "PayNow, group post and removal settings"),
 )
 
 
@@ -334,23 +336,62 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if kind not in db.GROUP_KEYS:
         await update.message.reply_text("Usage: /setgroup rec or /setgroup comp")
         return
+    chat_id = update.effective_chat.id
     try:
-        me = await context.bot.get_chat_member(update.effective_chat.id, context.bot.id)
+        me = await context.bot.get_chat_member(chat_id, context.bot.id)
         is_admin = me.status in ("administrator", "creator")
     except Exception:
-        is_admin = False
+        me, is_admin = None, False
     if not is_admin:
         # Telegram only guarantees member lookups (the registration check)
         # for bots that are group admins.
         await update.message.reply_text(
-            "Make me an admin of this group first (no special permissions "
-            f"needed), then send /setgroup {kind} again."
+            "Make me an admin of this group first"
+            + (
+                " with the rights \"Ban users\" and \"Invite users via link\""
+                if kind == "rec"
+                else " (no special permissions needed)"
+            )
+            + f", then send /setgroup {kind} again."
         )
         return
-    db.set_setting(conn, db.GROUP_KEYS[kind], str(update.effective_chat.id))
+    if kind != "rec":
+        db.set_setting(conn, db.GROUP_KEYS[kind], str(chat_id))
+        await update.message.reply_text(
+            f"This chat is now the {kind} group. Progress posts (counts only, no "
+            "names) go here on Mondays and Thursdays until the deadline."
+        )
+        return
+    # Rec chat only: removing unpaid people and gating rejoins need two rights.
+    if not (getattr(me, "can_restrict_members", False) and getattr(me, "can_invite_users", False)):
+        await update.message.reply_text(
+            "Give me the admin rights \"Ban users\" and \"Invite users via link\" "
+            "in this group, then send /setgroup rec again."
+        )
+        return
+    try:
+        # A new primary link revokes the old one, so removed people can't
+        # walk back in with it; joins now go through the bot's request link.
+        await context.bot.export_chat_invite_link(chat_id)
+        old_link = db.get_setting(conn, removal.JOIN_LINK_KEY)
+        if old_link:
+            with contextlib.suppress(TelegramError):
+                await context.bot.revoke_chat_invite_link(chat_id, old_link)
+        link = await context.bot.create_chat_invite_link(
+            chat_id, name="Club join link", creates_join_request=True
+        )
+    except TelegramError as exc:
+        await update.message.reply_text(f"Could not create the join link: {exc}")
+        return
+    db.set_setting(conn, db.GROUP_KEYS[kind], str(chat_id))
+    db.set_setting(conn, removal.JOIN_LINK_KEY, link.invite_link)
     await update.message.reply_text(
-        f"This chat is now the {kind} group. Progress posts (counts only, no "
-        "names) go here on Mondays and Thursdays until the deadline."
+        "This chat is now the rec group. Progress posts (counts only, no names) "
+        "go here on Mondays and Thursdays until the deadline.\n\n"
+        f"Join link from now on: {link.invite_link}\n"
+        "I welcome everyone who asks to join and let them in, except people "
+        "removed for not paying (until they pay). The old main invite link no "
+        "longer works; please revoke any other old links in the group settings."
     )
 
 
@@ -692,7 +733,7 @@ SETTING_KEYS = (
     "school_bill_number",
     "school_recipient_match",
 )
-ALL_SETTING_KEYS = SETTING_KEYS + ("group_posts",)
+ALL_SETTING_KEYS = SETTING_KEYS + ("group_posts", "remove_unpaid", "removal_grace_days")
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -711,6 +752,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             lines.append(f"{key} = {value}{suffix}")
         group_posts = db.get_setting(conn, "group_posts") or "on (default)"
         lines.append(f"group_posts = {group_posts}")
+        lines.append(f"remove_unpaid = {removal.mode(conn)} (off | preview | on)")
+        lines.append(f"removal_grace_days = {removal.grace_days(conn)}")
         lines.append("\nChange with: /settings <key> <value>")
         await update.message.reply_text("\n".join(lines))
         return
@@ -731,6 +774,33 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         db.set_setting(conn, key, value.lower())
         await update.message.reply_text(f"Group progress posts turned {value.lower()}.")
+        return
+    if key == "remove_unpaid":
+        if value.lower() not in removal.MODES:
+            await update.message.reply_text("Usage: /settings remove_unpaid off|preview|on")
+            return
+        db.set_setting(conn, key, value.lower())
+        await update.message.reply_text(
+            {
+                "off": "Unpaid people will not be removed from the rec chat.",
+                "preview": "Preview mode: you get the list before removal day, "
+                "but nobody is removed.",
+                "on": "Unpaid people will be removed from the rec chat after the "
+                "deadline + grace days. You get a preview (with Keep buttons) "
+                "2 days before.",
+            }[value.lower()]
+        )
+        return
+    if key == "removal_grace_days":
+        if not value.isdigit() or int(value) > removal.MAX_GRACE_DAYS:
+            await update.message.reply_text(
+                f"Usage: /settings removal_grace_days <0-{removal.MAX_GRACE_DAYS}>"
+            )
+            return
+        db.set_setting(conn, key, str(int(value)))
+        await update.message.reply_text(
+            f"Unpaid people are removed {int(value)} day(s) after the deadline."
+        )
         return
     # Dry-run a QR with the candidate value; a bad UEN/merchant name/bill
     # number (non-ASCII, too long) would otherwise break /pay for everyone.

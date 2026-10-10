@@ -10,11 +10,12 @@ import sqlite3
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -23,7 +24,7 @@ from telegram.ext import (
     filters,
 )
 
-from clubbot import admin, db, newterm, scheduler, validation
+from clubbot import admin, db, newterm, removal, scheduler, validation
 from clubbot.newterm import (  # noqa: F401  (re-exported for tests)
     NEWTERM_USAGE,
     cmd_newterm,
@@ -42,12 +43,6 @@ log = logging.getLogger(__name__)
 ASK_NAME, ASK_SUTD_ID, CONFIRM = range(3)
 MAX_RECEIPT_BYTES = 8 * 1024 * 1024
 MAX_EXTRACT_ATTEMPTS = 4  # the first try plus three 15-minute retries
-# Settings written by /setgroup; registration requires being in one of them.
-IN_GROUP_STATUSES = {
-    ChatMemberStatus.MEMBER,
-    ChatMemberStatus.ADMINISTRATOR,
-    ChatMemberStatus.OWNER,
-}
 
 WELCOME = (
     "Welcome to the SUTD Badminton Club bot!\n\n"
@@ -119,8 +114,9 @@ ADMIN_HELP = (
     "/removeadmin - remove an admin (tap to choose)\n"
     "/transfertreasurer <sutd_id> - hand over the treasurer role\n"
     "/relink <sutd_id> - let a member re-register from a new Telegram account\n"
-    "/settings - view or change the PayNow/verification settings "
-    "and group_posts on|off"
+    "/keep - people never removed from the rec chat\n"
+    "/settings - view or change the PayNow/verification settings, "
+    "group_posts on|off, remove_unpaid off|preview|on, removal_grace_days"
 )
 
 
@@ -181,11 +177,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def _in_club_group(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """True if no club group is configured yet, or the user is in one of them."""
+    """True if no club group is configured yet, or the user is in one of them
+    (or was seen in the rec chat: someone removed for not paying must be able
+    to register and pay before rejoining)."""
     group_ids = [
         value for key in db.GROUP_KEYS.values() if (value := db.get_setting(_db(context), key))
     ]
-    if not group_ids:
+    if not group_ids or db.get_rec_person(_db(context), user_id) is not None:
         return True
     for chat_id in group_ids:
         try:
@@ -194,10 +192,7 @@ async def _in_club_group(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bo
             # Bot removed from the group, bad stored id, network: not in it.
             log.warning("getChatMember failed for group %s", chat_id, exc_info=True)
             continue
-        if member.status in IN_GROUP_STATUSES or (
-            member.status == ChatMemberStatus.RESTRICTED
-            and getattr(member, "is_member", False)
-        ):
+        if removal.in_chat(member):
             return True
     return False
 
@@ -865,6 +860,12 @@ def build_application(
     app.add_handler(CommandHandler("settings", admin.cmd_settings, filters=PRIVATE))
     app.add_handler(CommandHandler("roster", admin.cmd_roster, filters=PRIVATE))
     app.add_handler(CommandHandler("setgroup", admin.cmd_setgroup))
+    app.add_handler(CommandHandler("keep", removal.cmd_keep, filters=PRIVATE))
+    app.add_handler(CallbackQueryHandler(removal.on_keep_toggle, pattern=r"^(kp|uk):\d+$"))
+    # Rec chat only (the handlers ignore every other chat): track joins, and
+    # gate join requests so unpaid removed people can't walk back in.
+    app.add_handler(ChatMemberHandler(removal.on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatJoinRequestHandler(removal.on_join_request))
     app.add_handler(CallbackQueryHandler(on_pay_start, pattern=r"^pay:start$"))
     app.add_handler(CallbackQueryHandler(on_optout, pattern=r"^optout:\d+$"))
     app.add_handler(

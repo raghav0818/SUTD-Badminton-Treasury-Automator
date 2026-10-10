@@ -46,6 +46,13 @@ changing payment or verification logic.
   running v2 (first backup DM sent). Deploying later changes: Claude can
   `git pull` + `pip install` over ssh, but the restart needs the
   treasurer (`sudo systemctl restart clubbot`, or `bash ~/clubbot/deploy/update.sh`).
+- **Removing unpaid people from the rec chat (2026-10-10)** is built on branch
+  `removing-unpaid-members` (plan: `docs/superpowers/specs/removing-member-plan.md`),
+  250 tests pass, not merged or live-tested. Rec chat ONLY, never the comp
+  chat. Default `remove_unpaid=preview`. Live test needs: bot admin in the rec
+  chat with Ban users + Invite users rights, `/setgroup rec` again (makes the
+  join-request link), revoke old links, and the one-off
+  `scripts/import_rec_members.py` (Telethon; needs api_id/api_hash).
 - **Beware a stale parallel copy** at `Documents\SUTD Projects\Badmintion Tele Bot`
   (remote `badminton-tele-bot`). THIS repo is the source of truth.
 - **Google side moved (2026-10-07)** to its own Firebase project
@@ -107,6 +114,11 @@ changing payment or verification logic.
 - All date/time logic uses explicit Singapore time (`db.SINGAPORE_TIME`);
   the host OS timezone (UTC on the Pi) must not matter.
 - SUTD IDs: 7 digits starting `1010`.
+- **A bot cannot list a group's members** (Bot API). It only knows people who
+  registered, joined/requested while it watched (`chat_member` needs
+  `allowed_updates`), or came from the one-off Telethon import. A kick is
+  ban + unban; the join-request link is the only way to DM a stranger
+  (5-minute window, DM before approving).
 - **v2 design rules settled in review (keep them):** a Telegram `Forbidden`
   (member blocked the bot) counts as delivered; any other send error retries.
   Stamps (`term_events`, `payments.notified_at`) are written only after
@@ -130,6 +142,8 @@ changing payment or verification logic.
 | `clubbot/gemini.py` | Gemini Flash structured extraction (swappable adapter) |
 | `clubbot/db.py` | SQLite schema + auto-migration + every query; relink; SGT source of truth |
 | `clubbot/scheduler.py` | Hourly due-check (term-start blast, d3/7/10/13 + last-call reminders, Mon/Thu group posts; `term_events` stamps), Sunday DB backup DM, Gemini-failure retry, Sheet sync jobs |
+| `clubbot/removal.py` | Rec chat only: remove unpaid people after deadline + grace (preview/warning/daily sweep), join-request gate, join tracking, `/keep` |
+| `scripts/import_rec_members.py` | One-off Telethon import of people already in the rec chat (bots can't list members) |
 | `clubbot/sheets.py` | Read-only Google Sheet mirror (Members + Payments + Shirts tabs) |
 | `clubbot/config.py`, `__main__.py` | `.env` loading; entry point `python -m clubbot` |
 | `scripts/preflight.py` | Pre-launch connectivity check for all three secrets |
@@ -196,5 +210,14 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   replies split under 4096 chars; PTB pinned `>=22.8,<23`. Codex review: 6
   findings, all fixed (`80f9a8f`); 231 tests pass. Pulled onto the Pi;
   needs a restart to go live. Real-Telegram test run still not done.
+- **2026-10-10** — On branch `removing-unpaid-members`: researched
+  (`docs/research/2026-10-10-removing-unpaid-members.md`) and grilled a plan to
+  auto-remove unpaid people from the **rec chat only** (never the comp chat):
+  `docs/superpowers/specs/removing-member-plan.md` (join-request gate, daily
+  sweep after deadline + grace, preview/Keep, one-off Telethon import of
+  existing members). Treasurer approved; built the same day: `clubbot/removal.py`,
+  `rec_group_people` table, `/keep`, `/settings remove_unpaid|removal_grace_days`,
+  `/setgroup rec` rights check + join-request link, `run_polling(allowed_updates=ALL)`,
+  `scripts/import_rec_members.py`. 250 tests pass. Not merged or live-tested.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).

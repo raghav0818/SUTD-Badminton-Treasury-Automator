@@ -2,6 +2,8 @@
 
 import logging
 
+from telegram import Update
+
 from clubbot import bot, config, db
 from clubbot.gemini import GeminiExtractor
 from clubbot.sheets import SheetMirror
@@ -30,7 +32,8 @@ def main() -> None:
             "SHEET_ID; mirror disabled."
         )
     app = bot.build_application(cfg.bot_token, conn, extractor=extractor, sheet=sheet)
-    app.run_polling()
+    # chat_member updates (rec chat joins) are only sent when asked for.
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

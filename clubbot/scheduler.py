@@ -18,7 +18,7 @@ from datetime import date, datetime, time, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Forbidden
 
-from clubbot import db
+from clubbot import db, removal
 from clubbot.payments import SINGAPORE_TIME
 
 log = logging.getLogger(__name__)
@@ -156,6 +156,7 @@ async def send_unpaid_reminders(
             f"(deadline {term['deadline']}). Tap Pay now to get your QR, "
             "then send the payment screenshot here."
         )
+    text += removal.removal_notice(conn, term)
     sent = 0
     for member in db.list_unpaid_members(conn, term_id):
         stamp = f"{event}:{member['telegram_user_id']}" if event else None
@@ -184,6 +185,7 @@ def group_post_texts(bot, conn: sqlite3.Connection, term) -> dict[str, str]:
             f"{term['name']} membership - "
             f"{db.recreational_paid_count(conn, term['id'])} rec members paid so far."
             + tail
+            + removal.removal_notice(conn, term)
         ),
     }
 
@@ -220,6 +222,9 @@ async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
         return
     group_posts_on = db.get_setting(conn, "group_posts") != "off"
     for term in db.list_terms(conn):
+        if term["start_date"] <= today.isoformat() <= term["end_date"]:
+            # Rec chat clean-up runs until the term ends (late joiners).
+            await removal.run_due(bot, conn, term, today)
         if not term["start_date"] <= today.isoformat() <= term["deadline"]:
             continue
         blasted = False
