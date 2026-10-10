@@ -60,7 +60,7 @@ changing payment or verification logic.
   treasurer (`sudo systemctl restart clubbot`, or `bash ~/clubbot/deploy/update.sh`).
 - **Removing unpaid people from the rec chat (2026-10-10)** is built on branch
   `removing-unpaid-members` (plan: `docs/superpowers/specs/removing-member-plan.md`),
-  250 tests pass, not merged or live-tested. Rec chat ONLY, never the comp
+  merged to `main` and pushed 2026-10-10 (`e586358`, together with the session sign-ups; 274 tests pass), not live-tested. Rec chat ONLY, never the comp
   chat. Default `remove_unpaid=preview`. Live test needs: bot admin in the rec
   chat with Ban users + Invite users rights, `/setgroup rec` again (makes the
   join-request link), revoke old links, and the one-off
@@ -231,7 +231,7 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   existing members). Treasurer approved; built the same day: `clubbot/removal.py`,
   `rec_group_people` table, `/keep`, `/settings remove_unpaid|removal_grace_days`,
   `/setgroup rec` rights check + join-request link, `run_polling(allowed_updates=ALL)`,
-  `scripts/import_rec_members.py`. 250 tests pass. Not merged or live-tested.
+  `scripts/import_rec_members.py`. Merged to `main` with the session sign-ups (274 tests pass); not live-tested.
 - **2026-10-10** — Recre session sign-ups to replace Mitup for the vice
   captain: research → plan → self-grill (20 questions, waitlist / handoff /
   cancel / noon pick added) → treasurer decisions (admin host, anyone in rec
