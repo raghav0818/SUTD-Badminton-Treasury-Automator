@@ -21,7 +21,12 @@ from telegram.ext import ContextTypes
 
 from clubbot import db, removal, scheduler, validation
 from clubbot.format import money
-from clubbot.payments import SchoolConfig, build_member_qr, school_config
+from clubbot.payments import (
+    SchoolConfig,
+    build_member_qr,
+    normalise_verification_text,
+    school_config,
+)
 
 log = logging.getLogger(__name__)
 
@@ -316,6 +321,7 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     db.replace_roster(conn, rows)
+    scheduler.request_sheet_sync(context.application)
     await update.message.reply_text(f"Roster replaced: {len(rows)} people.")
 
 
@@ -801,6 +807,13 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         db.set_setting(conn, key, str(int(value)))
         await update.message.reply_text(
             f"Unpaid people are removed {int(value)} day(s) after the deadline."
+        )
+        return
+    if key in ("school_bill_number", "school_recipient_match") and not (
+        normalise_verification_text(value)
+    ):
+        await update.message.reply_text(
+            "Not saved - this verification value must contain letters or numbers."
         )
         return
     # Dry-run a QR with the candidate value; a bad UEN/merchant name/bill

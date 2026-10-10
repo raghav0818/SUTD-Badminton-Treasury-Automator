@@ -4,7 +4,7 @@ from datetime import date, datetime, time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 from clubbot import db, sessions
 from clubbot.db import SINGAPORE_TIME
@@ -231,6 +231,17 @@ def test_refresh_ignores_message_not_modified(conn):
     join(context, sid, 1)  # must not raise
 
 
+def test_immediate_refresh_retries_after_telegram_rate_limit(conn):
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    context.bot.edit_message_text.reset_mock()
+    context.bot.edit_message_text.side_effect = [RetryAfter(0), None]
+
+    asyncio.run(sessions._refresh_now(context.bot, conn, sid))
+
+    assert context.bot.edit_message_text.await_count == 2
+
+
 # --- the noon pick and handoff -------------------------------------------------------
 
 
@@ -277,6 +288,83 @@ def test_failed_announcement_keeps_pick_and_retries(conn):
     after = db.get_session(conn, sid)
     assert after["announced_at"] is not None
     assert (after["primary_id"], after["secondary_id"]) == (session["primary_id"], session["secondary_id"])
+
+
+def test_zero_player_pick_notifies_host_once(conn):
+    context = make_context(conn)
+    posted_session(conn, context)
+    context.bot.send_message.reset_mock()
+    noon = datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)
+
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon))
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon.replace(hour=13)))
+
+    host_dms = [
+        call.kwargs["text"] for call in context.bot.send_message.call_args_list
+        if call.kwargs["chat_id"] == HOST
+    ]
+    assert len(host_dms) == 1
+    assert "nobody" in host_dms[0].lower()
+
+
+def test_zero_player_host_notification_retries_after_send_failure(conn):
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    context.bot.send_message.reset_mock()
+    context.bot.send_message.side_effect = [BadRequest("temporary failure"), None]
+    noon = datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)
+
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon))
+    assert db.get_session(conn, sid)["empty_notified_at"] is None
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon.replace(hour=13)))
+
+    assert context.bot.send_message.await_count == 2
+    assert db.get_session(conn, sid)["empty_notified_at"] is not None
+
+
+def test_failed_handoff_group_post_is_retried_by_due_job(conn):
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    join(context, sid, 1, 2, 3)
+    noon = datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon))
+    old = db.get_session(conn, sid)
+
+    async def fail_group(*args, **kwargs):
+        if kwargs.get("chat_id") == REC_GROUP:
+            raise BadRequest("temporary group failure")
+        return MagicMock()
+
+    context.bot.send_message.side_effect = fail_group
+    asyncio.run(sessions.on_leave(make_tap(f"ss:l:{sid}", old["primary_id"]), context))
+    assert db.get_session(conn, sid)["announced_at"] is None
+
+    context.bot.send_message.side_effect = None
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon.replace(hour=13)))
+    assert db.get_session(conn, sid)["announced_at"] is not None
+
+
+def test_failed_nobody_left_handoff_is_retried_by_due_job(conn):
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    join(context, sid, 1)
+    noon = datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon))
+    old = db.get_session(conn, sid)
+
+    async def fail_group(*args, **kwargs):
+        if kwargs.get("chat_id") == REC_GROUP:
+            raise BadRequest("temporary group failure")
+        return MagicMock()
+
+    context.bot.send_message.side_effect = fail_group
+    asyncio.run(sessions.on_leave(make_tap(f"ss:l:{sid}", old["primary_id"]), context))
+    assert db.get_session(conn, sid)["announced_at"] is None
+
+    context.bot.send_message.side_effect = None
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon.replace(hour=13)))
+    assert db.get_session(conn, sid)["announced_at"] is not None
+    assert "nobody is left" in context.bot.send_message.call_args.kwargs["text"]
 
 
 def test_primary_cant_make_it_hands_over_to_backup(conn):

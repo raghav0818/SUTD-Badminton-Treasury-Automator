@@ -219,6 +219,91 @@ def test_on_mode_warns_then_removes_on_removal_day(conn):
     assert fake.ban_chat_member.await_count == 2
 
 
+def test_large_preview_is_chunked_and_every_candidate_has_keep_button(conn):
+    term = _term(conn)
+    db.set_setting(conn, "remove_unpaid", "on")
+    statuses = {}
+    for uid in range(1, 184):
+        _seen(conn, uid, f"Member {uid:03d} With A Long Display Name", date(2026, 8, 1))
+        statuses[uid] = ChatMemberStatus.MEMBER
+    fake = make_bot(statuses)
+
+    _run(fake, conn, term, REMOVAL_DAY - timedelta(days=2))
+
+    treasurer_calls = [
+        call for call in fake.send_message.call_args_list
+        if call.kwargs["chat_id"] == TREASURER
+    ]
+    assert len(treasurer_calls) > 1
+    assert all(len(call.kwargs["text"]) <= 4096 for call in treasurer_calls)
+    keep_ids = {
+        int(button.callback_data.split(":")[1])
+        for call in treasurer_calls
+        if (markup := call.kwargs.get("reply_markup"))
+        for row in markup.inline_keyboard
+        for button in row
+    }
+    assert keep_ids == set(statuses)
+
+
+def test_transient_warning_failure_retries_before_preview_is_complete(conn):
+    term = _term(conn)
+    db.set_setting(conn, "remove_unpaid", "on")
+    _member(conn, 1, "1010001", "Unpaid Alice")
+    fake = make_bot({1: ChatMemberStatus.MEMBER})
+    attempts = {1: 0}
+
+    async def send_message(*args, **kwargs):
+        if kwargs["chat_id"] == 1:
+            attempts[1] += 1
+            if attempts[1] == 1:
+                raise BadRequest("temporary warning failure")
+        return MagicMock()
+
+    fake.send_message = AsyncMock(side_effect=send_message)
+    preview_day = REMOVAL_DAY - timedelta(days=2)
+    _run(fake, conn, term, preview_day)
+    _run(fake, conn, term, preview_day)
+
+    assert attempts[1] == 2
+    assert db.term_event_claimed(conn, term["id"], "removal-previewed:1")
+
+
+def test_unban_failure_is_persisted_and_retried_hourly(conn):
+    term = _term(conn)
+    db.set_setting(conn, "remove_unpaid", "on")
+    _member(conn, 1, "1010001", "Unpaid Alice")
+    fake = make_bot({1: ChatMemberStatus.MEMBER})
+    _run(fake, conn, term, REMOVAL_DAY - timedelta(days=2))
+    fake.unban_chat_member = AsyncMock(
+        side_effect=[BadRequest("temporary unban failure"), None]
+    )
+
+    _run(fake, conn, term, REMOVAL_DAY)
+    assert [row["telegram_user_id"] for row in db.list_pending_unbans(conn, REC)] == [1]
+    _run(fake, conn, term, REMOVAL_DAY)
+
+    assert fake.unban_chat_member.await_count == 2
+    assert db.list_pending_unbans(conn, REC) == []
+
+
+def test_crash_immediately_after_ban_still_leaves_unban_recovery(conn):
+    class SimulatedCrash(BaseException):
+        pass
+
+    term = _term(conn)
+    db.set_setting(conn, "remove_unpaid", "on")
+    _member(conn, 1, "1010001", "Unpaid Alice")
+    fake = make_bot({1: ChatMemberStatus.MEMBER})
+    _run(fake, conn, term, REMOVAL_DAY - timedelta(days=2))
+    fake.ban_chat_member = AsyncMock(side_effect=SimulatedCrash)
+
+    with pytest.raises(SimulatedCrash):
+        _run(fake, conn, term, REMOVAL_DAY)
+
+    assert [row["telegram_user_id"] for row in db.list_pending_unbans(conn, REC)] == [1]
+
+
 def test_paying_during_the_buffer_saves_you(conn):
     term = _term(conn)
     fake = _setup_people(conn, term)
@@ -253,6 +338,20 @@ def test_late_joiner_removed_after_own_grace(conn):
         if fake.ban_chat_member.await_count:
             break
     assert REMOVAL_DAY + timedelta(days=offset) == date(2026, 10, 8)
+
+
+def test_registered_late_joiner_gets_own_preview_and_final_warning(conn):
+    term = _term(conn)
+    db.set_setting(conn, "remove_unpaid", "on")
+    _member(conn, 9, "1010009", "Freshman")
+    _seen(conn, 9, "Freshman", date(2026, 10, 1))
+    fake = make_bot({9: ChatMemberStatus.MEMBER})
+
+    _run(fake, conn, term, date(2026, 10, 6))
+
+    assert any("Freshman" in text for text in _dm_text(fake, TREASURER))
+    assert any("removed" in text for text in _dm_text(fake, 9))
+    assert db.term_event_claimed(conn, term["id"], "removal-previewed:9")
 
 
 def test_kick_failure_is_reported_and_retried_next_day(conn):

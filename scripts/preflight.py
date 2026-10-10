@@ -1,8 +1,8 @@
 """Pre-launch connectivity check: verifies .env secrets actually work.
 
 Run:  python scripts/preflight.py
-Checks the Telegram bot token, Gemini API key, and Google Sheet mirror
-without starting the bot or touching clubbot.db. Safe to run any time.
+Checks the Telegram bot token, Gemini API key, and read access to the Google
+Sheet without starting the bot or touching clubbot.db. Safe to run any time.
 """
 
 import asyncio
@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from clubbot import config, db  # noqa: E402
+from clubbot import config  # noqa: E402
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -58,12 +58,10 @@ def check_sheet(cfg) -> bool:
 
     try:
         mirror = SheetMirror.from_config(cfg.google_credentials, cfg.sheet_id)
-        # Push an empty snapshot: proves API enabled + sheet shared + writable,
-        # and creates the Members/Payments tabs so success is visible.
-        mirror.push(*mirror.snapshot(db.connect(":memory:")))
+        title = mirror.check_access()
     except Exception as exc:
-        return report("Sheet", FAIL, f"cannot write to the Sheet ({describe(exc)})")
-    return report("Sheet", PASS, "wrote Members/Payments tabs - open the Sheet to see them")
+        return report("Sheet", FAIL, f"cannot read the Sheet ({describe(exc)})")
+    return report("Sheet", PASS, f"opened {title!r} without changing any tabs")
 
 
 def main() -> int:

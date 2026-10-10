@@ -9,6 +9,7 @@ from clubbot.payments import (
     SCHOOL_BILL_NUMBER,
     SCHOOL_UEN,
     ExtractedPayment,
+    SchoolConfig,
     build_member_qr,
     school_config,
     verify_extracted_payment,
@@ -161,6 +162,21 @@ def test_transaction_id_that_normalises_to_empty_is_treated_as_missing():
     )
     assert result.outcome == "exception"
     assert "Transaction ID is missing" in result.reasons[0]
+
+
+def test_verification_fails_closed_for_empty_normalised_school_checks():
+    result = verify_extracted_payment(
+        valid_extraction(recipient=None, billing_id=None),
+        valid_amounts={5},
+        term_start="2026-06-01",
+        term_end="2026-06-30",
+        qr_issued_at="2026-06-20T02:30:00+00:00",
+        now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
+        school=SchoolConfig(recipient_match="!!!", bill_number="!!!"),
+    )
+    assert result.outcome == "exception"
+    assert any("Recipient" in reason for reason in result.reasons)
+    assert any("Billing ID" in reason for reason in result.reasons)
 
 
 def test_school_config_defaults_and_settings_override():

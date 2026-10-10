@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
-from telegram.error import Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import ContextTypes
 
 from clubbot import db
@@ -37,6 +37,8 @@ KICK_PAUSE = 1.0  # seconds between removals; Telegram documents no ban rate lim
 # must never get anyone removed.
 SPARED_STATUSES = ("verified", "pending_verification", "exception")
 KEEP_BUTTONS = 30  # same cap as /unpaid's Mark-paid buttons
+MESSAGE_LIMIT = 4096
+MESSAGE_MARGIN = 3500  # leave room for headings and final explanatory notes
 PAY_KEYBOARD = InlineKeyboardMarkup(
     [[InlineKeyboardButton("Pay now", callback_data="pay:start")]]
 )
@@ -144,85 +146,182 @@ async def overdue_in_chat(bot, conn, term, chat_id: int, day: date):
     return overdue, identified
 
 
-async def send_preview(bot, conn, term, chat_id: int) -> bool:
-    """Tell the treasurer who goes on removal day; when on, warn those people.
+def _preview_groups(people) -> list[list]:
+    """Batches small enough for Telegram text and inline-keyboard limits."""
+    groups, current, chars = [], [], 0
+    for person in people:
+        line = f"- {_who(person)}"
+        if current and (
+            len(current) >= KEEP_BUTTONS or chars + len(line) + 1 > MESSAGE_MARGIN
+        ):
+            groups.append(current)
+            current, chars = [], 0
+        current.append(person)
+        chars += len(line) + 1
+    if current:
+        groups.append(current)
+    return groups
 
-    Returns False if the treasurer DM failed (retry next hour).
-    """
-    day = removal_day(conn, term)
+
+async def _send_summary(bot, chat_id: int, heading: str, lines: list[str]) -> None:
+    """Send a long result in safe chunks; summaries are best effort."""
+    chunks, current = [], heading
+    for line in lines:
+        line = line[: MESSAGE_LIMIT - 100]
+        candidate = f"{current}\n{line}"
+        if len(candidate) > MESSAGE_LIMIT:
+            chunks.append(current)
+            current = f"{heading} (continued)\n{line}"
+        else:
+            current = candidate
+    chunks.append(current)
+    for chunk in chunks:
+        await _send(bot, chat_id, chunk)
+
+
+async def send_preview(
+    bot,
+    conn,
+    term,
+    chat_id: int,
+    *,
+    target_day: date | None = None,
+    include_empty: bool = True,
+) -> bool:
+    """Preview everyone due by target_day and warn each registered member."""
+    day = target_day or removal_day(conn, term)
     people, identified = await overdue_in_chat(bot, conn, term, chat_id, day)
+    live = mode(conn) == "on"
+    if live:
+        people = [
+            person
+            for person in people
+            if not db.term_event_claimed(
+                conn, term["id"], f"removal-previewed:{person['telegram_user_id']}"
+            )
+        ]
+    if not people and not include_empty:
+        return True
+
     try:
         total = await bot.get_chat_member_count(chat_id)
     except TelegramError:
         total = None
-    live = mode(conn) == "on"
-    lines = [
-        f"Rec chat clean-up for {term['name']}: on {day.isoformat()} I "
-        + ("will remove" if live else "would remove")
-        + " these people if they still haven't paid:"
-    ]
-    lines += [f"- {_who(p)}" for p in people] or ["(nobody right now)"]
-    if not live:
-        lines.append(
-            "\nPREVIEW MODE: nobody will actually be removed. "
-            "Turn it on with /settings remove_unpaid on"
-        )
-    exceptions = db.get_term_payment_stats(conn, term["id"])["exceptions"]
-    if exceptions:
-        lines.append(f"\n{exceptions} receipt(s) wait for your review; those people stay.")
-    if total is not None:
-        lines.append(
-            f"\nThe chat has {total} members; I can identify {identified} of them "
-            "(bots and people who never joined while I was watching are invisible to me)."
-        )
-    keyboard = None
-    if people:
-        if len(people) <= KEEP_BUTTONS:
-            lines.append("Tap Keep for anyone who should never be removed (coaches etc.).")
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            f"Keep: {p['name']}"[:60],
-                            callback_data=f"kp:{p['telegram_user_id']}",
-                        )
-                    ]
-                    for p in people
-                ]
-            )
-        else:
-            lines.append("To keep someone, ask them to /start the bot, then use /keep.")
-    if not await _send(bot, db.get_treasurer_id(conn), "\n".join(lines), keyboard):
-        return False
+
+    # A transient DM failure must not silently consume the person's warning.
     if live:
-        warning = (
-            f"Your {term['name']} membership is still unpaid. Unpaid members are "
-            f"removed from the rec group chat on {day.isoformat()}. "
-            "Tap Pay now to get your QR."
-        )
         for person in people:
             stamp = f"removal-warning:{person['telegram_user_id']}"
             if not person["sutd_id"] or db.term_event_claimed(conn, term["id"], stamp):
                 continue  # the bot can only DM people who started it
+            warning = (
+                f"Your {term['name']} membership is still unpaid. Unpaid members are "
+                "removed from the rec group chat on "
+                f"{due_date(conn, term, person['first_seen_at']).isoformat()}. "
+                "Tap Pay now to get your QR."
+            )
             if await _send(bot, person["telegram_user_id"], warning, PAY_KEYBOARD):
                 db.claim_term_event(conn, term["id"], stamp)
+            else:
+                return False
+
+    groups = _preview_groups(people) or [[]]
+    exceptions = db.get_term_payment_stats(conn, term["id"])["exceptions"]
+    for index, group in enumerate(groups):
+        lines = [
+            f"Rec chat clean-up for {term['name']}"
+            + (f" ({index + 1}/{len(groups)})" if len(groups) > 1 else "")
+            + f": on {day.isoformat()} I "
+            + ("will remove" if live else "would remove")
+            + " these people if they still haven't paid:"
+        ]
+        lines += [f"- {_who(person)}" for person in group] or ["(nobody right now)"]
+        if group:
+            lines.append("Tap Keep for anyone who should never be removed (coaches etc.).")
+        if index == len(groups) - 1:
+            if not live:
+                lines.append(
+                    "\nPREVIEW MODE: nobody will actually be removed. "
+                    "Turn it on with /settings remove_unpaid on"
+                )
+            if exceptions:
+                lines.append(
+                    f"\n{exceptions} receipt(s) wait for your review; those people stay."
+                )
+            if total is not None:
+                lines.append(
+                    f"\nThe chat has {total} members; I can identify {identified} of them "
+                    "(bots and people who never joined while I was watching are invisible to me)."
+                )
+        keyboard = (
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(
+                        f"Keep: {person['name']}"[:60],
+                        callback_data=f"kp:{person['telegram_user_id']}",
+                    )]
+                    for person in group
+                ]
+            )
+            if group
+            else None
+        )
+        text = "\n".join(lines)
+        if len(text) > MESSAGE_LIMIT:
+            log.error("Removal preview chunk unexpectedly exceeds Telegram's limit")
+            return False
+        if not await _send(bot, db.get_treasurer_id(conn), text, keyboard):
+            return False
+
+    if live:
+        for person in people:
+            db.claim_term_event(
+                conn, term["id"], f"removal-previewed:{person['telegram_user_id']}"
+            )
     return True
 
 
 async def sweep(bot, conn, term, chat_id: int, today: date) -> None:
-    """Remove everyone overdue today (kick = ban + unban, so they may rejoin)."""
+    """Remove overdue people only after each has had the full warning window."""
     people, _ = await overdue_in_chat(bot, conn, term, chat_id, today)
-    removed, failed = [], []
+    warned = []
+    for person in people:
+        previewed = db.term_event_sent_at(
+            conn, term["id"], f"removal-previewed:{person['telegram_user_id']}"
+        )
+        if previewed is None:
+            continue
+        preview_day = previewed.astimezone(db.SINGAPORE_TIME).date()
+        if today >= preview_day + PREVIEW_LEAD:
+            warned.append(person)
+
+    removed, unlock_pending, failed = [], [], []
     link = db.get_setting(conn, JOIN_LINK_KEY)
     rejoin = f"ask to join again with {link}" if link else "ask to join the chat again"
-    for person in people:
+    for person in warned:
         user_id = person["telegram_user_id"]
+        # Queue first. If the process dies after Telegram applies the ban but
+        # before this coroutine resumes, the next due-check still unbans them.
+        db.queue_pending_unban(conn, chat_id, user_id, person["name"])
         try:
             await bot.ban_chat_member(chat_id, user_id)
-            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-        except TelegramError as exc:
+        except (BadRequest, Forbidden) as exc:
+            # Telegram definitively rejected these requests, so no ban was made.
+            db.clear_pending_unban(conn, chat_id, user_id)
             failed.append(f"- {_who(person)}: {exc}")
             continue
+        except TelegramError as exc:
+            # Network failures are ambiguous: leave recovery queued in case
+            # Telegram applied the request before the response was lost.
+            failed.append(f"- {_who(person)}: {exc}")
+            continue
+
+        try:
+            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        except TelegramError as exc:
+            unlock_pending.append(f"- {_who(person)}: {exc}")
+        else:
+            db.clear_pending_unban(conn, chat_id, user_id)
         removed.append(f"- {_who(person)}")
         if person["sutd_id"]:
             await _send(
@@ -236,40 +335,78 @@ async def sweep(bot, conn, term, chat_id: int, today: date) -> None:
         await asyncio.sleep(KICK_PAUSE)
     if not removed and not failed:
         return
-    lines = [f"Rec chat clean-up for {term['name']}:"]
+    lines = []
     if removed:
         lines += [f"Removed {len(removed)}:"] + removed
+    if unlock_pending:
+        lines += [
+            f"Rejoin unlock pending for {len(unlock_pending)} (I'll retry hourly):"
+        ] + unlock_pending
     if failed:
         lines += [f"Could not remove {len(failed)} (I'll try again tomorrow):"] + failed
-    await _send(bot, db.get_treasurer_id(conn), "\n".join(lines))
+    await _send_summary(
+        bot, db.get_treasurer_id(conn), f"Rec chat clean-up for {term['name']}:", lines
+    )
+
+
+async def retry_pending_unbans(bot, conn, chat_id: int) -> None:
+    """Finish interrupted kicks before doing any new removal work."""
+    for pending in db.list_pending_unbans(conn, chat_id):
+        try:
+            await bot.unban_chat_member(
+                chat_id, pending["telegram_user_id"], only_if_banned=True
+            )
+        except TelegramError:
+            log.warning(
+                "Still unable to unban %s in %s",
+                pending["telegram_user_id"],
+                chat_id,
+                exc_info=True,
+            )
+        else:
+            db.clear_pending_unban(conn, chat_id, pending["telegram_user_id"])
 
 
 async def run_due(bot, conn: sqlite3.Connection, term, today: date) -> None:
     """Called by the hourly due-check for each term that is open today."""
     chat_id = _rec_chat(conn)
     current = mode(conn)
-    if chat_id is None or current == "off" or db.get_treasurer_id(conn) is None:
+    if chat_id is None:
+        return
+    await retry_pending_unbans(bot, conn, chat_id)
+    if current == "off" or db.get_treasurer_id(conn) is None:
         return
     day = removal_day(conn, term)
-    # Separate stamps, so switching preview → on mid-term still sends the
-    # real preview and member warnings before anyone is removed.
-    event = "removal-preview" if current == "on" else "removal-preview-dry"
-    if today >= day - PREVIEW_LEAD and not db.term_event_claimed(conn, term["id"], event):
-        if await send_preview(bot, conn, term, chat_id):
-            db.claim_term_event(conn, term["id"], event)
     if current != "on":
+        event = "removal-preview-dry"
+        if today >= day - PREVIEW_LEAD and not db.term_event_claimed(
+            conn, term["id"], event
+        ):
+            if await send_preview(bot, conn, term, chat_id):
+                db.claim_term_event(conn, term["id"], event)
         return
-    previewed = db.term_event_sent_at(conn, term["id"], "removal-preview")
-    if previewed is None:
-        return
-    # Never remove anyone without the full warning time, even after a late
-    # /newterm or a switch to "on" just before removal day.
-    first_sweep = max(day, previewed.astimezone(db.SINGAPORE_TIME).date() + PREVIEW_LEAD)
+
+    # Look two days ahead every day. Late joiners therefore receive their own
+    # preview and final warning instead of relying on the term's global preview.
+    if today >= day - PREVIEW_LEAD:
+        target = today + PREVIEW_LEAD
+        event = f"removal-preview:{target.isoformat()}"
+        if not db.term_event_claimed(conn, term["id"], event):
+            if await send_preview(
+                bot,
+                conn,
+                term,
+                chat_id,
+                target_day=target,
+                include_empty=target == day,
+            ):
+                db.claim_term_event(conn, term["id"], event)
+
     sweep_event = f"sweep-{today.isoformat()}"
-    if today < first_sweep or db.term_event_claimed(conn, term["id"], sweep_event):
+    if today < day or db.term_event_claimed(conn, term["id"], sweep_event):
         return
     await sweep(bot, conn, term, chat_id, today)
-    # Stamped even after failures: they are retried tomorrow, not hourly.
+    # Stamped even after failures: ban failures are retried tomorrow, not hourly.
     db.claim_term_event(conn, term["id"], sweep_event)
 
 

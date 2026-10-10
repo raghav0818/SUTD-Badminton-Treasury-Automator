@@ -538,6 +538,30 @@ def test_settings_rejects_value_that_breaks_qr(conn):
     assert db.get_setting(conn, "school_merchant_name") is None
 
 
+@pytest.mark.parametrize("key", ["school_bill_number", "school_recipient_match"])
+def test_settings_rejects_verification_value_without_alphanumerics(conn, key):
+    db.ensure_treasurer(conn, 999)
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = [key, "!!!"]
+
+    asyncio.run(admin.cmd_settings(update, context))
+
+    assert "Not saved" in reply_text_of(update)
+    assert db.get_setting(conn, key) is None
+
+
+def test_roster_change_requests_sheet_sync(conn, monkeypatch):
+    db.ensure_treasurer(conn, 999)
+    requested = MagicMock()
+    monkeypatch.setattr(admin.scheduler, "request_sheet_sync", requested)
+    update = make_update(user_id=999, text="/roster\nAlice Tan, 1010001")
+    context = make_context(conn)
+
+    asyncio.run(admin.cmd_roster(update, context))
+
+    requested.assert_called_once_with(context.application)
+
+
 def test_settings_rejects_unknown_key(conn):
     db.ensure_treasurer(conn, 999)
     update, context = make_update(user_id=999), make_context(conn)

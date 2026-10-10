@@ -220,6 +220,11 @@ async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
     today = now.date()
     if not REMINDER_HOUR <= now.hour < QUIET_HOUR:
         return
+    rec_chat = db.get_setting(conn, db.GROUP_KEYS["rec"])
+    if rec_chat is not None:
+        # This recovery must outlive the term: a restart after term-end must
+        # still finish the unban half of an interrupted kick.
+        await removal.retry_pending_unbans(bot, conn, int(rec_chat))
     group_posts_on = db.get_setting(conn, "group_posts") != "off"
     for term in db.list_terms(conn):
         if term["start_date"] <= today.isoformat() <= term["end_date"]:

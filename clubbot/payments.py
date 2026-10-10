@@ -81,12 +81,13 @@ def build_member_qr(
     return qrgen.render_png(payload)
 
 
-def _normalise_text(value: str | None) -> str:
+def normalise_verification_text(value: str | None) -> str:
+    """Canonical alphanumeric form used by deterministic receipt checks."""
     return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
 
 
 def normalise_transaction_id(value: str | None) -> str | None:
-    normalised = _normalise_text(value)
+    normalised = normalise_verification_text(value)
     return normalised or None
 
 
@@ -115,11 +116,16 @@ def verify_extracted_payment(
         expected = " or ".join(f"S${cents / 100:.2f}" for cents in sorted(valid_amounts))
         reasons.append(f"Amount is not the expected {expected}.")
 
-    recipient = _normalise_text(extracted.recipient)
-    if _normalise_text(school.recipient_match) not in recipient:
+    recipient = normalise_verification_text(extracted.recipient)
+    expected_recipient = normalise_verification_text(school.recipient_match)
+    if not expected_recipient or expected_recipient not in recipient:
         reasons.append("Recipient does not match the SUTD account.")
 
-    if _normalise_text(extracted.billing_id) != _normalise_text(school.bill_number):
+    expected_bill = normalise_verification_text(school.bill_number)
+    if (
+        not expected_bill
+        or normalise_verification_text(extracted.billing_id) != expected_bill
+    ):
         reasons.append("Billing ID does not match the club's DBS FLYMAX account.")
 
     try:

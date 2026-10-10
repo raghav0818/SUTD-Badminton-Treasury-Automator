@@ -84,6 +84,11 @@ class SheetMirror:
         ]
         return members, payments, shirts
 
+    def check_access(self) -> str:
+        """Read Sheet metadata without modifying any mirror tabs."""
+        metadata = self._spreadsheet.fetch_sheet_metadata()
+        return metadata.get("properties", {}).get("title", "configured Sheet")
+
     def push(
         self, members: list[list], payments: list[list], shirts: list[list]
     ) -> None:

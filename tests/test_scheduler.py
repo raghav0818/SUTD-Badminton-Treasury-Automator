@@ -101,6 +101,20 @@ def _sent_to(fake_bot):
     return [call.kwargs["chat_id"] for call in fake_bot.send_message.await_args_list]
 
 
+def test_due_check_retries_pending_unban_even_without_an_open_term(conn):
+    fake_bot = make_bot()
+    fake_bot.unban_chat_member = AsyncMock()
+    db.set_setting(conn, "rec_group_id", "-1002")
+    db.queue_pending_unban(conn, -1002, 111, "Alice")
+
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-04", 10, 1)))
+
+    fake_bot.unban_chat_member.assert_awaited_once_with(
+        -1002, 111, only_if_banned=True
+    )
+    assert db.list_pending_unbans(conn, -1002) == []
+
+
 def test_due_reminder_skips_paid_and_opted_out_and_never_resends(conn):
     _member(conn, 111, "1000001", "Alice")
     _member(conn, 222, "1000002", "Bob")

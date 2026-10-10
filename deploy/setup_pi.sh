@@ -12,6 +12,12 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
+if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 12))'; then
+    echo "ERROR: Python 3.12 or newer is required." >&2
+    python3 --version >&2
+    exit 1
+fi
+
 echo "==> Creating Python environment and installing dependencies (first run takes a few minutes)"
 [ -d .venv ] || python3 -m venv .venv
 .venv/bin/pip install --quiet --upgrade -r requirements.txt

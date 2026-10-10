@@ -39,9 +39,11 @@ def _parse_fee_cents(value: str, *, allow_zero: bool = False) -> int:
         amount = Decimal(value)
     except InvalidOperation as exc:
         raise ValueError("fee must be a number") from exc
-    # is_finite() first: NaN/Infinity pass Decimal() but break the checks below.
+    # NaN/Infinity pass Decimal() but cannot be compared safely.
+    if not amount.is_finite():
+        raise ValueError("fee must be finite")
     too_small = amount < 0 if allow_zero else amount <= 0
-    if not amount.is_finite() or too_small or amount.as_tuple().exponent < -2:
+    if too_small or amount.as_tuple().exponent < -2:
         raise ValueError("fee must be positive with at most 2 decimal places")
     return int(amount * 100)
 

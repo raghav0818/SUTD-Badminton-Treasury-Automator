@@ -387,6 +387,15 @@ def test_parse_newterm_args_rejects_bad_input(args, error):
         bot.parse_newterm_args(args)
 
 
+def test_parse_newterm_args_rejects_nan_fee_cleanly():
+    args = [
+        "T", "2026-09-01", "2026-12-01", "deadline=2026-09-15",
+        "comp=NaN", "rec=25", "recshirt=30", "shirt=15",
+    ]
+    with pytest.raises(ValueError, match="finite"):
+        bot.parse_newterm_args(args)
+
+
 def test_newterm_rejects_deadline_outside_term_with_usage(conn):
     db.ensure_treasurer(conn, 999)
     update = make_update(user_id=999, text="/newterm")
@@ -480,6 +489,20 @@ def test_pay_with_shirt_asks_size_then_issues_shirt_qr(conn):
     payment = db.get_current_payment(conn, 111)
     assert payment["category"] == "competitive"
     assert payment["shirt_size"] == "M"
+
+
+def test_shirt_choice_requests_sheet_sync(conn, monkeypatch):
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    create_priced_term(conn)
+    context = pay_context(conn)
+    requested = MagicMock()
+    monkeypatch.setattr(bot.scheduler, "request_sheet_sync", requested)
+
+    asyncio.run(bot.on_pay_size(make_callback("pay:size:M"), context))
+
+    requested.assert_called_once_with(context.application)
 
 
 def test_choosing_again_reissues_qr_but_keeps_first_issue_time(conn):

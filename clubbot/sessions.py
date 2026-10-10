@@ -10,6 +10,7 @@ Plan: docs/superpowers/specs/2026-10-10-session-signups-plan.md
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import random
@@ -272,13 +273,15 @@ def _cant_make_it(sid: int) -> InlineKeyboardMarkup:
     )
 
 
-async def _dm(bot, user_id: int, text: str, reply_markup=None) -> None:
+async def _dm(bot, user_id: int, text: str, reply_markup=None) -> bool:
     """Best effort: people who never started the bot can't be DMed (the group
     mention still reaches them)."""
     try:
         await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
     except TelegramError as exc:
         log.info("Could not DM %s: %s", user_id, exc)
+        return False
+    return True
 
 
 async def _dm_roles(bot, session, names, *, primary_changed=True, secondary_changed=True):
@@ -341,11 +344,32 @@ async def run_due_picks(bot, conn: sqlite3.Connection, now: datetime) -> None:
         if session["picked_at"] is None:
             primary, secondary = _fill_roles(conn, session, [])
             if primary is None:
+                if session["empty_notified_at"] is None:
+                    notified = await _dm(
+                        bot,
+                        session["host_id"],
+                        f"Nobody is signed up for {session['title']} on "
+                        f"{when_text(session)} yet, so I couldn't assign anyone "
+                        "to collect the nets and shuttles. I'll check again hourly.",
+                    )
+                    if notified:
+                        db.mark_session_empty_notified(conn, session["id"])
                 continue  # nobody playing yet; try again next hour
             db.set_session_pick(conn, session["id"], primary, secondary)
             session = db.get_session(conn, session["id"])
-            await _refresh_now(bot, conn, session["id"])
+            if not await _refresh_now(bot, conn, session["id"]):
+                continue
         if session["primary_id"] is None:
+            # A previously announced pick can become empty after everyone
+            # leaves. If that handoff post failed, announced_at was cleared;
+            # retry the authoritative empty state here.
+            if session["picked_at"] is not None:
+                text = (
+                    f"🧺 {html.escape(when_text(session))}: nobody is left to "
+                    "collect the nets and shuttles."
+                )
+                if await _group_post(bot, session, text):
+                    db.mark_session_announced(conn, session["id"])
             continue
         names = _names(conn, session)
         if await _group_post(bot, session, _pick_text(session, names)):
@@ -375,11 +399,21 @@ async def refresh_card(bot, conn: sqlite3.Connection, sid: int) -> None:
         log.warning("Could not update session card %s: %s", sid, exc)
 
 
-async def _refresh_now(bot, conn: sqlite3.Connection, sid: int) -> None:
-    try:
-        await refresh_card(bot, conn, sid)
-    except RetryAfter:
-        log.warning("Rate-limited updating session card %s", sid)
+async def _refresh_now(bot, conn: sqlite3.Connection, sid: int) -> bool:
+    """Refresh immediately, honoring Telegram's retry delay a few times."""
+    for attempt in range(3):
+        try:
+            await refresh_card(bot, conn, sid)
+            return True
+        except RetryAfter as exc:
+            if attempt == 2:
+                log.warning("Rate-limited updating session card %s after retries", sid)
+                return False
+            delay = exc.retry_after
+            if hasattr(delay, "total_seconds"):
+                delay = delay.total_seconds()
+            await asyncio.sleep(max(0.0, min(float(delay), 60.0)))
+    return False
 
 
 async def _job_refresh(context) -> None:
@@ -653,7 +687,10 @@ async def _announce_handoff(bot, conn, sid, leaver, old_names, old_roles) -> Non
         )
         if secondary:
             text += f"\nBackup: {mention_html(secondary, names[secondary])}."
-    await _group_post(bot, session, text)
+    if not await _group_post(bot, session, text):
+        # The stored roles are authoritative; make the hourly job publish them.
+        db.mark_session_unannounced(conn, sid)
+        return
     await _dm_roles(
         bot,
         session,

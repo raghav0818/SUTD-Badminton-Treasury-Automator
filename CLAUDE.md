@@ -14,8 +14,17 @@ changing payment or verification logic.
 
 ## Status (2026-10-10)
 
-- **Recre session sign-ups (replaces Mitup), branch
-  `automating-recre-announcements`, built 2026-10-10, not merged/deployed.**
+- **Full-codebase verification and hardening is complete in the current
+  working tree (not committed or deployed).** 293 tests pass; every Python
+  file compiles; `pip check` and `git diff --check` pass; live read-only
+  preflight passes Telegram, Gemini, and Google Sheets. Fixes cover fail-closed
+  receipt settings, safe non-destructive preflight, `NaN` fee handling, Sheet
+  sync triggers, complete relinking, large/per-person removal previews,
+  warning retries, crash-safe kick/unban recovery, session rate limits and
+  notification/handoff retries, and the Pi Python-version guard. A real
+  payment receipt and real group kick/session flow still need the launch
+  smoke test because those actions affect real money or members.
+- **Recre session sign-ups (replaces Mitup), merged to `main`, not deployed.**
   Plan `docs/superpowers/specs/2026-10-10-session-signups-plan.md` (treasurer
   approved D1–D5), research `docs/research/2026-10-10-session-announcements-rsvp.md`.
   Admins (the vice captain @mikeclh, once `/addadmin`ed) DM `/session` →
@@ -24,8 +33,9 @@ changing payment or verification logic.
   before if it starts by 2pm) the bot picks a primary (nets + shuttles from the
   store room) and a backup, fair rotation by fewest past primaries; DMs both +
   mentions in the group. Leave / "I can't make it" by the primary hands over
-  to the backup and picks a new backup. 255 tests pass. Next: review, merge,
-  deploy, then the vice captain registers and gets `/addadmin`.
+  to the backup and picks a new backup. Code review and recovery-path tests
+  are complete. Next: deploy, then the vice captain registers and gets
+  `/addadmin`.
 - **v2 is merged to `main` and pushed (2026-10-07); not
   yet deployed.** It implements every item in
   `docs/superpowers/specs/2026-10-04-v2-build-list.md` (A–D): Gemini
@@ -60,7 +70,7 @@ changing payment or verification logic.
   treasurer (`sudo systemctl restart clubbot`, or `bash ~/clubbot/deploy/update.sh`).
 - **Removing unpaid people from the rec chat (2026-10-10)** is built on branch
   `removing-unpaid-members` (plan: `docs/superpowers/specs/removing-member-plan.md`),
-  merged to `main` and pushed 2026-10-10 (`e586358`, together with the session sign-ups; 274 tests pass), not live-tested. Rec chat ONLY, never the comp
+  merged to `main` and pushed 2026-10-10 (`e586358`, together with the session sign-ups), not live-tested. Rec chat ONLY, never the comp
   chat. Default `remove_unpaid=preview`. Live test needs: bot admin in the rec
   chat with Ban users + Invite users rights, `/setgroup rec` again (makes the
   join-request link), revoke old links, and the one-off
@@ -237,5 +247,13 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   cancel / noon pick added) → treasurer decisions (admin host, anyone in rec
   group joins, noon pick, fair rotation, 30 spots) → built in
   `clubbot/sessions.py` + `tests/test_sessions.py`. Not yet reviewed or live.
+- **2026-10-10** — Full-codebase review and regression pass: fixed receipt
+  verification values that normalized empty, destructive Sheet preflight,
+  non-finite fees, stale Sheet mirrors, incomplete account relinks, removal
+  preview limits and per-member warning windows, crash-safe unban recovery,
+  and session notification/card/handoff retry gaps. Added Pi Python 3.12+
+  enforcement. 293 tests, compilation, dependency validation, patch checks,
+  and all three live preflight connections pass. Real payment/group smoke
+  tests remain a launch action.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).

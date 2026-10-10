@@ -118,6 +118,16 @@ CREATE TABLE IF NOT EXISTS rec_group_people (
     keep             INTEGER NOT NULL DEFAULT 0
 );
 
+-- A kick is ban + unban. Persist the second half so a transient failure or
+-- process restart can never leave somebody permanently banned.
+CREATE TABLE IF NOT EXISTS rec_pending_unbans (
+    chat_id          INTEGER NOT NULL,
+    telegram_user_id INTEGER NOT NULL,
+    name             TEXT    NOT NULL,
+    queued_at        TEXT    NOT NULL,
+    PRIMARY KEY (chat_id, telegram_user_id)
+);
+
 -- Recre sessions posted for sign-ups (Mitup replacement). message_id is NULL
 -- while the session is only a preview in the host's DM. primary_id collects
 -- the nets and shuttles; secondary_id steps in only if the primary can't.
@@ -137,6 +147,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     secondary_id INTEGER,
     picked_at    TEXT,
     announced_at TEXT,
+    empty_notified_at TEXT,
     created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -187,6 +198,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "payments",
         {"qr_issued_at": "TEXT", "payment_timestamp": "TEXT"},
     )
+    _add_missing_columns(conn, "sessions", {"empty_notified_at": "TEXT"})
     # Phase 3 columns.
     _add_missing_columns(
         conn,
@@ -423,6 +435,74 @@ def relink_member(
         )
         conn.execute(
             "UPDATE admins SET telegram_user_id = ? WHERE telegram_user_id = ?",
+            (new_telegram_id, old),
+        )
+        old_rec = conn.execute(
+            "SELECT * FROM rec_group_people WHERE telegram_user_id = ?", (old,)
+        ).fetchone()
+        new_rec = conn.execute(
+            "SELECT * FROM rec_group_people WHERE telegram_user_id = ?",
+            (new_telegram_id,),
+        ).fetchone()
+        if old_rec is not None and new_rec is not None:
+            conn.execute(
+                """
+                UPDATE rec_group_people SET name = ?, first_seen_at = ?, keep = ?
+                WHERE telegram_user_id = ?
+                """,
+                (
+                    full_name,
+                    min(old_rec["first_seen_at"], new_rec["first_seen_at"]),
+                    int(bool(old_rec["keep"] or new_rec["keep"])),
+                    new_telegram_id,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM rec_group_people WHERE telegram_user_id = ?", (old,)
+            )
+        elif old_rec is not None:
+            conn.execute(
+                """
+                UPDATE rec_group_people SET telegram_user_id = ?, name = ?
+                WHERE telegram_user_id = ?
+                """,
+                (new_telegram_id, full_name, old),
+            )
+
+        # Session sign-ups do not require registration, so the new account may
+        # already be present. Keep the earlier place and collapse duplicates.
+        duplicate_signups = conn.execute(
+            """
+            SELECT old.id AS old_id, new.id AS new_id
+            FROM session_signups old
+            JOIN session_signups new ON new.session_id = old.session_id
+            WHERE old.user_id = ? AND new.user_id = ?
+            """,
+            (old, new_telegram_id),
+        ).fetchall()
+        for signup in duplicate_signups:
+            if signup["old_id"] < signup["new_id"]:
+                conn.execute("DELETE FROM session_signups WHERE id = ?", (signup["new_id"],))
+            else:
+                conn.execute("DELETE FROM session_signups WHERE id = ?", (signup["old_id"],))
+        conn.execute(
+            "UPDATE session_signups SET user_id = ?, name = ? WHERE user_id = ?",
+            (new_telegram_id, full_name, old),
+        )
+        conn.execute(
+            "UPDATE session_signups SET name = ? WHERE user_id = ?",
+            (full_name, new_telegram_id),
+        )
+        conn.execute(
+            "UPDATE sessions SET host_id = ?, host_name = ? WHERE host_id = ?",
+            (new_telegram_id, full_name, old),
+        )
+        conn.execute(
+            "UPDATE sessions SET primary_id = ? WHERE primary_id = ?",
+            (new_telegram_id, old),
+        )
+        conn.execute(
+            "UPDATE sessions SET secondary_id = ? WHERE secondary_id = ?",
             (new_telegram_id, old),
         )
         conn.execute(
@@ -1158,6 +1238,39 @@ def list_rec_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def queue_pending_unban(
+    conn: sqlite3.Connection, chat_id: int, telegram_user_id: int, name: str
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO rec_pending_unbans (chat_id, telegram_user_id, name, queued_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_id, telegram_user_id) DO UPDATE SET name = excluded.name
+        """,
+        (chat_id, telegram_user_id, name, _utc_now()),
+    )
+    conn.commit()
+
+
+def list_pending_unbans(
+    conn: sqlite3.Connection, chat_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM rec_pending_unbans WHERE chat_id = ? ORDER BY queued_at",
+        (chat_id,),
+    ).fetchall()
+
+
+def clear_pending_unban(
+    conn: sqlite3.Connection, chat_id: int, telegram_user_id: int
+) -> None:
+    conn.execute(
+        "DELETE FROM rec_pending_unbans WHERE chat_id = ? AND telegram_user_id = ?",
+        (chat_id, telegram_user_id),
+    )
+    conn.commit()
+
+
 def get_term_payment_stats(conn: sqlite3.Connection, term_id: int) -> dict[str, int]:
     """Headline counts for /stats; 'unpaid' matches /unpaid (opted-out excluded)."""
     registered = conn.execute(
@@ -1426,6 +1539,19 @@ def set_session_pick(
 def mark_session_announced(conn: sqlite3.Connection, session_id: int) -> None:
     conn.execute(
         "UPDATE sessions SET announced_at = ? WHERE id = ?", (_utc_now(), session_id)
+    )
+    conn.commit()
+
+
+def mark_session_unannounced(conn: sqlite3.Connection, session_id: int) -> None:
+    conn.execute("UPDATE sessions SET announced_at = NULL WHERE id = ?", (session_id,))
+    conn.commit()
+
+
+def mark_session_empty_notified(conn: sqlite3.Connection, session_id: int) -> None:
+    conn.execute(
+        "UPDATE sessions SET empty_notified_at = COALESCE(empty_notified_at, ?) WHERE id = ?",
+        (_utc_now(), session_id),
     )
     conn.commit()
 

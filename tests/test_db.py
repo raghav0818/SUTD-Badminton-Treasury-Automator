@@ -84,6 +84,41 @@ def test_settings_roundtrip(conn):
     assert db.get_setting(conn, "ref_strategy") == "reference_label"
 
 
+def test_relink_member_moves_rec_and_session_identity(conn):
+    old_id, new_id = 111, 222
+    db.add_member(
+        conn, telegram_user_id=old_id, full_name="Old Name", sutd_id="1010654", username=None
+    )
+    db.note_rec_person(conn, old_id, "Old Name")
+    db.set_rec_keep(conn, old_id, "Old Name", True)
+    session = db.create_session(
+        conn,
+        title="Recre",
+        starts_at="2026-10-20T19:00:00+08:00",
+        ends_at="2026-10-20T23:00:00+08:00",
+        venue="ISH 2",
+        capacity=30,
+        host_id=old_id,
+        host_name="Old Name",
+    )
+    db.add_signup(conn, session["id"], old_id, "Old Name")
+    db.set_session_pick(conn, session["id"], old_id, None)
+
+    db.relink_member(
+        conn,
+        sutd_id="1010654",
+        new_telegram_id=new_id,
+        full_name="New Name",
+        username="new",
+    )
+
+    assert [row["user_id"] for row in db.list_signups(conn, session["id"])] == [new_id]
+    moved = db.get_session(conn, session["id"])
+    assert (moved["host_id"], moved["primary_id"]) == (new_id, new_id)
+    assert db.get_rec_person(conn, old_id) is None
+    assert db.get_rec_person(conn, new_id)["keep"] == 1
+
+
 def test_create_active_term_and_payment_history(conn):
     db.add_member(
         conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1007654", username=None

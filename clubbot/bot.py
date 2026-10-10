@@ -446,6 +446,7 @@ async def _issue_qr(
     term, payment = opened
     db.set_shirt_size(conn, payment["id"], shirt_size)
     payment = db.mark_qr_issued(conn, payment["id"])
+    scheduler.request_sheet_sync(context.application)
     amount = db.term_fee(term, payment["category"], with_shirt=shirt_size is not None)
     qr = build_member_qr(
         fee_cents=amount,
