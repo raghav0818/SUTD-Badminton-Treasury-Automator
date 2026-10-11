@@ -14,8 +14,8 @@ changing payment or verification logic.
 
 ## Status (2026-10-10)
 
-- **Full-codebase verification and hardening is complete in the current
-  working tree (not committed or deployed).** 293 tests pass; every Python
+- **Full-codebase verification and hardening is committed as `9fbc60d` and
+  pushed to `main`; not yet deployed.** 293 tests pass; every Python
   file compiles; `pip check` and `git diff --check` pass; live read-only
   preflight passes Telegram, Gemini, and Google Sheets. Fixes cover fail-closed
   receipt settings, safe non-destructive preflight, `NaN` fee handling, Sheet
@@ -24,6 +24,9 @@ changing payment or verification logic.
   notification/handoff retries, and the Pi Python-version guard. A real
   payment receipt and real group kick/session flow still need the launch
   smoke test because those actions affect real money or members.
+- When collection opens, the bot posts a one-time payment announcement with
+  the deadline and private-chat payment link to each configured group. It
+  catches up after downtime and honors `group_posts off`.
 - **Recre session sign-ups (replaces Mitup), merged to `main`, not deployed.**
   Plan `docs/superpowers/specs/2026-10-10-session-signups-plan.md` (treasurer
   approved D1–D5), research `docs/research/2026-10-10-session-announcements-rsvp.md`.
@@ -255,5 +258,17 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   enforcement. 293 tests, compilation, dependency validation, patch checks,
   and all three live preflight connections pass. Real payment/group smoke
   tests remain a launch action.
+- **2026-10-10** — Added one-time payment-open posts to configured groups,
+  with the deadline and private payment link. Failed deliveries retry and the
+  scheduler catches up after downtime; `group_posts off` suppresses them.
+- **2026-10-11** — First real v2 payment (UOB TMRW, S$0.20) went to review:
+  Gemini returned the UEN as `billing_id` (the prompt said "UEN/bill
+  reference"); UOB shows the full Billing ID under "Reference no. (optional)".
+  Fix (uncommitted at time of writing): Gemini also lists every ID on the
+  receipt (`reference_numbers`) and code matches the exact Billing ID among
+  them; a transaction ID equal to the school's Billing ID/UEN is treated as
+  missing so it can never be reserved and block later payers. Re-run on the
+  real receipt: 5/5 verified. 301 tests pass. Other banks (DBS/POSB, OCBC,
+  PayLah) still unproven; failures there fail closed to treasurer review.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).

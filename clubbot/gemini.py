@@ -12,10 +12,15 @@ Return only the requested structured fields.
 - is_success_screen: true only if payment is completed/successful, not a preview
 - amount_cents: SGD amount as integer cents, or null
 - recipient: displayed recipient/merchant name, or null
-- billing_id: the UEN/bill reference number, or null
+- billing_id: the bill reference the payment was made against (often labelled
+  bill reference, reference, comments or "reference no. (optional)"), or null.
+  Not the recipient's UEN/ID on its own.
 - payment_timestamp: ISO 8601 date and time including timezone offset, for example
   2026-06-20T10:38:00+08:00, or null. Singapore bank times use +08:00.
-- transaction_id: the bank's transaction/reference number, or null
+- transaction_id: the bank's own unique transaction reference for this payment,
+  or null. Not the bill reference and not the recipient's UEN/ID.
+- reference_numbers: every ID, UEN, bill, reference and transaction number
+  shown anywhere on the screenshot, each copied exactly as shown
 Do not infer missing values."""
 
 RESPONSE_SCHEMA: dict[str, Any] = {
@@ -28,6 +33,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         "billing_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "payment_timestamp": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "transaction_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "reference_numbers": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "readable",
@@ -37,6 +43,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
         "billing_id",
         "payment_timestamp",
         "transaction_id",
+        "reference_numbers",
     ],
     "additionalProperties": False,
 }

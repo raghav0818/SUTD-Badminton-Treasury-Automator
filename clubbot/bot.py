@@ -33,7 +33,7 @@ from clubbot.newterm import (  # noqa: F401  (re-exported for tests)
 from clubbot.format import money
 from clubbot.payments import (
     build_member_qr,
-    normalise_transaction_id,
+    receipt_transaction_id,
     school_config,
     verify_extracted_payment,
 )
@@ -581,7 +581,8 @@ async def _finish_receipt(
     """
     conn = _db(context)
     image_hash = payment["image_hash"]
-    transaction_id = normalise_transaction_id(extracted.transaction_id)
+    school = school_config(conn)
+    transaction_id = receipt_transaction_id(extracted, school)
     duplicate_txn = False
     if transaction_id:
         duplicate_txn = not db.reserve_bank_transaction(
@@ -597,7 +598,7 @@ async def _finish_receipt(
         term_end=payment["end_date"],
         qr_issued_at=payment["qr_issued_at"],
         duplicate_transaction=duplicate_txn,
-        school=school_config(conn),
+        school=school,
     )
     if result.outcome == "retry":
         # Nothing was accepted, so free the image fingerprint for a resend.

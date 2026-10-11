@@ -11,6 +11,7 @@ from clubbot.payments import (
     ExtractedPayment,
     SchoolConfig,
     build_member_qr,
+    receipt_transaction_id,
     school_config,
     verify_extracted_payment,
 )
@@ -177,6 +178,59 @@ def test_verification_fails_closed_for_empty_normalised_school_checks():
     assert result.outcome == "exception"
     assert any("Recipient" in reason for reason in result.reasons)
     assert any("Billing ID" in reason for reason in result.reasons)
+
+
+def _check(extracted):
+    return verify_extracted_payment(
+        extracted,
+        valid_amounts={20, 30},
+        term_start="2026-10-07",
+        term_end="2026-10-20",
+        qr_issued_at="2026-10-10T11:12:24+00:00",
+        now=datetime(2026, 10, 11, 11, 0, tzinfo=timezone.utc),
+    )
+
+
+# Gemini's real output for a live UOB TMRW receipt (2026-10-11): the UEN came
+# back as billing_id; the full Billing ID sat under "Reference no. (optional)".
+UOB_TMRW = dict(
+    amount_cents=20,
+    recipient="SINGAPORE UNIVERSITY OF TECHNOLOGY AND DESIGN",
+    billing_id=SCHOOL_UEN,
+    payment_timestamp="2026-10-11T18:28:00+08:00",
+    transaction_id="2610112184655201",
+    reference_numbers=(SCHOOL_UEN, SCHOOL_BILL_NUMBER, "2610112184655201"),
+)
+
+
+def test_billing_id_found_among_reference_numbers_passes():
+    assert _check(valid_extraction(**UOB_TMRW)).passed
+
+
+def test_billing_id_matching_ignores_spacing_and_case():
+    spaced = "200913519 csl5 eiu6161-38169"
+    assert _check(valid_extraction(**{**UOB_TMRW, "reference_numbers": (spaced,)})).passed
+
+
+def test_uen_alone_or_truncated_billing_id_still_fails():
+    for refs in ((SCHOOL_UEN,), (SCHOOL_BILL_NUMBER[:-1],), (SCHOOL_BILL_NUMBER + "0",), ()):
+        result = _check(valid_extraction(**{**UOB_TMRW, "reference_numbers": refs}))
+        assert result.outcome == "exception"
+        assert result.reasons == ("Billing ID does not match the club's DBS FLYMAX account.",)
+
+
+def test_null_reference_numbers_falls_back_to_billing_id():
+    assert _check(
+        valid_extraction(**{**UOB_TMRW, "billing_id": SCHOOL_BILL_NUMBER, "reference_numbers": None})
+    ).passed
+
+
+def test_school_id_misread_as_transaction_id_is_treated_as_missing():
+    for misread in (SCHOOL_BILL_NUMBER, SCHOOL_UEN, SCHOOL_BILL_NUMBER.lower()):
+        extracted = valid_extraction(**{**UOB_TMRW, "transaction_id": misread})
+        assert receipt_transaction_id(extracted, SchoolConfig()) is None
+        assert _check(extracted).reasons == ("Transaction ID is missing.",)
+    assert receipt_transaction_id(valid_extraction(**UOB_TMRW), SchoolConfig()) == "2610112184655201"
 
 
 def test_school_config_defaults_and_settings_override():

@@ -629,6 +629,45 @@ def test_valid_receipt_is_auto_verified(conn):
     assert "accepted" in reply_text_of(update)
 
 
+def test_billing_id_misread_as_transaction_id_does_not_block_later_payers(conn):
+    # UOB TMRW labels both the Billing ID and the bank reference "Reference no.".
+    db.ensure_treasurer(conn, 999)
+    term = create_active_term(conn)
+
+    def submit(user_id, sutd_id, image, transaction_id):
+        db.add_member(conn, telegram_user_id=user_id, full_name=f"M{user_id}", sutd_id=sutd_id, username=None)
+        payment = db.mark_qr_issued(
+            conn, db.get_or_create_payment(conn, member_id=user_id, term_id=term["id"])["id"]
+        )
+        extracted = ExtractedPayment(
+            readable=True,
+            is_success_screen=True,
+            amount_cents=5,
+            recipient="SINGAPORE UNIVERSITY OF TECHNOLOGY AND DESIGN",
+            billing_id="200913519CSL5",
+            payment_timestamp=datetime.now(SINGAPORE_TIME).isoformat(),
+            transaction_id=transaction_id,
+            reference_numbers=("200913519CSL5", SCHOOL_BILL_NUMBER, "2610112184655201"),
+        )
+        extractor = MagicMock()
+        extractor.extract = AsyncMock(return_value=extracted)
+        update = make_update()
+        update.effective_user.id = user_id
+        update.message.photo = [MagicMock(file_id=f"F{user_id}", file_size=100)]
+        context = make_context(conn, extractor)
+        telegram_file = MagicMock()
+        telegram_file.download_as_bytearray = AsyncMock(return_value=bytearray(image))
+        context.bot.get_file.return_value = telegram_file
+        asyncio.run(bot.on_receipt(update, context))
+        return db.get_payment(conn, payment["id"])
+
+    first = submit(111, "1010654", b"img-1", SCHOOL_BILL_NUMBER)
+    assert first["status"] == "exception"
+    assert first["bank_txn_id"] is None
+    second = submit(222, "1010655", b"img-2", "2610112184655201")
+    assert second["status"] == "verified"
+
+
 def submit_priced_receipt(conn, *, amount_cents, shirt_size, on_roster=False):
     db.add_member(
         conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"

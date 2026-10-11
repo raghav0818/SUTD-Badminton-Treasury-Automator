@@ -49,6 +49,9 @@ class ExtractedPayment:
     billing_id: str | None
     payment_timestamp: str | None
     transaction_id: str | None
+    # Every ID/reference on the receipt, verbatim: banks label the Billing ID
+    # differently (UOB TMRW: "Reference no. (optional)"), so code matches it.
+    reference_numbers: tuple[str, ...] = ()
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"), sort_keys=True)
@@ -91,6 +94,22 @@ def normalise_transaction_id(value: str | None) -> str | None:
     return normalised or None
 
 
+def receipt_transaction_id(
+    extracted: ExtractedPayment, school: SchoolConfig
+) -> str | None:
+    """The bank's own reference, or None if missing or misread as the school's ID.
+
+    Every payer's receipt shows the same Billing ID/UEN; reserving one of them
+    as a unique bank reference would reject every later payer as a duplicate.
+    """
+    txn = normalise_transaction_id(extracted.transaction_id)
+    school_ids = {
+        normalise_verification_text(school.bill_number),
+        normalise_verification_text(school.uen),
+    }
+    return None if txn in school_ids else txn
+
+
 def verify_extracted_payment(
     extracted: ExtractedPayment,
     *,
@@ -122,10 +141,11 @@ def verify_extracted_payment(
         reasons.append("Recipient does not match the SUTD account.")
 
     expected_bill = normalise_verification_text(school.bill_number)
-    if (
-        not expected_bill
-        or normalise_verification_text(extracted.billing_id) != expected_bill
-    ):
+    seen_ids = {
+        normalise_verification_text(value)
+        for value in (extracted.billing_id, *(extracted.reference_numbers or ()))
+    }
+    if not expected_bill or expected_bill not in seen_ids:
         reasons.append("Billing ID does not match the club's DBS FLYMAX account.")
 
     try:
@@ -156,7 +176,7 @@ def verify_extracted_payment(
     # Check the NORMALISED id: a reference of only punctuation/unicode
     # lookalikes must not slip past both this check and the dedup reservation
     # (which keys on the normalised value).
-    if not normalise_transaction_id(extracted.transaction_id):
+    if not receipt_transaction_id(extracted, school):
         reasons.append("Transaction ID is missing.")
     elif duplicate_transaction:
         reasons.append("Transaction ID has already been submitted.")
