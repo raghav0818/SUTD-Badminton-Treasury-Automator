@@ -109,12 +109,27 @@ def test_shirts_tab_lists_paid_shirt_orders_with_size_counts(conn):
 
     data = spreadsheet.worksheets["Shirts"].data
     assert data[0] == SHIRT_HEADERS
-    assert data[1] == ["Bob Lim", "M"]
-    assert data[2] == ["", ""]
-    counts = dict(data[3:])
-    assert counts["M total"] == 1
-    assert counts["XS total"] == 0
+    assert data[1] == ["Bob Lim", "M", "cash"]
+    assert data[2] == ["", "", ""]
+    counts = {row[0]: row[1] for row in data[3:]}
+    assert counts["M to order"] == 1
+    assert counts["XS to order"] == 0
     assert len(counts) == len(db.SHIRT_SIZES)
+
+    # Cara pays by receipt: listed as "waiting" but not ordered until the bank
+    # check confirms it (the receipt could be fake).
+    cara = db.get_payment_for_member_term(conn, member_id=333, term_id=term["id"])
+    db.save_verification_result(
+        conn, cara["id"], status="verified", amount_cents=3000, extracted_json="{}",
+        bank_txn_id="T1", verified_by="auto",
+    )
+    mirror.push(*mirror.snapshot(conn))
+    data = spreadsheet.worksheets["Shirts"].data
+    assert ["Cara Ng", "M", "waiting"] in data
+    assert {row[0]: row[1] for row in data if row[0]}["M to order"] == 1
+    db.set_bank_confirmed(conn, [cara["id"]])
+    mirror.push(*mirror.snapshot(conn))
+    assert {r[0]: r[1] for r in spreadsheet.worksheets["Shirts"].data if r[0]}["M to order"] == 2
 
 
 def test_push_reuses_existing_worksheets(conn):

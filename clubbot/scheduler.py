@@ -287,15 +287,19 @@ async def do_weekly_backup(bot, conn: sqlite3.Connection) -> bool:
             conn.backup(target)
         finally:
             target.close()
-        stamp = datetime.now(SINGAPORE_TIME).date().isoformat()
+        # Imported here: reconcile imports admin, which imports this module.
+        from clubbot import reconcile
+
+        now = datetime.now(SINGAPORE_TIME)
         with open(path, "rb") as file:
             await bot.send_document(
                 chat_id=treasurer_id,
                 document=file,
-                filename=f"clubbot-{stamp}.db",
+                filename=f"clubbot-{now.date().isoformat()}.db",
                 caption=(
                     "Weekly database backup. Keep this file: it holds every "
                     "member, payment and the receipt-reuse history."
+                    + reconcile.waiting_nudge(conn, now)
                 ),
             )
         db.set_setting(conn, "last_backup_at", datetime.now(SINGAPORE_TIME).isoformat())

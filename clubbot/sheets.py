@@ -21,12 +21,12 @@ PAYMENT_HEADERS = [
     "Amount",
     "Paid at",
     "Verified by",
-    "Flagged",
+    "Bank",
     "Category",
     "Shirt",
     "Size",
 ]
-SHIRT_HEADERS = ["Name", "Size"]
+SHIRT_HEADERS = ["Name", "Size", "Bank"]
 
 
 def _yes_no(value: int | None) -> str:
@@ -66,7 +66,7 @@ class SheetMirror:
                 money(p["amount_cents"]) if p["amount_cents"] is not None else "",
                 p["payment_timestamp"] or "",
                 p["verified_by"] or "",
-                "yes" if p["flagged_at"] else "",
+                db.bank_label(p),
                 p["category"] or "",
                 _yes_no(p["with_shirt"]),
                 p["shirt_size"] or "",
@@ -76,10 +76,15 @@ class SheetMirror:
         # Latest term's shirt orders (kept after it ends), then per-size counts.
         term = db.get_latest_started_term(conn)
         orders = db.list_shirt_orders(conn, term["id"]) if term else []
-        shirts = [[o["full_name"], o["shirt_size"] or "?"] for o in orders]
-        shirts.append(["", ""])
+        # Totals count only bank-confirmed or cash shirts: a "waiting" receipt
+        # may be fake, so it's listed but not ordered until /reconcile clears it.
+        shirts = [
+            [o["full_name"], o["shirt_size"] or "?", db.bank_label(o)] for o in orders
+        ]
+        shirts.append(["", "", ""])
+        orderable = [o for o in orders if db.bank_label(o) in ("confirmed", "cash")]
         shirts += [
-            [f"{size} total", sum(o["shirt_size"] == size for o in orders)]
+            [f"{size} to order", sum(o["shirt_size"] == size for o in orderable), ""]
             for size in db.SHIRT_SIZES
         ]
         return members, payments, shirts

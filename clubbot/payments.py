@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from clubbot import db, paynow, qrgen
@@ -183,4 +183,217 @@ def verify_extracted_payment(
 
     return VerificationResult(
         "exception" if reasons else "verified", tuple(reasons)
+    )
+
+
+# --- Bank reconciliation -----------------------------------------------------------
+# A receipt can be faked; the school's own FLYMAX list cannot (the treasurer
+# screenshots it). Each verified payment must find its own bank line.
+
+MATCH_WINDOW = timedelta(minutes=15)  # receipt time vs FLYMAX time
+DATE_ONLY_WINDOW = timedelta(hours=12)  # a date-only line sits at noon: same SGT day
+NAME_NOISE = {"MR", "MS", "MRS", "MDM", "DR", "MISS"}
+
+
+@dataclass(frozen=True)
+class BankLine:
+    amount_cents: int | None
+    paid_at: str | None
+    payer_name: str | None
+    transaction_id: str | None
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    confirmed: tuple[int, ...]  # payment ids newly backed by a bank line
+    # (payment id, bank line) where only the payer name differs
+    name_differs: tuple[tuple[int, BankLine], ...]
+    # a bank line fits this payment AND another one: nobody auto-confirmed
+    ambiguous: tuple[int, ...]
+    missing: tuple[int, ...]  # inside the covered period, no bank line at all
+    waiting: int  # unconfirmed, outside the covered period: next time
+    stray_lines: tuple[BankLine, ...]  # bank money no member's receipt claims
+    unreadable_lines: int
+    covered: tuple[datetime, datetime] | None
+
+
+def _line_time(line: BankLine) -> tuple[datetime, timedelta] | None:
+    try:
+        when = datetime.fromisoformat(line.paid_at or "")
+    except ValueError:
+        return None
+    if len(line.paid_at) == 10:  # "YYYY-MM-DD"
+        return when.replace(hour=12, tzinfo=SINGAPORE_TIME), DATE_ONLY_WINDOW
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=SINGAPORE_TIME)  # FLYMAX shows SGT
+    return when, MATCH_WINDOW
+
+
+def _name_tokens(name: str | None) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[A-Z]+", (name or "").upper())
+        if len(token) >= 2 and token not in NAME_NOISE
+    }
+
+
+def _payment_ids(payment, school_ids: set[str]) -> set[str]:
+    """The member's receipt references, minus the Billing ID/UEN every receipt shares."""
+    ids = {payment["bank_txn_id"] or ""}
+    try:
+        extracted = json.loads(payment["extracted_json"] or "{}")
+    except ValueError:
+        extracted = {}
+    ids.add(extracted.get("transaction_id") or "")
+    ids.update(extracted.get("reference_numbers") or ())
+    return {normalise_verification_text(value) for value in ids} - {""} - school_ids
+
+
+@dataclass
+class _Row:
+    line: BankLine
+    at: datetime
+    window: timedelta
+    txn: str
+    name: str
+
+    def same_transfer(self, other: "_Row") -> bool:
+        """Overlapping screenshots repeat rows, and Gemini may read the copy a
+        little differently (no ID, a truncated name). Collapsing too much only
+        flags an honest payer; keeping a copy could let two payments share it."""
+        if self.txn and other.txn:
+            return self.txn == other.txn
+        return (
+            self.line.amount_cents == other.line.amount_cents
+            and abs(self.at - other.at) <= DUPLICATE_GAP
+            and (not self.name or not other.name or self.name == other.name)
+        )
+
+
+DUPLICATE_GAP = timedelta(minutes=1)
+
+
+def reconcile(
+    payments, lines: list[BankLine], school: SchoolConfig | None = None
+) -> ReconcileResult:
+    """Match receipt-verified payments to FLYMAX lines; one line backs one payment.
+
+    `payments` are db.list_reconcile_payments rows. A payment is confirmed only
+    when the evidence is unambiguous; a line that fits two payments (including
+    an already-confirmed one) confirms neither and goes to the treasurer.
+    """
+    school = school or SchoolConfig()
+    school_ids = {
+        normalise_verification_text(school.bill_number),
+        normalise_verification_text(school.uen),
+    } - {""}
+
+    rows: list[_Row] = []
+    unreadable = 0
+    for line in lines:
+        timed = _line_time(line)
+        if timed is None or not line.amount_cents:
+            unreadable += 1
+            continue
+        txn = normalise_verification_text(line.transaction_id)
+        row = _Row(
+            line, *timed, "" if txn in school_ids else txn,
+            normalise_verification_text(line.payer_name),
+        )
+        twin = next((r for r in rows if r.same_transfer(row)), None)
+        if twin is None:
+            rows.append(row)
+        elif not twin.txn:
+            twin.txn = row.txn
+
+    def paid_at(payment) -> datetime | None:
+        try:
+            when = datetime.fromisoformat(payment["payment_timestamp"] or "")
+        except ValueError:
+            return None
+        return when if when.tzinfo else None
+
+    used: set[int] = set()
+    matched: set[int] = set()  # payment ids backed by a line this run
+
+    # Pass 1: the line's transaction ID is on exactly one member's receipt.
+    ids = {p["id"]: _payment_ids(p, school_ids) for p in payments}
+    for i, row in enumerate(rows):
+        owners = [p for p in payments if row.txn and row.txn in ids[p["id"]]]
+        if len(owners) == 1 and owners[0]["amount_cents"] == row.line.amount_cents:
+            used.add(i)
+            matched.add(owners[0]["id"])
+
+    def fits(payment, i: int, *, same_name: bool) -> bool:
+        row, when = rows[i], paid_at(payment)
+        return (
+            i not in used
+            and when is not None
+            and row.line.amount_cents == payment["amount_cents"]
+            and abs(when - row.at) <= row.window
+            and (
+                not same_name
+                or bool(_name_tokens(payment["full_name"]) & _name_tokens(row.line.payer_name))
+            )
+        )
+
+    # Pass 2: same amount, close in time, a shared name word, and nobody else
+    # (not even an already-confirmed payment) fits that line.
+    rest = [p for p in payments if p["id"] not in matched]
+    candidates = {
+        i: [p for p in rest if fits(p, i, same_name=True)] for i in range(len(rows))
+    }
+    for payment in sorted(rest, key=lambda p: p["audit_confirmed_at"] is None):
+        for i in range(len(rows)):
+            if i not in used and [p["id"] for p in candidates[i]] == [payment["id"]]:
+                used.add(i)
+                matched.add(payment["id"])
+                break
+
+    covered = None
+    if rows:
+        start = min(rows, key=lambda r: r.at)
+        end = max(rows, key=lambda r: r.at)
+        covered = (start.at + start.window, end.at - end.window)
+
+    def in_covered(payment) -> bool:
+        when = paid_at(payment)
+        return bool(covered and when and covered[0] < when < covered[1])
+
+    name_differs, ambiguous, missing, waiting = [], [], [], 0
+    for payment in rest:
+        if payment["id"] in matched or payment["audit_confirmed_at"]:
+            continue
+        if any(
+            payment["id"] in [p["id"] for p in candidates[i]]
+            for i in range(len(rows))
+            if i not in used
+        ):
+            ambiguous.append(payment["id"])
+            continue
+        # Pass 3 (report only): amount and time fit but the name doesn't, e.g.
+        # a parent paid. Never confirms anything, so the line isn't consumed.
+        near = [i for i in range(len(rows)) if fits(payment, i, same_name=False)]
+        if near:
+            when = paid_at(payment)
+            name_differs.append(
+                (payment["id"], rows[min(near, key=lambda i: abs(when - rows[i].at))].line)
+            )
+        elif in_covered(payment):
+            missing.append(payment["id"])
+        else:
+            waiting += 1
+
+    newly = tuple(
+        p["id"] for p in payments if p["id"] in matched and not p["audit_confirmed_at"]
+    )
+    return ReconcileResult(
+        confirmed=newly,
+        name_differs=tuple(name_differs),
+        ambiguous=tuple(ambiguous),
+        missing=tuple(missing),
+        waiting=waiting,
+        stray_lines=tuple(r.line for i, r in enumerate(rows) if i not in used),
+        unreadable_lines=unreadable,
+        covered=covered,
     )

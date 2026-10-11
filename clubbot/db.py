@@ -1371,10 +1371,11 @@ def list_roster_unregistered(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def list_shirt_orders(conn: sqlite3.Connection, term_id: int) -> list[sqlite3.Row]:
-    """(full_name, shirt_size) for verified payments that included a shirt."""
+    """Verified payments that included a shirt, with their bank-check columns."""
     return conn.execute(
         """
-        SELECT m.full_name, p.shirt_size FROM payments p
+        SELECT m.full_name, p.shirt_size, p.audit_confirmed_at, p.flagged_at,
+            p.verified_by, p.status FROM payments p
         JOIN members m ON m.telegram_user_id = p.member_id
         WHERE p.term_id = ? AND p.status = 'verified' AND p.with_shirt = 1
         ORDER BY m.full_name
@@ -1428,6 +1429,60 @@ def revoke_payment(
     )
     conn.commit()
     return get_payment(conn, payment["id"])
+
+
+# --- Bank reconciliation (/reconcile) -------------------------------------------
+# audit_confirmed_at = a FLYMAX line matched this payment (or the treasurer said
+# it's fine); flagged_at = no bank match yet. Both columns predate v2's audit.
+
+
+def list_reconcile_payments(conn: sqlite3.Connection, term_id: int) -> list[sqlite3.Row]:
+    """Receipt-verified payments (not cash /markpaid) that a bank line must back."""
+    return conn.execute(
+        """
+        SELECT p.*, m.full_name, m.sutd_id FROM payments p
+        JOIN members m ON m.telegram_user_id = p.member_id
+        WHERE p.term_id = ? AND p.status = 'verified'
+            AND p.verified_by IN ('auto', 'treasurer')
+        """,
+        (term_id,),
+    ).fetchall()
+
+
+def set_bank_confirmed(conn: sqlite3.Connection, payment_ids: list[int]) -> None:
+    conn.executemany(
+        "UPDATE payments SET audit_confirmed_at = ?, flagged_at = NULL WHERE id = ?",
+        [(_utc_now(), pid) for pid in payment_ids],
+    )
+    conn.commit()
+
+
+def set_bank_flagged(conn: sqlite3.Connection, payment_ids: list[int]) -> None:
+    conn.executemany(
+        "UPDATE payments SET flagged_at = ? WHERE id = ? AND audit_confirmed_at IS NULL",
+        [(_utc_now(), pid) for pid in payment_ids],
+    )
+    conn.commit()
+
+
+def bank_label(payment) -> str:
+    """Sheet's Bank column: has a FLYMAX line backed this payment yet?"""
+    if payment["status"] != "verified":
+        return ""
+    if payment["verified_by"] == "manual_override":
+        return "cash"
+    if payment["audit_confirmed_at"]:
+        return "confirmed"
+    if payment["flagged_at"]:
+        return "no match"
+    return "waiting"
+
+
+def bank_counts(conn: sqlite3.Connection, term_id: int) -> dict[str, int]:
+    rows = list_reconcile_payments(conn, term_id)
+    confirmed = sum(1 for p in rows if p["audit_confirmed_at"])
+    flagged = sum(1 for p in rows if not p["audit_confirmed_at"] and p["flagged_at"])
+    return {"confirmed": confirmed, "flagged": flagged, "waiting": len(rows) - confirmed - flagged}
 
 
 def mark_term_start_notified(conn: sqlite3.Connection, term_id: int) -> None:

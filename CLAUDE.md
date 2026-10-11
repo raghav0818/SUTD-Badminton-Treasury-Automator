@@ -12,7 +12,30 @@ session** — that is how sessions hand off. The full design/PRD is at
 `docs/superpowers/specs/2026-06-11-club-payment-bot-design.md`; read it before
 changing payment or verification logic.
 
-## Status (2026-10-10)
+## Status (2026-10-11)
+
+- **Live on the Pi at `495d325`** (UOB Billing ID fix), test term with 1-cent
+  fees in the "SUTD Badminton EXCO 26" test group. A real S$0.01 UOB payment
+  auto-verified.
+- **Fake receipts: `/reconcile` built, Codex-reviewed (5 findings fixed),
+  pulled onto the Pi; needs a restart, then a real FLYMAX test.** Key rule
+  from the review: a bank line that fits two payments (incl. an
+  already-confirmed one) confirms neither, and goes to the treasurer as
+  "ambiguous"; the school's Billing ID/UEN never count as a bank txn ID;
+  Shirts tab totals count only bank-confirmed or cash shirts. An
+  AI-generated receipt nearly auto-verified; screenshots can never prove money
+  moved (research `docs/research/2026-10-11-fake-receipt-defences.md`). Plan
+  (grilled, treasurer approved): `docs/superpowers/specs/2026-10-11-bank-reconciliation-plan.md`.
+  Receipt-verified payments now count as paid but "waiting"; the treasurer
+  sends FLYMAX list screenshots to `/reconcile`, Gemini reads the rows,
+  `payments.reconcile` matches each payment to one bank line (txn ID, else
+  amount + ±15 min + a shared name word) and flags the rest with [Revoke] /
+  [It's fine]. Never auto-revokes. Reuses the old audit columns
+  (`audit_confirmed_at` = bank-confirmed, `flagged_at` = no match). Sheet
+  "Bank" column, `/stats` line, nudge in the weekly backup DM, deterrence
+  line in the QR caption. 316 tests pass; Gemini read a synthetic FLYMAX list
+  correctly. Open: real FLYMAX screenshot format, and whether FLYMAX's txn ID
+  equals payer receipt refs (UOB `2610112184655201`, `2610112184752256`).
 
 - **Full-codebase verification and hardening is committed as `9fbc60d` and
   pushed to `main`; not yet deployed.** 293 tests pass; every Python
@@ -113,9 +136,10 @@ changing payment or verification logic.
 - The VLM (Gemini Flash) only *extracts* data from screenshots; membership
   decisions are made by deterministic checks in code (PRD §7.3).
 - Members are keyed by Telegram user ID, never by @username.
-- The school account is called **DBS FLYMAX**. The treasurer has view-only
-  app access: no API, no export, no alerts — hence screenshot verification
-  plus a once-per-term FLYMAX count check (the weekly audit was dropped in v2).
+- The school account is called **DBS FLYMAX** (probably the DBS MAX app).
+  The treasurer has view-only app access: no API — hence screenshot
+  verification, backed by `/reconcile` (treasurer's FLYMAX list screenshots
+  matched line by line). A member's receipt is never proof on its own.
 - Keep fees configurable per term; never hardcode a fee amount.
 - `receipt_fingerprints` is permanent anti-reuse history. Never clear it
   between terms, and back up `clubbot.db`.
@@ -169,6 +193,7 @@ changing payment or verification logic.
 | `clubbot/scheduler.py` | Hourly due-check (term-start blast, d3/7/10/13 + last-call reminders, Mon/Thu group posts; `term_events` stamps), Sunday DB backup DM, Gemini-failure retry, Sheet sync jobs |
 | `clubbot/removal.py` | Rec chat only: remove unpaid people after deadline + grace (preview/warning/daily sweep), join-request gate, join tracking, `/keep` |
 | `scripts/import_rec_members.py` | One-off Telethon import of people already in the rec chat (bots can't list members) |
+| `clubbot/reconcile.py` | `/reconcile`: treasurer's FLYMAX screenshots → bank lines → match report with Revoke / It's fine (`rc:` buttons); rules in `payments.reconcile` |
 | `clubbot/sessions.py` | `/session` recre sign-up cards (`ss:` buttons), waitlist, noon nets & shuttles pick + handoff |
 | `clubbot/sheets.py` | Read-only Google Sheet mirror (Members + Payments + Shirts tabs) |
 | `clubbot/config.py`, `__main__.py` | `.env` loading; entry point `python -m clubbot` |
@@ -264,11 +289,15 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
 - **2026-10-11** — First real v2 payment (UOB TMRW, S$0.20) went to review:
   Gemini returned the UEN as `billing_id` (the prompt said "UEN/bill
   reference"); UOB shows the full Billing ID under "Reference no. (optional)".
-  Fix (uncommitted at time of writing): Gemini also lists every ID on the
+  Fix (`495d325`, deployed): Gemini also lists every ID on the
   receipt (`reference_numbers`) and code matches the exact Billing ID among
   them; a transaction ID equal to the school's Billing ID/UEN is treated as
   missing so it can never be reserved and block later payers. Re-run on the
   real receipt: 5/5 verified. 301 tests pass. Other banks (DBS/POSB, OCBC,
   PayLah) still unproven; failures there fail closed to treasurer review.
+- **2026-10-11** — Treasurer's AI-generated fake receipt reached review only
+  because its Billing ID was slightly off. Researched (detectors are at chance;
+  everyone reconciles against the receiving account), grilled, and built
+  `/reconcile` (`clubbot/reconcile.py` + `payments.reconcile`). See Status.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).

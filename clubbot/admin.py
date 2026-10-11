@@ -65,6 +65,7 @@ ADMIN_COMMANDS = (
 )
 TREASURER_COMMANDS = (
     ("newterm", "Open a new term (tap through the steps)"),
+    ("reconcile", "Check payments against FLYMAX screenshots"),
     ("markpaid", "Record a cash payment: /markpaid <SUTD ID>"),
     ("remind", "Nudge unpaid members now"),
     ("revoke", "Remove a membership: /revoke <SUTD ID>"),
@@ -263,6 +264,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(NO_TERM)
         return
     stats = db.get_term_payment_stats(conn, term["id"])
+    bank = db.bank_counts(conn, term["id"])
     breakdown = _breakdown_lines(db.get_term_amount_breakdown(conn, term["id"]))
     await update.message.reply_text(
         f"{term['name']}\n"
@@ -272,7 +274,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Paid: {stats['paid']}\n"
         f"Unpaid: {stats['unpaid']}\n"
         f"Opted out: {stats['opted_out']}\n"
-        f"Exceptions: {stats['exceptions']}"
+        f"Exceptions: {stats['exceptions']}\n\n"
+        f"Bank check (/reconcile): {bank['confirmed']} confirmed, "
+        f"{bank['waiting']} waiting, {bank['flagged']} no match"
     )
 
 

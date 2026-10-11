@@ -24,7 +24,7 @@ from telegram.ext import (
     filters,
 )
 
-from clubbot import admin, db, newterm, removal, scheduler, sessions, validation
+from clubbot import admin, db, newterm, reconcile, removal, scheduler, sessions, validation
 from clubbot.newterm import (  # noqa: F401  (re-exported for tests)
     NEWTERM_USAGE,
     cmd_newterm,
@@ -466,7 +466,9 @@ async def _issue_qr(
             f"{term['name']} membership fee: {money(amount)}\n"
             "Pay using this QR, then send the successful-payment screenshot here. "
             "Expand the transfer details so the amount, recipient, Billing ID, "
-            "payment time, and bank reference number are visible."
+            "payment time, and bank reference number are visible.\n\n"
+            "Every payment is matched against SUTD's bank record. Fake or edited "
+            "receipts mean removal from the club and may be reported."
         ),
     )
 
@@ -482,6 +484,9 @@ def _receipt_file(message) -> tuple[str, str, int | None] | None:
 
 
 async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if reconcile.collecting(context):  # treasurer mid-/reconcile: a FLYMAX screenshot
+        await reconcile.on_screenshot(update, context)
+        return
     conn = _db(context)
     member = db.get_member(conn, update.effective_user.id)
     if member is None:
@@ -836,6 +841,8 @@ def build_application(
     for handler in newterm.build_handlers(PRIVATE):
         app.add_handler(handler)
     for handler in sessions.build_handlers(PRIVATE):
+        app.add_handler(handler)
+    for handler in reconcile.build_handlers(PRIVATE):
         app.add_handler(handler)
     registration = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start, filters=PRIVATE)],
