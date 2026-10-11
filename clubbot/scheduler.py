@@ -209,6 +209,25 @@ async def post_group_progress(
             db.claim_term_event(conn, term["id"], stamp)
 
 
+async def post_payment_open(bot, conn: sqlite3.Connection, term) -> None:
+    """Announce a new payment window once in each configured club group."""
+    text = (
+        f"{term['name']} membership payment is now open. "
+        f"Please pay by {term['deadline']}.\n"
+        "Open a private chat with the bot to register or get your personal "
+        f"PayNow QR: https://t.me/{bot.username}?start=pay"
+    )
+    for key in (db.GROUP_KEYS["comp"], db.GROUP_KEYS["rec"]):
+        chat_id = db.get_setting(conn, key)
+        if chat_id is None:
+            continue
+        event = f"payment-open:{key}"
+        if db.term_event_claimed(conn, term["id"], event):
+            continue
+        if await _deliver(bot, int(chat_id), text):
+            db.claim_term_event(conn, term["id"], event)
+
+
 async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
     """Send everything due today and not yet stamped, for every open term.
 
@@ -232,6 +251,8 @@ async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
             await removal.run_due(bot, conn, term, today)
         if not term["start_date"] <= today.isoformat() <= term["deadline"]:
             continue
+        if today.isoformat() >= term["start_date"] and group_posts_on:
+            await post_payment_open(bot, conn, term)
         blasted = False
         if term["start_notified_at"] is None:
             await do_term_start_blast(bot, conn, term["id"])

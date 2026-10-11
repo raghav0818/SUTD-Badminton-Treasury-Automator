@@ -178,6 +178,9 @@ def test_group_posts_counts_only_no_names_once(conn):
         db.mark_paid_manual(conn, member_id=uid, term_id=term["id"])
     db.set_setting(conn, "comp_group_id", "-1001")
     db.set_setting(conn, "rec_group_id", "-1002")
+    # This test covers the scheduled progress post, after the opening post.
+    db.claim_term_event(conn, term["id"], "payment-open:comp_group_id")
+    db.claim_term_event(conn, term["id"], "payment-open:rec_group_id")
 
     fake_bot = make_bot()
     fake_bot.username = "ShuttleBot"
@@ -209,7 +212,49 @@ def test_group_posts_switch_off_and_send_failure(conn):
     db.set_setting(conn, "group_posts", "on")
     fake_bot.send_message.side_effect = Exception("bot was kicked")
     asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-03", 12, 1)))
-    assert fake_bot.send_message.await_count == 2  # both tried, no crash
+    assert fake_bot.send_message.await_count == 4  # opening notice + progress, both groups tried
+
+
+def test_payment_open_announcement_posts_once_to_each_group(conn):
+    term = _fixed_term(conn)
+    db.set_setting(conn, "rec_group_id", "-1002")
+    db.set_setting(conn, "comp_group_id", "-1001")
+    fake_bot = make_bot()
+    fake_bot.username = "ShuttleBot"
+
+    # Catch up if the bot missed the exact start date while it was offline.
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-02", 10, 1)))
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-02", 11, 1)))
+
+    posts = {call.kwargs["chat_id"]: call.kwargs["text"] for call in fake_bot.send_message.await_args_list}
+    assert set(posts) == {-1001, -1002}
+    assert fake_bot.send_message.await_count == 2
+    for text in posts.values():
+        assert "payment is now open" in text
+        assert "2026-09-15" in text
+        assert "https://t.me/ShuttleBot?start=pay" in text
+
+
+def test_payment_open_announcement_retries_failed_group_delivery(conn):
+    term = _fixed_term(conn)
+    db.set_setting(conn, "rec_group_id", "-1002")
+    db.set_setting(conn, "comp_group_id", "-1001")
+    fake_bot = make_bot()
+    fake_bot.username = "ShuttleBot"
+
+    async def fail_comp_once(*args, **kwargs):
+        if kwargs["chat_id"] == -1001:
+            fake_bot.send_message.side_effect = None
+            raise RuntimeError("temporary failure")
+
+    fake_bot.send_message.side_effect = fail_comp_once
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-02", 10, 1)))
+
+    assert db.term_event_claimed(conn, term["id"], "payment-open:rec_group_id")
+    assert not db.term_event_claimed(conn, term["id"], "payment-open:comp_group_id")
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-02", 11, 1)))
+    assert fake_bot.send_message.await_count == 3
+    assert db.term_event_claimed(conn, term["id"], "payment-open:comp_group_id")
 
 
 # --- do_term_start_blast -------------------------------------------------------
