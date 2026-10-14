@@ -108,7 +108,7 @@ def test_wrong_fields_go_to_exception():
         now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
     )
     assert result.outcome == "exception"
-    assert len(result.reasons) == 6
+    assert len(result.reasons) == 5
 
 
 def test_duplicate_transaction_goes_to_exception():
@@ -150,19 +150,21 @@ def test_timestamp_without_timezone_is_rejected():
     assert "no timezone" in result.reasons[0]
 
 
-def test_transaction_id_that_normalises_to_empty_is_treated_as_missing():
-    # Punctuation-only or unicode-lookalike references must not slip past both
-    # the missing-ID check and the (normalised) duplicate reservation.
+def test_transaction_id_that_normalises_to_empty_does_not_block_verification():
+    # Punctuation-only or unicode-lookalike references normalise to nothing,
+    # same as a genuinely missing ID: that's fine now (/reconcile is the
+    # backstop), as long as it also can't be reserved for dedup elsewhere.
+    extracted = valid_extraction(transaction_id="ＴＸ－１２３")  # fullwidth: normalises to ""
+    assert receipt_transaction_id(extracted, SchoolConfig()) is None
     result = verify_extracted_payment(
-        valid_extraction(transaction_id="ＴＸ－１２３"),  # fullwidth: normalises to ""
+        extracted,
         valid_amounts={5},
         term_start="2026-06-01",
         term_end="2026-06-30",
         qr_issued_at="2026-06-20T02:30:00+00:00",
         now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
     )
-    assert result.outcome == "exception"
-    assert "Transaction ID is missing" in result.reasons[0]
+    assert result.passed
 
 
 def test_verification_fails_closed_for_empty_normalised_school_checks():
@@ -229,8 +231,25 @@ def test_school_id_misread_as_transaction_id_is_treated_as_missing():
     for misread in (SCHOOL_BILL_NUMBER, SCHOOL_UEN, SCHOOL_BILL_NUMBER.lower()):
         extracted = valid_extraction(**{**UOB_TMRW, "transaction_id": misread})
         assert receipt_transaction_id(extracted, SchoolConfig()) is None
-        assert _check(extracted).reasons == ("Transaction ID is missing.",)
+        # Treated as missing, not a mismatch: still auto-verifies.
+        assert _check(extracted).passed
     assert receipt_transaction_id(valid_extraction(**UOB_TMRW), SchoolConfig()) == "2610112184655201"
+
+
+def test_missing_transaction_id_does_not_block_auto_verify():
+    # The common real-world case: a bank's collapsed success screen shows no
+    # transaction/reference number at all (only the school's Billing ID).
+    # Everything else checking out is enough; /reconcile covers the rest.
+    extracted = valid_extraction(transaction_id=None, reference_numbers=())
+    result = verify_extracted_payment(
+        extracted,
+        valid_amounts={5},
+        term_start="2026-06-01",
+        term_end="2026-06-30",
+        qr_issued_at="2026-06-20T02:30:00+00:00",
+        now=datetime(2026, 6, 20, 3, 0, tzinfo=timezone.utc),
+    )
+    assert result.passed
 
 
 def test_school_config_defaults_and_settings_override():

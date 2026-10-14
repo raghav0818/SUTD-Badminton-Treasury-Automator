@@ -12,11 +12,25 @@ session** — that is how sessions hand off. The full design/PRD is at
 `docs/superpowers/specs/2026-06-11-club-payment-bot-design.md`; read it before
 changing payment or verification logic.
 
-## Status (2026-10-11)
+## Status (2026-10-14)
 
-- **Live on the Pi at `495d325`** (UOB Billing ID fix), test term with 1-cent
-  fees in the "SUTD Badminton EXCO 26" test group. A real S$0.01 UOB payment
-  auto-verified.
+- **Missing transaction ID no longer blocks auto-verify (not yet deployed).**
+  A real test payment from a newly registered member (Clarice Lim, DBS/PayLah-
+  style collapsed success screen) failed auto-verify solely because the bank
+  reference number sits behind a "show details" chevron most payers never
+  tap — Gemini correctly read the screen and returned `transaction_id: null`;
+  the deterministic check then hard-failed it to manual review. Since most
+  banks behave this way, requiring a transaction ID would send most
+  legitimate payments to the treasurer, defeating the automation goal.
+  Fixed: `verify_extracted_payment` (`clubbot/payments.py`) no longer treats
+  a missing transaction ID as a block — only a transaction ID that IS present
+  and already used by another payment still blocks. A missing one now relies
+  on `/reconcile`'s own backstop (amount + time ±15 min + a shared name word
+  against the treasurer's FLYMAX list; a bank line fitting two payments
+  confirms neither). 317 tests updated/pass (`tests/test_payments.py`,
+  `tests/test_bot.py`). **Needs a Pi restart to go live** — not deployed yet.
+- **Live on the Pi at `33839d8`**, test term with 1-cent fees in the "SUTD
+  Badminton EXCO 26" test group. A real S$0.01 UOB payment auto-verified.
 - **Fake receipts: `/reconcile` built, Codex-reviewed (5 findings fixed),
   pulled onto the Pi; needs a restart, then a real FLYMAX test.** Key rule
   from the review: a bank line that fits two payments (incl. an
@@ -295,6 +309,14 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   missing so it can never be reserved and block later payers. Re-run on the
   real receipt: 5/5 verified. 301 tests pass. Other banks (DBS/POSB, OCBC,
   PayLah) still unproven; failures there fail closed to treasurer review.
+- **2026-10-14** — Diagnosed a real auto-verify failure on the Pi (SSH over
+  Tailscale): a newly registered member's receipt was a bank app's collapsed
+  success screen with no visible transaction ID (DBS/PayLah-style; the number
+  sits behind an unexpanded chevron). Confirmed by pulling the member's
+  receipt off Telegram via the bot's own file_id (viewed once, both the Pi
+  and local temp copies deleted immediately after — never kept on disk).
+  Gemini extracted correctly; the deterministic "Transaction ID is missing"
+  check was too strict for how real banks behave. Fixed per Status above.
 - **2026-10-11** — Treasurer's AI-generated fake receipt reached review only
   because its Billing ID was slightly off. Researched (detectors are at chance;
   everyone reconciles against the receiving account), grilled, and built

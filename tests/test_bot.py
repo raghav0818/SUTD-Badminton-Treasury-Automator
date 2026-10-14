@@ -661,8 +661,12 @@ def test_billing_id_misread_as_transaction_id_does_not_block_later_payers(conn):
         asyncio.run(bot.on_receipt(update, context))
         return db.get_payment(conn, payment["id"])
 
+    # The misread "transaction ID" (really the Billing ID) is treated as
+    # missing, which no longer blocks auto-verify on its own — but it must
+    # still never be reserved as a real transaction ID (that would be the
+    # bug: it would then collide with every other payer's own billing ID).
     first = submit(111, "1010654", b"img-1", SCHOOL_BILL_NUMBER)
-    assert first["status"] == "exception"
+    assert first["status"] == "verified"
     assert first["bank_txn_id"] is None
     second = submit(222, "1010655", b"img-2", "2610112184655201")
     assert second["status"] == "verified"

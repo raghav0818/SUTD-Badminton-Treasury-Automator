@@ -173,12 +173,15 @@ def verify_extracted_payment(
     except ValueError:
         reasons.append("Payment timestamp is missing, invalid, or has no timezone.")
 
-    # Check the NORMALISED id: a reference of only punctuation/unicode
-    # lookalikes must not slip past both this check and the dedup reservation
-    # (which keys on the normalised value).
-    if not receipt_transaction_id(extracted, school):
-        reasons.append("Transaction ID is missing.")
-    elif duplicate_transaction:
+    # A missing transaction ID does NOT block auto-verify: most banks only
+    # show it behind an "expand details" tap payers routinely skip, so
+    # requiring it would send most legitimate payments to manual review.
+    # /reconcile's bank-line matching (amount + time + a shared name word
+    # against the treasurer's own FLYMAX list) is the real backstop for
+    # these. A transaction ID that IS present and already used by another
+    # payment still blocks here — that's unambiguous reuse, no need to wait
+    # for reconcile.
+    if receipt_transaction_id(extracted, school) and duplicate_transaction:
         reasons.append("Transaction ID has already been submitted.")
 
     return VerificationResult(
