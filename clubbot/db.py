@@ -62,7 +62,17 @@ CREATE TABLE IF NOT EXISTS payments (
     notified_at        TEXT,
     wants_shirt        INTEGER,
     extract_attempts   INTEGER NOT NULL DEFAULT 0,
-    last_extract_error_at TEXT
+    last_extract_error_at TEXT,
+    review_notified_at TEXT
+);
+
+-- /reconcile: a FLYMAX transfer that backed a payment is that payment's for
+-- good, like receipt_fingerprints (never cleared, even on revoke or a new
+-- receipt). One payment can collect several over its revoke/resubmit history.
+CREATE TABLE IF NOT EXISTS bank_line_claims (
+    txn_id     TEXT    PRIMARY KEY,
+    payment_id INTEGER NOT NULL REFERENCES payments(id),
+    claimed_at TEXT    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS admins (
@@ -143,6 +153,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id      INTEGER,
     message_id   INTEGER,
     cancelled_at TEXT,
+    cancel_posted_at TEXT,
     primary_id   INTEGER,
     secondary_id INTEGER,
     picked_at    TEXT,
@@ -243,6 +254,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "last_extract_error_at": "TEXT",
         },
     )
+    # The treasurer's Approve/Reject message was delivered (retried until so).
+    _add_missing_columns(conn, "payments", {"review_notified_at": "TEXT"})
+    # Cancellation posts are now retried until delivered. Older cancellations
+    # were already announced (best effort): mark them done so none re-post.
+    session_columns = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "cancel_posted_at" not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN cancel_posted_at TEXT")
+        conn.execute(
+            "UPDATE sessions SET cancel_posted_at = cancelled_at WHERE cancelled_at IS NOT NULL"
+        )
     # Pre-v2 terms had one price and no shirt: every category pays fee_cents.
     conn.execute(
         """
@@ -540,15 +561,21 @@ def _relink_key(sutd_id: str) -> str:
     return f"relink:{sutd_id}"
 
 
-def arm_relink(conn: sqlite3.Connection, sutd_id: str) -> None:
+def arm_relink(conn: sqlite3.Connection, sutd_id: str) -> str:
+    """Arm a relink and return its single-use secret code. Knowing a SUTD ID is
+    not enough to take over an account (or its admin/treasurer role)."""
+    code = secrets.token_urlsafe(12)
     set_setting(conn, _relink_key(sutd_id), _utc_now())
+    set_setting(conn, f"relinkcode:{sutd_id}", code)
+    return code
 
 
 def disarm_relink(conn: sqlite3.Connection, sutd_id: str) -> None:
     delete_setting(conn, _relink_key(sutd_id))
+    delete_setting(conn, f"relinkcode:{sutd_id}")
 
 
-def relink_armed(conn: sqlite3.Connection, sutd_id: str) -> bool:
+def _relink_fresh(conn: sqlite3.Connection, sutd_id: str) -> bool:
     value = get_setting(conn, _relink_key(sutd_id))
     if value is None:
         return False
@@ -559,6 +586,16 @@ def relink_armed(conn: sqlite3.Connection, sutd_id: str) -> bool:
     return datetime.now(timezone.utc) - armed_at < RELINK_TTL
 
 
+def relink_armed(conn: sqlite3.Connection, sutd_id: str, code: str | None) -> bool:
+    """Armed, not expired, and `code` is this relink's secret."""
+    expected = get_setting(conn, f"relinkcode:{sutd_id}")
+    return (
+        bool(code and expected)
+        and secrets.compare_digest(code, expected)
+        and _relink_fresh(conn, sutd_id)
+    )
+
+
 def list_armed_relinks(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     """(sutd_id, armed_at) for every relink flag, freshest first, expired pruned."""
     rows = conn.execute(
@@ -567,10 +604,10 @@ def list_armed_relinks(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     armed: list[tuple[str, str]] = []
     for row in rows:
         sutd_id = row["key"].removeprefix("relink:")
-        if relink_armed(conn, sutd_id):
+        if _relink_fresh(conn, sutd_id):
             armed.append((sutd_id, row["value"]))
         else:
-            delete_setting(conn, row["key"])
+            disarm_relink(conn, sutd_id)
     return armed
 
 
@@ -940,7 +977,11 @@ def mark_payment_pending(
         SET status = 'pending_verification', screenshot_file_id = ?,
             image_hash = ?, extracted_json = NULL, bank_txn_id = NULL,
             verified_at = NULL, verified_by = NULL,
-            extract_attempts = 0, last_extract_error_at = NULL
+            extract_attempts = 0, last_extract_error_at = NULL,
+            audit_confirmed_at = NULL, flagged_at = NULL, review_notified_at = NULL,
+            -- Facts read from the OLD receipt. wants_shirt/shirt_size (the
+            -- member's current pay-flow choice) stay.
+            amount_cents = NULL, payment_timestamp = NULL, with_shirt = NULL
         WHERE id = ?
         """,
         (screenshot_file_id, image_hash, payment_id),
@@ -1009,6 +1050,20 @@ def list_extraction_retries(
         (max_attempts,),
     ).fetchall()
     return [get_payment(conn, row["id"]) for row in rows]
+
+
+def mark_review_notified(conn: sqlite3.Connection, payment_id: int) -> None:
+    conn.execute(
+        "UPDATE payments SET review_notified_at = ? WHERE id = ?", (_utc_now(), payment_id)
+    )
+    conn.commit()
+
+
+def list_unnotified_reviews(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Receipts waiting for the treasurer whose review message never arrived."""
+    return conn.execute(
+        "SELECT id FROM payments WHERE status = 'exception' AND review_notified_at IS NULL"
+    ).fetchall()
 
 
 def mark_payment_exception(conn: sqlite3.Connection, payment_id: int) -> None:
@@ -1138,6 +1193,15 @@ def opt_out(conn: sqlite3.Connection, payment_id: int) -> None:
         (_utc_now(), payment_id),
     )
     conn.commit()
+
+
+def members_notified(conn: sqlite3.Connection, term_id: int) -> set[int]:
+    """Members the term-start blast reached."""
+    rows = conn.execute(
+        "SELECT member_id FROM payments WHERE term_id = ? AND notified_at IS NOT NULL",
+        (term_id,),
+    ).fetchall()
+    return {row["member_id"] for row in rows}
 
 
 def mark_payment_notified(conn: sqlite3.Connection, payment_id: int) -> None:
@@ -1424,7 +1488,11 @@ def revoke_payment(
     if payment["status"] != "verified":
         raise ValueError("only a verified payment can be revoked")
     conn.execute(
-        "UPDATE payments SET status = 'revoked' WHERE id = ?",
+        """
+        UPDATE payments
+        SET status = 'revoked', audit_confirmed_at = NULL, flagged_at = NULL
+        WHERE id = ?
+        """,
         (payment["id"],),
     )
     conn.commit()
@@ -1457,12 +1525,49 @@ def set_bank_confirmed(conn: sqlite3.Connection, payment_ids: list[int]) -> None
     conn.commit()
 
 
-def set_bank_flagged(conn: sqlite3.Connection, payment_ids: list[int]) -> None:
-    conn.executemany(
-        "UPDATE payments SET flagged_at = ? WHERE id = ? AND audit_confirmed_at IS NULL",
-        [(_utc_now(), pid) for pid in payment_ids],
-    )
-    conn.commit()
+def bank_line_owners(conn: sqlite3.Connection) -> dict[str, int]:
+    """FLYMAX txn ID -> the payment (any term, any status) it confirmed."""
+    rows = conn.execute("SELECT txn_id, payment_id FROM bank_line_claims").fetchall()
+    return {row["txn_id"]: row["payment_id"] for row in rows}
+
+
+def record_reconcile(
+    conn: sqlite3.Connection,
+    *,
+    suspended: list[int],
+    confirmed: list[int],
+    claims: list[tuple[int, str]],
+    flagged: list[int],
+) -> None:
+    """Save one /reconcile outcome all or nothing, so a crash can never leave a
+    payment confirmed without its transfer reserved."""
+    now = _utc_now()
+    with conn:
+        conn.executemany(
+            "UPDATE payments SET audit_confirmed_at = NULL WHERE id = ?",
+            [(pid,) for pid in suspended],
+        )
+        conn.executemany(
+            "UPDATE payments SET audit_confirmed_at = ?, flagged_at = NULL WHERE id = ?",
+            [(now, pid) for pid in confirmed],
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO bank_line_claims (txn_id, payment_id, claimed_at)"
+            " VALUES (?, ?, ?)",
+            [(txn, pid, now) for pid, txn in claims],
+        )
+        conn.executemany(
+            "UPDATE payments SET flagged_at = ? WHERE id = ? AND audit_confirmed_at IS NULL",
+            [(now, pid) for pid in flagged],
+        )
+
+
+def payment_version(payment) -> int:
+    """Changes every time a payment (re)becomes verified, so a Revoke or
+    It's fine button made for one receipt can't act on a later replacement."""
+    if not payment["verified_at"]:
+        return 0
+    return int(datetime.fromisoformat(payment["verified_at"]).timestamp())
 
 
 def bank_label(payment) -> str:
@@ -1589,6 +1694,35 @@ def set_session_pick(
         (primary_id, secondary_id, _utc_now(), session_id),
     )
     conn.commit()
+
+
+def mark_session_cancel_posted(conn: sqlite3.Connection, session_id: int) -> None:
+    conn.execute(
+        "UPDATE sessions SET cancel_posted_at = ? WHERE id = ?", (_utc_now(), session_id)
+    )
+    conn.commit()
+
+
+def sessions_needing_cancel_post(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Cancelled sessions whose cancellation never reached the group."""
+    return conn.execute(
+        """
+        SELECT * FROM sessions
+        WHERE message_id IS NOT NULL AND cancelled_at IS NOT NULL
+            AND cancel_posted_at IS NULL
+        """
+    ).fetchall()
+
+
+def sessions_picked_without_primary(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Picked, not cancelled, but nobody left in charge (announced or not)."""
+    return conn.execute(
+        """
+        SELECT * FROM sessions
+        WHERE message_id IS NOT NULL AND cancelled_at IS NULL
+            AND picked_at IS NOT NULL AND primary_id IS NULL
+        """
+    ).fetchall()
 
 
 def mark_session_announced(conn: sqlite3.Connection, session_id: int) -> None:

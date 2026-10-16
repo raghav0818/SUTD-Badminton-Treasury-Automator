@@ -344,27 +344,37 @@ def test_failed_handoff_group_post_is_retried_by_due_job(conn):
     assert db.get_session(conn, sid)["announced_at"] is not None
 
 
-def test_failed_nobody_left_handoff_is_retried_by_due_job(conn):
+def test_job_passed_past_the_last_person_cancels_the_session(conn):
+    # Treasurer rule: the job passes down the list; once nobody is left to
+    # take it, the session can't run and is cancelled.
     context = make_context(conn)
     sid = posted_session(conn, context)
-    join(context, sid, 1)
-    noon = datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)
-    asyncio.run(sessions.run_due_picks(context.bot, conn, noon))
-    old = db.get_session(conn, sid)
+    join(context, sid, 1, 2)
+    asyncio.run(sessions.run_due_picks(context.bot, conn, datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)))
+    first = db.get_session(conn, sid)["primary_id"]
+    second = ({1, 2} - {first}).pop()
 
-    async def fail_group(*args, **kwargs):
-        if kwargs.get("chat_id") == REC_GROUP:
-            raise BadRequest("temporary group failure")
-        return MagicMock()
+    asyncio.run(sessions.on_leave(make_tap(f"ss:l:{sid}", first), context))
+    assert db.get_session(conn, sid)["cancelled_at"] is None  # the backup took over
+    assert db.get_session(conn, sid)["primary_id"] == second
 
-    context.bot.send_message.side_effect = fail_group
-    asyncio.run(sessions.on_leave(make_tap(f"ss:l:{sid}", old["primary_id"]), context))
-    assert db.get_session(conn, sid)["announced_at"] is None
+    asyncio.run(sessions.on_leave(make_tap(f"ss:l:{sid}", second), context))
+    assert db.get_session(conn, sid)["cancelled_at"] is not None
+    sent = [c.kwargs for c in context.bot.send_message.call_args_list]
+    assert "Session cancelled" in [k["text"] for k in sent if k["chat_id"] == REC_GROUP][-1]
+    assert any(k["chat_id"] == HOST and "I cancelled" in k["text"] for k in sent)
+    card = context.bot.edit_message_text.call_args.kwargs
+    assert card["text"].startswith("❌ CANCELLED") and card["reply_markup"] is None
+    assert "cancelled" in answer_of(tap(sessions.on_join, f"ss:j:{sid}", context, 3))
 
-    context.bot.send_message.side_effect = None
-    asyncio.run(sessions.run_due_picks(context.bot, conn, noon.replace(hour=13)))
-    assert db.get_session(conn, sid)["announced_at"] is not None
-    assert "nobody is left" in context.bot.send_message.call_args.kwargs["text"]
+
+def test_hourly_job_cancels_a_picked_session_left_with_nobody(conn):
+    # Leftover state (e.g. from before this rule): picked, but nobody in charge.
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    db.set_session_pick(conn, sid, None, None)
+    asyncio.run(sessions.run_due_picks(context.bot, conn, datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)))
+    assert db.get_session(conn, sid)["cancelled_at"] is not None
 
 
 def test_primary_cant_make_it_hands_over_to_backup(conn):
@@ -399,3 +409,91 @@ def test_rotation_counts_past_primaries(conn):
     db.set_session_pick(conn, first, 1, 2)
     db.mark_session_announced(conn, first)
     assert db.times_primary(conn, exclude_session_id=999) == {1: 1}
+
+
+def test_late_joiner_fills_an_empty_backup_role(conn):
+    # Codex: only one player at the noon pick (no backup); Bob joins later.
+    # Bob must become the backup and be told.
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    join(context, sid, 1)
+    asyncio.run(sessions.run_due_picks(context.bot, conn, datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)))
+    assert db.get_session(conn, sid)["secondary_id"] is None
+
+    join(context, sid, 2)
+    assert db.get_session(conn, sid)["secondary_id"] == 2
+    sent = [c.kwargs for c in context.bot.send_message.call_args_list]
+    group = [k["text"] for k in sent if k["chat_id"] == REC_GROUP]
+    assert "Backup:" in group[-1] and "tg://user?id=2" in group[-1]
+    assert any(k["chat_id"] == 2 and "You're the backup" in k["text"] for k in sent)
+
+
+def test_backup_can_drop_out_from_their_dm_and_a_new_backup_is_named(conn):
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    join(context, sid, 1, 2, 3)
+    bot = context.bot
+    asyncio.run(sessions.run_due_picks(bot, conn, datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)))
+    old = db.get_session(conn, sid)
+    backup_dm = next(
+        c.kwargs for c in bot.send_message.call_args_list
+        if c.kwargs["chat_id"] == old["secondary_id"]
+    )
+    assert backup_dm["reply_markup"].inline_keyboard[0][0].callback_data == f"ss:l:{sid}"
+
+    asyncio.run(sessions.on_leave(make_tap(f"ss:l:{sid}", old["secondary_id"]), context))
+    new = db.get_session(conn, sid)
+    assert new["primary_id"] == old["primary_id"]
+    group = [c.kwargs["text"] for c in bot.send_message.call_args_list if c.kwargs["chat_id"] == REC_GROUP]
+    assert "Still collecting" in group[-1] and "New backup" in group[-1]
+
+
+def test_noon_post_is_reposted_if_duties_change_while_it_sends(conn):
+    # Codex: the primary leaves while the noon post is in flight; the stale
+    # post must not be stamped as the final word: the new duties are posted.
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    join(context, sid, 1, 2, 3)
+    bot = context.bot
+    original = bot.send_message.side_effect
+    left = {"done": False}
+
+    async def send(**kwargs):
+        if kwargs["chat_id"] == REC_GROUP and not left["done"]:
+            left["done"] = True
+            primary = db.get_session(conn, sid)["primary_id"]
+            await sessions.on_leave(make_tap(f"ss:l:{sid}", primary), context)
+        return MagicMock(chat_id=REC_GROUP, message_id=77)
+
+    bot.send_message.side_effect = send
+    asyncio.run(sessions.run_due_picks(bot, conn, datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)))
+    bot.send_message.side_effect = original
+    final = db.get_session(conn, sid)
+    assert final["announced_at"] is not None
+    group = [c.kwargs["text"] for c in bot.send_message.call_args_list if c.kwargs["chat_id"] == REC_GROUP]
+    assert f"tg://user?id={final['primary_id']}" in group[-1]
+
+
+def test_cancellation_post_is_retried_until_delivered(conn):
+    # Codex: a crash or Telegram error after saving the cancel must not leave
+    # the group uninformed; the hourly job finishes it.
+    context = make_context(conn)
+    sid = posted_session(conn, context)
+    join(context, sid, 1)
+    noon = datetime(2026, 10, 15, 12, tzinfo=SINGAPORE_TIME)
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon))
+
+    async def fail_group(*args, **kwargs):
+        if kwargs.get("chat_id") == REC_GROUP:
+            raise BadRequest("temporary group failure")
+        return MagicMock()
+
+    context.bot.send_message.side_effect = fail_group
+    asyncio.run(sessions.on_leave(make_tap(f"ss:l:{sid}", 1), context))
+    assert db.get_session(conn, sid)["cancelled_at"] is not None
+    assert db.get_session(conn, sid)["cancel_posted_at"] is None
+
+    context.bot.send_message.side_effect = None
+    asyncio.run(sessions.run_due_picks(context.bot, conn, noon.replace(hour=13)))
+    assert db.get_session(conn, sid)["cancel_posted_at"] is not None
+    assert "Session cancelled" in context.bot.send_message.call_args_list[-2].kwargs["text"]

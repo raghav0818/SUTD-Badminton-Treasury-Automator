@@ -403,15 +403,66 @@ only as a signal for manual review, never as a verdict.**
 
 ## Open questions for the treasurer
 
-1. Is the FLYMAX app actually **DBS MAX**? Does it show a "Transactions" tab
-   with a report/download option, and a notification setting?
+1. ~~Is the FLYMAX app actually **DBS MAX**?~~ **Confirmed 2026-10-16** —
+   see section 7 below.
 2. On your S$0.05 test payment, does FLYMAX's **transaction ID equal** the
    reference on the payer's receipt? Is it the same for a second bank?
+   Still open — see section 7 (the digit counts don't match, but that's not
+   a same-transaction comparison).
 3. Does FLYMAX history go back further than 90 days?
 4. Would members accept **non-round fees** (for example S$20.37) in exchange
    for automatic bank matching?
 5. If your role can't export: will SUTD Finance either upgrade it or email you
    a weekly CSV of the club outlet's transactions?
+
+---
+
+## 7. Confirmed FLYMAX screenshot format (2026-10-16)
+
+The treasurer sent two real screenshots (kept locally only, in
+`docs/research/flymax-samples/`, gitignored — they show real member names and
+test payment amounts). They confirm:
+
+- **FLYMAX is DBS MAX**, header literally reads "DBS MAX". Bottom nav: My QR,
+  History, Overview, More.
+- **Overview tab → "Earning insights"** shows a bar chart (Amount/Volume
+  toggle) and weekly totals ("Total earnings this week", "Average daily
+  earnings/transactions"). Not the row-by-row list `/reconcile` needs.
+- **History tab is the one that matters.** Rows are grouped under a date
+  header (e.g. "Tue, 13 Oct 2026"), each row:
+  - PayNow icon
+  - Payer name, sometimes with an alternate name in parentheses, e.g.
+    `CLARICE LIM( LIN YINGXIN )`
+  - Amount, right-aligned (`SGD 0.02`)
+  - `TXN ID: <digits>` — a 20-digit numeric ID (e.g.
+    `26101312242399990572`, `26101118373588771833`,
+    `26091723451299650485`). The leading 4 digits look like YYMM
+    (`2610` = Oct 2026, `2609` = Sep 2026).
+  - `<collector username> collected at <h:mm am/pm>`, e.g.
+    "RAGHAVRAJESH collected at 12:24 pm"
+  - **No Billing ID is shown per row.** The PRD (§4) assumption that FLYMAX
+    shows the Billing ID per line does not hold — only payer name, amount,
+    date, time and TXN ID are visible. `clubbot/payments.py`'s
+    `BankLine` already only uses amount/time/name/transaction_id, so no code
+    change is needed; this just corrects the design doc's assumption.
+  - The search bar says "Search by name, TXN ID or amount" — TXN ID is a
+    first-class searchable field, consistent with it being FLYMAX's own
+    reference.
+- **The real Clarice Lim test payment (section "Trigger" history) shows up
+  fine in FLYMAX**, S$0.02 on 13 Oct with TXN ID `26101312242399990572`,
+  even though her own bank receipt had no visible transaction ID (the
+  missing-txn-ID case from the 2026-10-14 CLAUDE.md status entry). This is
+  exactly the case `/reconcile`'s amount + time + name-word matching exists
+  for, and it works: the payment is findable in FLYMAX by amount/time/name
+  even with no ID on her side.
+- **Still open:** whether FLYMAX's 20-digit TXN ID equals the reference a
+  payer's own bank app shows. The CLAUDE.md status entry for 2026-10-11
+  records UOB payer-receipt transaction IDs as 16 digits
+  (`2610112184655201`, `2610112184752256`) — a different length than
+  FLYMAX's 20-digit TXN IDs here. That's a signal the two may be different ID
+  systems, not a confirmation (they weren't the same transaction). The
+  cheapest real test is still: compare one specific payment's FLYMAX TXN ID
+  against that same payer's own receipt transaction ID.
 
 ---
 

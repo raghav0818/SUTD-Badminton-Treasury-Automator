@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from telethon import TelegramClient  # noqa: E402  (one-off; not in requirements.txt)
+from telethon import TelegramClient  # noqa: E402  (one-off; not in config/requirements.txt)
 from telethon.sessions import StringSession  # noqa: E402
 
 from clubbot import config, db  # noqa: E402

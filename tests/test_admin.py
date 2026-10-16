@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -349,6 +350,24 @@ def test_revoke_verified_payment_dms_member(conn):
     assert "revoked" in context.bot.send_message.call_args.kwargs["text"]
 
 
+def test_old_revoke_confirm_refuses_a_re_verified_payment(conn):
+    # Codex: a Confirm made for one receipt must not revoke a replacement.
+    db.ensure_treasurer(conn, 999)
+    seed_members(conn)
+    term = create_active_term(conn)
+    db.mark_paid_manual(conn, member_id=111, term_id=term["id"])
+    update, context = make_update(user_id=999), make_context(conn)
+    context.args = ["1007654"]
+    asyncio.run(admin.cmd_revoke(update, context))
+    pid = db.get_current_payment(conn, 111)["id"]
+    conn.execute(  # re-verified from a new receipt meanwhile
+        "UPDATE payments SET verified_at = '2099-01-01T00:00:00+00:00' WHERE id = ?", (pid,)
+    )
+    conn.commit()
+    assert "changed since" in tap_confirm(update, context)
+    assert db.get_current_payment(conn, 111)["status"] == "verified"
+
+
 def test_revoke_non_verified_payment(conn):
     db.ensure_treasurer(conn, 999)
     seed_members(conn)
@@ -460,9 +479,12 @@ def test_relink_arms_flag_with_expiry(conn):
     update, context = make_update(user_id=999), make_context(conn)
     context.args = ["1007654"]
     asyncio.run(admin.cmd_relink(update, context))
-    assert db.relink_armed(conn, "1007654")
+    code = re.search(r"start=relink_([\w-]+)", reply_text_of(update)).group(1)
+    assert db.relink_armed(conn, "1007654", code)
+    assert not db.relink_armed(conn, "1007654", None)
     assert "NEW Telegram account" in reply_text_of(update)
     assert "48 hours" in reply_text_of(update)
+    assert "PRIVATELY" in reply_text_of(update)
 
 
 def test_relink_no_args_lists_armed(conn):
@@ -477,11 +499,11 @@ def test_relink_no_args_lists_armed(conn):
 def test_relink_cancel_disarms(conn):
     db.ensure_treasurer(conn, 999)
     seed_members(conn)
-    db.arm_relink(conn, "1007654")
+    code = db.arm_relink(conn, "1007654")
     update, context = make_update(user_id=999), make_context(conn)
     context.args = ["1007654", "cancel"]
     asyncio.run(admin.cmd_relink(update, context))
-    assert not db.relink_armed(conn, "1007654")
+    assert not db.relink_armed(conn, "1007654", code)
     assert "cancelled" in reply_text_of(update)
 
 
@@ -491,7 +513,8 @@ def test_relink_flag_expires_after_ttl(conn):
         timespec="seconds"
     )
     db.set_setting(conn, "relink:1007654", stale)
-    assert not db.relink_armed(conn, "1007654")
+    db.set_setting(conn, "relinkcode:1007654", "right-code")
+    assert not db.relink_armed(conn, "1007654", "right-code")
     assert db.list_armed_relinks(conn) == []
 
 
@@ -605,6 +628,19 @@ def test_setgroup_stores_chat_id_inside_a_group(conn):
         assert db.get_setting(conn, key) == str(chat_id)
     # Rec: the old main link is revoked and a join-request link replaces it.
     assert db.get_setting(conn, "rec_join_link") == "https://t.me/+join"
+
+
+def test_setgroup_refuses_one_chat_as_both_rec_and_comp(conn):
+    db.ensure_treasurer(conn, 999)
+    db.set_setting(conn, "comp_group_id", "-1001")
+    update, context = make_update(user_id=999), make_context(conn)
+    update.effective_chat.type = "supergroup"
+    update.effective_chat.id = -1001  # the comp chat
+    context.args = ["rec"]
+    context.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="administrator"))
+    asyncio.run(admin.cmd_setgroup(update, context))
+    assert db.get_setting(conn, "rec_group_id") is None
+    assert "already the comp group" in reply_text_of(update)
 
 
 def test_setgroup_rec_needs_ban_and_invite_rights(conn):
@@ -815,14 +851,14 @@ def test_removeadmin_without_id_lists_admins_to_tap(conn):
 def test_relink_cancel_button(conn):
     db.ensure_treasurer(conn, 999)
     seed_members(conn)
-    db.arm_relink(conn, "1007654")
+    code = db.arm_relink(conn, "1007654")
     update, context = make_update(user_id=999), make_context(conn)
     asyncio.run(admin.cmd_relink(update, context))
     markup = update.message.reply_text.call_args.kwargs["reply_markup"]
     old_button = markup.inline_keyboard[0][0].callback_data
     tap = make_callback(old_button)
     asyncio.run(admin.on_relink_cancel(tap, context))
-    assert not db.relink_armed(conn, "1007654")
+    assert not db.relink_armed(conn, "1007654", code)
 
 
 def test_old_relink_cancel_button_keeps_a_newer_arming(conn):
@@ -836,7 +872,7 @@ def test_old_relink_cancel_button_keeps_a_newer_arming(conn):
     stale = fresh_button.callback_data.rsplit(":", 1)[0] + ":1"
     tap = make_callback(stale)
     asyncio.run(admin.on_relink_cancel(tap, context))
-    assert db.relink_armed(conn, "1007654")
+    assert db.list_armed_relinks(conn)  # the newer arming survives
     assert "re-armed" in tap.callback_query.edit_message_text.call_args.args[0]
 
 

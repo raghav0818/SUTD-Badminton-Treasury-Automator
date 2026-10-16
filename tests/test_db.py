@@ -597,3 +597,21 @@ def test_startup_requeues_interrupted_extraction(conn):
     assert db.list_extraction_retries(conn, 4) == []  # crashed mid-check
     assert db.requeue_interrupted_extractions(conn) == 1
     assert [p["id"] for p in db.list_extraction_retries(conn, 4)] == [payment["id"]]
+
+
+def test_a_new_receipt_forgets_the_old_receipts_amount_time_and_shirt():
+    # Codex: rejected S$25 receipt, then a S$30 shirt receipt whose reading
+    # keeps failing; the treasurer's approval must not record S$25 / no shirt.
+    conn = db.connect(":memory:")
+    term = _term(conn)
+    db.add_member(conn, telegram_user_id=1, full_name="A", sutd_id="1010001", username=None)
+    pid = db.get_or_create_payment(conn, member_id=1, term_id=term["id"])["id"]
+    db.mark_payment_pending(conn, pid, screenshot_file_id="F1", image_hash="h1")
+    db.save_verification_result(
+        conn, pid, status="rejected", amount_cents=2500, extracted_json="{}",
+        bank_txn_id=None, payment_timestamp="2026-10-01T10:00:00+08:00",
+    )
+    db.mark_payment_pending(conn, pid, screenshot_file_id="F2", image_hash="h2")
+    row = db.get_payment(conn, pid)
+    assert row["amount_cents"] is None and row["payment_timestamp"] is None
+    assert row["with_shirt"] is None

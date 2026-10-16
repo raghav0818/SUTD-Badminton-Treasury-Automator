@@ -102,8 +102,22 @@ def removal_notice(conn: sqlite3.Connection, term) -> str:
 
 
 def _rec_chat(conn: sqlite3.Connection) -> int | None:
+    """The rec chat, or None if unset or (misconfigured) the comp chat: every
+    removal path goes through here, so the comp chat can never be touched."""
     value = db.get_setting(conn, REC_KEY)
-    return int(value) if value else None
+    if not value or value == db.get_setting(conn, db.GROUP_KEYS["comp"]):
+        return None
+    return int(value)
+
+
+def _still_due(conn: sqlite3.Connection, term, person, chat_id: int, today: date) -> bool:
+    """Re-check right before a ban: a payment, /keep, a mode switch or a chat
+    change may have landed while earlier kicks were waiting on Telegram."""
+    if mode(conn) != "on" or _rec_chat(conn) != chat_id:
+        return False
+    fresh = db.get_rec_person(conn, person["telegram_user_id"])
+    current = {**dict(person), **(dict(fresh) if fresh else {})}
+    return is_overdue(conn, term, current, today)
 
 
 def _who(person) -> str:
@@ -300,6 +314,8 @@ async def sweep(bot, conn, term, chat_id: int, today: date) -> None:
     rejoin = f"ask to join again with {link}" if link else "ask to join the chat again"
     for person in warned:
         user_id = person["telegram_user_id"]
+        if not _still_due(conn, term, person, chat_id, today):
+            continue
         # Queue first. If the process dies after Telegram applies the ban but
         # before this coroutine resumes, the next due-check still unbans them.
         db.queue_pending_unban(conn, chat_id, user_id, person["name"])

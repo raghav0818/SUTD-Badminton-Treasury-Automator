@@ -132,9 +132,13 @@ def test_relink_registration_moves_history(conn):
     )
     term = create_active_term(conn)
     payment = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
-    db.arm_relink(conn, "1010654")
+    code = db.arm_relink(conn, "1010654")
 
     context = make_context(conn)
+    # The member opened the treasurer's link: /start relink_<code>.
+    start = make_update(user_id=555, text="/start", username="alice_new")
+    context.args = [f"relink_{code}"]
+    asyncio.run(bot.cmd_start(start, context))
     context.user_data.update({"full_name": "Alice Tan", "in_club_group": True})
     update = make_update(user_id=555, text="1010654", username="alice_new")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
@@ -148,7 +152,27 @@ def test_relink_registration_moves_history(conn):
     assert member["username"] == "alice_new"
     assert db.get_member(conn, 111) is None
     assert db.get_payment(conn, payment["id"])["telegram_user_id"] == 555
-    assert not db.relink_armed(conn, "1010654")
+    assert not db.relink_armed(conn, "1010654", code)  # single use
+
+
+def test_relink_needs_the_secret_link_not_just_the_sutd_id(conn):
+    # Codex: a squatter who only knows the SUTD ID must not take over the
+    # account (and with it an admin or treasurer role) during the window.
+    db.ensure_treasurer(conn, 111)
+    db.add_member(
+        conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
+    )
+    db.arm_relink(conn, "1010654")
+    for user_data in (
+        {"full_name": "Attacker", "in_club_group": True},
+        {"full_name": "Attacker", "in_club_group": True, "relink_code": "guess"},
+    ):
+        context = make_context(conn)
+        context.user_data.update(user_data)
+        update = make_update(user_id=666, text="1010654", username="attacker")
+        assert asyncio.run(bot.on_sutd_id(update, context)) == bot.ASK_SUTD_ID
+        assert "already registered" in reply_text_of(update)
+    assert db.get_role(conn, 111) == "treasurer" and db.get_member(conn, 666) is None
 
 
 def test_relinked_admin_keeps_admin_menu_on_new_account(conn):
@@ -157,9 +181,11 @@ def test_relinked_admin_keeps_admin_menu_on_new_account(conn):
         conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
     db.add_admin(conn, telegram_user_id=111, added_by=999)
-    db.arm_relink(conn, "1010654")
+    code = db.arm_relink(conn, "1010654")
     context = make_context(conn)
-    context.user_data.update({"full_name": "Alice Tan", "in_club_group": True})
+    context.user_data.update(
+        {"full_name": "Alice Tan", "in_club_group": True, "relink_code": code}
+    )
     asyncio.run(bot.on_sutd_id(make_update(user_id=555, text="1010654"), context))
     asyncio.run(bot.on_confirm(make_update(user_id=555, text="yes"), context))
     assert db.get_role(conn, 555) == "admin"
@@ -174,9 +200,11 @@ def test_relink_confirm_after_disarm_is_blocked(conn):
     db.add_member(
         conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username="alice"
     )
-    db.arm_relink(conn, "1010654")
+    code = db.arm_relink(conn, "1010654")
     context = make_context(conn)
-    context.user_data.update({"full_name": "Attacker", "in_club_group": True})
+    context.user_data.update(
+        {"full_name": "Attacker", "in_club_group": True, "relink_code": code}
+    )
     update = make_update(user_id=666, text="1010654", username="attacker")
     assert asyncio.run(bot.on_sutd_id(update, context)) == bot.CONFIRM
 
@@ -1120,9 +1148,11 @@ def test_relink_is_gated_like_registration(conn):
     db.add_member(
         conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username=None
     )
-    db.arm_relink(conn, "1010654")
+    code = db.arm_relink(conn, "1010654")
     context = make_context(conn)
-    context.user_data.update({"full_name": "Outsider", "in_club_group": False})
+    context.user_data.update(
+        {"full_name": "Outsider", "in_club_group": False, "relink_code": code}
+    )
     update = make_update(user_id=666, text="1010654")
     assert asyncio.run(bot.on_sutd_id(update, context)) == ConversationHandler.END
     assert db.get_member(conn, 111) is not None  # Alice's account untouched
@@ -1144,3 +1174,64 @@ def test_retry_gives_up_even_if_member_blocked_the_bot(conn):
         c for c in context.bot.send_message.call_args_list if c.kwargs["chat_id"] == 999
     ]
     assert len(to_treasurer) == 1
+
+
+def test_old_review_buttons_cannot_approve_a_replacement_receipt(conn):
+    # Codex: receipt A goes to review; the member replaces it with receipt B
+    # (also in review). Tapping Approve on A's old message must not verify B.
+    db.ensure_treasurer(conn, 999)
+    db.add_member(conn, telegram_user_id=111, full_name="Alice Tan", sutd_id="1010654", username=None)
+    term = create_active_term(conn)
+    pid = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])["id"]
+    context = make_context(conn)
+
+    def to_review(file_id, image_hash):
+        db.mark_payment_pending(conn, pid, screenshot_file_id=file_id, image_hash=image_hash)
+        db.save_verification_result(
+            conn, pid, status="exception", amount_cents=None, extracted_json="{}", bank_txn_id=None
+        )
+        asyncio.run(bot._notify_treasurer(context, pid, ("check",)))
+        markup = context.bot.send_message.call_args.kwargs["reply_markup"]
+        return markup.inline_keyboard[0][0].callback_data  # Approve
+
+    old_approve = to_review("FA", "a" * 64)
+    new_approve = to_review("FB", "b" * 64)
+
+    stale = make_callback(old_approve, user_id=999)
+    asyncio.run(bot.on_payment_review(stale, context))
+    assert db.get_payment(conn, pid)["status"] == "exception"
+    assert "older receipt" in stale.callback_query.edit_message_text.call_args.args[0]
+
+    fresh = make_callback(new_approve, user_id=999)
+    asyncio.run(bot.on_payment_review(fresh, context))
+    assert db.get_payment(conn, pid)["status"] == "verified"
+
+
+def test_member_dm_failure_never_blocks_the_treasurers_review(conn):
+    # Codex: a retry ends in review, the member's DM fails; the treasurer
+    # must still get Approve/Reject, and an undelivered review is re-sent.
+    from dataclasses import replace
+
+    payment = setup_receipt(conn)
+    submit_failing_receipt(conn)
+    wrong_amount = replace(valid_extraction(), amount_cents=999)
+    context = receipt_context(conn, FakeExtractor(wrong_amount))
+
+    async def send(**kwargs):
+        if kwargs["chat_id"] == 111:
+            raise RuntimeError("member DM failed")
+        return MagicMock()
+
+    context.bot.send_message = AsyncMock(side_effect=send)
+    asyncio.run(bot.retry_failed_extractions(context))
+    assert db.get_payment(conn, payment["id"])["status"] == "exception"
+    to_treasurer = [c for c in context.bot.send_message.call_args_list if c.kwargs["chat_id"] == 999]
+    assert len(to_treasurer) == 1 and to_treasurer[0].kwargs["reply_markup"] is not None
+
+    # The treasurer's review message itself failing is retried later.
+    conn.execute("UPDATE payments SET review_notified_at = NULL WHERE id = ?", (payment["id"],))
+    conn.commit()
+    asyncio.run(bot.retry_failed_extractions(context))
+    to_treasurer = [c for c in context.bot.send_message.call_args_list if c.kwargs["chat_id"] == 999]
+    assert len(to_treasurer) == 2 and "re-sent" in to_treasurer[-1].kwargs["text"]
+    assert db.get_payment(conn, payment["id"])["review_notified_at"] is not None

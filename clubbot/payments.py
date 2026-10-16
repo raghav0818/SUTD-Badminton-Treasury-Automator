@@ -218,6 +218,13 @@ class ReconcileResult:
     stray_lines: tuple[BankLine, ...]  # bank money no member's receipt claims
     unreadable_lines: int
     covered: tuple[datetime, datetime] | None
+    # already-confirmed payments now contested by another receipt: un-confirm
+    suspended: tuple[int, ...] = ()
+    # (payment id, FLYMAX txn ID) for every match: that transfer is theirs for good
+    claimed_lines: tuple[tuple[int, str], ...] = ()
+    # rows read without their TXN ID (FLYMAX always shows one, so a misread):
+    # they can't be tied to one transfer for good, so they confirm nobody
+    no_txn_lines: tuple[BankLine, ...] = ()
 
 
 def _line_time(line: BankLine) -> tuple[datetime, timedelta] | None:
@@ -269,7 +276,8 @@ class _Row:
         return (
             self.line.amount_cents == other.line.amount_cents
             and abs(self.at - other.at) <= DUPLICATE_GAP
-            and (not self.name or not other.name or self.name == other.name)
+            # "ALICE" is a truncated read of "ALICE TAN"; "" fits anything
+            and (self.name.startswith(other.name) or other.name.startswith(self.name))
         )
 
 
@@ -277,15 +285,21 @@ DUPLICATE_GAP = timedelta(minutes=1)
 
 
 def reconcile(
-    payments, lines: list[BankLine], school: SchoolConfig | None = None
+    payments,
+    lines: list[BankLine],
+    school: SchoolConfig | None = None,
+    owners: dict[str, int] | None = None,
 ) -> ReconcileResult:
     """Match receipt-verified payments to FLYMAX lines; one line backs one payment.
 
-    `payments` are db.list_reconcile_payments rows. A payment is confirmed only
-    when the evidence is unambiguous; a line that fits two payments (including
-    an already-confirmed one) confirms neither and goes to the treasurer.
+    `payments` are db.list_reconcile_payments rows. `owners` maps a FLYMAX txn
+    ID to the payment (any term, any status) it already confirmed: that
+    transfer can never back anybody else. A payment is confirmed only when the
+    evidence is unambiguous; a line that fits two payments (including an
+    already-confirmed one) confirms neither, and both go to the treasurer.
     """
     school = school or SchoolConfig()
+    owners = owners or {}
     school_ids = {
         normalise_verification_text(school.bill_number),
         normalise_verification_text(school.uen),
@@ -306,8 +320,20 @@ def reconcile(
         twin = next((r for r in rows if r.same_transfer(row)), None)
         if twin is None:
             rows.append(row)
-        elif not twin.txn:
-            twin.txn = row.txn
+            continue
+        twin.txn = twin.txn or row.txn
+        if len(row.name) > len(twin.name):  # keep the untruncated name
+            twin.line, twin.name = row.line, row.name
+
+    # Collapsing copies first lets a re-read without its ID borrow it. A row
+    # still without one is only used for the covered period: confirming from
+    # it would leave no permanent claim, so its transfer could be reused.
+    timed_rows = rows
+    blind = [r.line for r in rows if not r.txn]
+    rows = [r for r in rows if r.txn]
+
+    by_id = {p["id"]: p for p in payments}
+    ids = {p["id"]: _payment_ids(p, school_ids) for p in payments}
 
     def paid_at(payment) -> datetime | None:
         try:
@@ -316,22 +342,10 @@ def reconcile(
             return None
         return when if when.tzinfo else None
 
-    used: set[int] = set()
-    matched: set[int] = set()  # payment ids backed by a line this run
-
-    # Pass 1: the line's transaction ID is on exactly one member's receipt.
-    ids = {p["id"]: _payment_ids(p, school_ids) for p in payments}
-    for i, row in enumerate(rows):
-        owners = [p for p in payments if row.txn and row.txn in ids[p["id"]]]
-        if len(owners) == 1 and owners[0]["amount_cents"] == row.line.amount_cents:
-            used.add(i)
-            matched.add(owners[0]["id"])
-
     def fits(payment, i: int, *, same_name: bool) -> bool:
         row, when = rows[i], paid_at(payment)
         return (
-            i not in used
-            and when is not None
+            when is not None
             and row.line.amount_cents == payment["amount_cents"]
             and abs(when - row.at) <= row.window
             and (
@@ -340,50 +354,112 @@ def reconcile(
             )
         )
 
+    def id_claims(payment, i: int) -> bool:
+        # The ID must agree on time too: an old transfer's ID pasted into a new
+        # receipt is not that transfer. No timestamp (rare, treasurer-approved):
+        # the ID alone, as before.
+        row, when = rows[i], paid_at(payment)
+        return (
+            bool(row.txn)
+            and row.txn in ids[payment["id"]]
+            and row.line.amount_cents == payment["amount_cents"]
+            and (when is None or abs(when - row.at) <= row.window)
+        )
+
+    used: set[int] = set()
+    matched: dict[int, int] = {}  # payment id -> row index backing it this run
+    # A receipt whose IDs match 2+ transfers (owned or not) can't be trusted.
+    contested: set[int] = {
+        pid for pid, p in by_id.items()
+        if sum(id_claims(p, i) for i in range(len(rows))) > 1
+    }
+
+    # Pass 0: a transfer that already confirmed somebody stays theirs. It
+    # re-backs its owner only if the owner's current receipt still fits it;
+    # any other receipt that fits it contests it (and the owner with it). As in
+    # passes 1-2, an ID claim outranks name + time.
+    for i, row in enumerate(rows):
+        if row.txn not in owners:
+            continue
+        used.add(i)
+        owner = owners[row.txn]
+        claimants = [pid for pid, p in by_id.items() if id_claims(p, i)] or [
+            pid for pid, p in by_id.items() if fits(p, i, same_name=True)
+        ]
+        if claimants == [owner] and owner not in contested:
+            matched[owner] = i
+        elif claimants:
+            contested.update(claimants)
+            if owner in by_id:
+                contested.add(owner)
+
+    # Pass 1: the line's txn ID is on exactly one receipt, and that receipt's
+    # IDs match exactly one line (one receipt can't consume two transfers).
+    claims = {
+        pid: [i for i in range(len(rows)) if i not in used and id_claims(p, i)]
+        for pid, p in by_id.items()
+        if pid not in matched and pid not in contested
+    }
+    contested.update(pid for pid, claimed in claims.items() if len(claimed) > 1)
+    for i in range(len(rows)):
+        claimants = [pid for pid, claimed in claims.items() if i in claimed]
+        if len(claimants) == 1 and claimants[0] not in contested:
+            used.add(i)
+            matched[claimants[0]] = i
+
     # Pass 2: same amount, close in time, a shared name word, and nobody else
     # (not even an already-confirmed payment) fits that line.
-    rest = [p for p in payments if p["id"] not in matched]
+    rest = [p for p in payments if p["id"] not in matched and p["id"] not in contested]
     candidates = {
-        i: [p for p in rest if fits(p, i, same_name=True)] for i in range(len(rows))
+        i: [p["id"] for p in rest if fits(p, i, same_name=True)]
+        for i in range(len(rows))
+        if i not in used
     }
     for payment in sorted(rest, key=lambda p: p["audit_confirmed_at"] is None):
-        for i in range(len(rows)):
-            if i not in used and [p["id"] for p in candidates[i]] == [payment["id"]]:
+        for i, fitting in candidates.items():
+            if i not in used and fitting == [payment["id"]]:
                 used.add(i)
-                matched.add(payment["id"])
+                matched[payment["id"]] = i
                 break
+    contested.update(
+        pid for i, fitting in candidates.items() if i not in used for pid in fitting
+    )
 
     covered = None
-    if rows:
-        start = min(rows, key=lambda r: r.at)
-        end = max(rows, key=lambda r: r.at)
+    if timed_rows:
+        start = min(timed_rows, key=lambda r: r.at)
+        end = max(timed_rows, key=lambda r: r.at)
         covered = (start.at + start.window, end.at - end.window)
 
     def in_covered(payment) -> bool:
         when = paid_at(payment)
         return bool(covered and when and covered[0] < when < covered[1])
 
-    name_differs, ambiguous, missing, waiting = [], [], [], 0
-    for payment in rest:
-        if payment["id"] in matched or payment["audit_confirmed_at"]:
+    name_differs, ambiguous, suspended, missing, waiting = [], [], [], [], 0
+    for payment in payments:
+        pid = payment["id"]
+        if pid in matched:
             continue
-        if any(
-            payment["id"] in [p["id"] for p in candidates[i]]
-            for i in range(len(rows))
-            if i not in used
-        ):
-            ambiguous.append(payment["id"])
+        if pid in contested:
+            ambiguous.append(pid)
+            if payment["audit_confirmed_at"]:
+                suspended.append(pid)  # it may be the fake that got in first
+            continue
+        if payment["audit_confirmed_at"]:
             continue
         # Pass 3 (report only): amount and time fit but the name doesn't, e.g.
         # a parent paid. Never confirms anything, so the line isn't consumed.
-        near = [i for i in range(len(rows)) if fits(payment, i, same_name=False)]
+        near = [
+            i for i in range(len(rows))
+            if i not in used and fits(payment, i, same_name=False)
+        ]
         if near:
             when = paid_at(payment)
             name_differs.append(
-                (payment["id"], rows[min(near, key=lambda i: abs(when - rows[i].at))].line)
+                (pid, rows[min(near, key=lambda i: abs(when - rows[i].at))].line)
             )
         elif in_covered(payment):
-            missing.append(payment["id"])
+            missing.append(pid)
         else:
             waiting += 1
 
@@ -399,4 +475,7 @@ def reconcile(
         stray_lines=tuple(r.line for i, r in enumerate(rows) if i not in used),
         unreadable_lines=unreadable,
         covered=covered,
+        suspended=tuple(suspended),
+        claimed_lines=tuple((pid, rows[i].txn) for pid, i in matched.items()),
+        no_txn_lines=tuple(blind),
     )

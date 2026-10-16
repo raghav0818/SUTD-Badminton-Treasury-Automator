@@ -165,7 +165,30 @@ def test_due_same_day_blast_replaces_reminder(conn):
     assert _sent_to(fake_bot) == [111]
     assert "collection is open" in fake_bot.send_message.await_args.kwargs["text"]
     assert db.get_term(conn, term["id"])["start_notified_at"] is not None
-    assert db.claim_term_event(conn, term["id"], "remind-d3") is False
+    assert db.claim_term_event(conn, term["id"], "remind-d3:111") is False  # done today
+
+
+def test_same_day_blast_only_skips_the_reminder_for_people_it_reached(conn):
+    # Codex: a QR holder is skipped by the blast, and someone else's blast
+    # delivery fails. The QR holder must still get the day-3 reminder, and
+    # nobody gets a reminder while the blast is still being retried.
+    _member(conn, 111, "1000001", "Alice")  # already has a QR: blast skips her
+    _member(conn, 222, "1000002", "Bob")
+    term = _fixed_term(conn, blasted=False)
+    alice = db.get_or_create_payment(conn, member_id=111, term_id=term["id"])
+    db.mark_qr_issued(conn, alice["id"])
+
+    fake_bot = make_bot()
+    fake_bot.send_message.side_effect = Exception("network")  # Bob's blast fails
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-04", 10, 1)))
+    assert db.get_term(conn, term["id"])["start_notified_at"] is None
+    assert _sent_to(fake_bot) == [222]  # only the blast attempt; no reminders yet
+
+    fake_bot = make_bot()
+    asyncio.run(scheduler.run_due_events(fake_bot, conn, _sgt("2026-09-04", 11, 1)))
+    texts = {c.kwargs["chat_id"]: c.kwargs["text"] for c in fake_bot.send_message.await_args_list}
+    assert "collection is open" in texts[222] and "Reminder" in texts[111]
+    assert fake_bot.send_message.await_count == 2  # Bob gets the blast only
 
 
 def test_group_posts_counts_only_no_names_once(conn):

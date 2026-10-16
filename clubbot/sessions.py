@@ -263,7 +263,8 @@ def _role_dm(session, role: str, primary_name: str = "") -> str:
         )
     return (
         f"🧺 You're the backup for the nets and shuttles for {where}.\n"
-        f"Only needed if {primary_name} can't make it; I'll message you if that happens."
+        f"Only needed if {primary_name} can't make it; I'll message you if that happens.\n"
+        "Can't make it yourself? Tap below and I'll find another backup."
     )
 
 
@@ -289,7 +290,12 @@ async def _dm_roles(bot, session, names, *, primary_changed=True, secondary_chan
     if primary and primary_changed:
         await _dm(bot, primary, _role_dm(session, "primary"), _cant_make_it(session["id"]))
     if secondary and secondary_changed:
-        await _dm(bot, secondary, _role_dm(session, "secondary", names.get(primary, "")))
+        await _dm(
+            bot,
+            secondary,
+            _role_dm(session, "secondary", names.get(primary, "")),
+            _cant_make_it(session["id"]),
+        )
 
 
 async def _group_post(bot, session, text: str) -> bool:
@@ -309,19 +315,68 @@ async def _group_post(bot, session, text: str) -> bool:
     return True
 
 
+def _duty_header(session, heading: str) -> str:
+    return f"🧺 <b>{heading}</b>\n📅 {html.escape(when_text(session))}\n\n"
+
+
+def _backup_line(secondary, names, label: str = "Backup") -> str:
+    who = mention_html(secondary, names[secondary]) if secondary else "nobody yet"
+    return f"🔁 <b>{label}:</b> {who}"
+
+
+async def _cancel_nobody_left(bot, conn, sid: int) -> None:
+    """The job was passed down past the last player: with nobody to collect
+    the nets and shuttles the session can't run, so it's cancelled. The DB
+    cancel happens first, so no tap or hourly job can revive the pick."""
+    db.cancel_session(conn, sid)
+    await _publish_cancel(bot, conn, sid)
+
+
+async def _publish_cancel(bot, conn, sid: int) -> None:
+    """Show a cancellation on the card and in the group (and, for an
+    auto-cancel, DM the host). Stamped only once the group post lands, so the
+    hourly job finishes it after a crash or a Telegram error."""
+    session = db.get_session(conn, sid)
+    await _refresh_now(bot, conn, sid)
+    when = html.escape(when_text(session))
+    auto = session["picked_at"] is not None and session["primary_id"] is None
+    text = (
+        f"❌ <b>Session cancelled</b>\n📅 {when}\n\n"
+        "Everyone has dropped out, so nobody is left to collect the nets and "
+        "shuttles. This session is cancelled."
+        if auto
+        else f"❌ The {when} session is cancelled."
+    )
+    if not await _group_post(bot, session, text):
+        return
+    db.mark_session_cancel_posted(conn, sid)
+    if auto:
+        await _dm(
+            bot,
+            session["host_id"],
+            f"I cancelled {session['title']} on {when_text(session)}: everyone "
+            "dropped out, so nobody was left to collect the nets and shuttles.",
+        )
+
+
+LEAVE_HINT = (
+    "\n\nCan't come? Tap ❌ Leave on the session post above and the job "
+    "passes to the next person automatically. If everyone drops out, the "
+    "session is cancelled."
+)
+
+
 def _pick_text(session, names) -> str:
     primary, secondary = session["primary_id"], session["secondary_id"]
-    when = html.escape(when_text(session))
-    text = (
-        f"🧺 {when}: {mention_html(primary, names[primary])} please collect the "
-        "nets and shuttles from the store room."
+    return (
+        _duty_header(session, "Nets &amp; shuttles duty")
+        + f"👤 <b>Collecting:</b> {mention_html(primary, names[primary])}\n"
+        + "Please bring the nets and shuttles from the store room before the "
+        + "session starts.\n"
+        + _backup_line(secondary, names)
+        + (f" (only if {html.escape(names[primary])} can't come)" if secondary else "")
+        + LEAVE_HINT
     )
-    if secondary:
-        text += (
-            f"\nBackup: {mention_html(secondary, names[secondary])} "
-            f"(only if {html.escape(names[primary])} can't make it)."
-        )
-    return text + "\nCan't make it? Tap ❌ Leave on the session post."
 
 
 def pick_time(session) -> datetime:
@@ -336,6 +391,14 @@ async def run_due_picks(bot, conn: sqlite3.Connection, now: datetime) -> None:
     The pick is saved before it's announced, so a restart can't re-roll it;
     announced_at is stamped only once the group post is delivered.
     """
+    # Finish cancellations whose group post never landed (crash, Telegram
+    # error), and cancel any picked session left with nobody in charge.
+    for row in db.sessions_needing_cancel_post(conn):
+        if now < _start(row):
+            await _publish_cancel(bot, conn, row["id"])
+    for row in db.sessions_picked_without_primary(conn):
+        if now < _start(row):
+            await _cancel_nobody_left(bot, conn, row["id"])
     for row in db.sessions_awaiting_pick_announcement(conn):
         session = db.get_session(conn, row["id"])  # fresh: earlier awaits may have changed it
         start = _start(session)
@@ -360,21 +423,21 @@ async def run_due_picks(bot, conn: sqlite3.Connection, now: datetime) -> None:
             if not await _refresh_now(bot, conn, session["id"]):
                 continue
         if session["primary_id"] is None:
-            # A previously announced pick can become empty after everyone
-            # leaves. If that handoff post failed, announced_at was cleared;
-            # retry the authoritative empty state here.
-            if session["picked_at"] is not None:
-                text = (
-                    f"🧺 {html.escape(when_text(session))}: nobody is left to "
-                    "collect the nets and shuttles."
-                )
-                if await _group_post(bot, session, text):
-                    db.mark_session_announced(conn, session["id"])
-            continue
-        names = _names(conn, session)
-        if await _group_post(bot, session, _pick_text(session, names)):
-            db.mark_session_announced(conn, session["id"])
-            await _dm_roles(bot, session, names)
+            continue  # picked, then everyone left: cancelled above / by on_leave
+        for _ in range(3):
+            # A Leave/Join while the post is in flight can change the duties;
+            # stamp only if what was posted is still true, else post again.
+            names = _names(conn, session)
+            posted = (session["primary_id"], session["secondary_id"])
+            if not await _group_post(bot, session, _pick_text(session, names)):
+                break
+            session = db.get_session(conn, session["id"])
+            if session["cancelled_at"] or session["primary_id"] is None:
+                break  # everyone left meanwhile; the cancel tells the group
+            if (session["primary_id"], session["secondary_id"]) == posted:
+                db.mark_session_announced(conn, session["id"])
+                await _dm_roles(bot, session, names)
+                break
 
 
 # --- The card in the group ------------------------------------------------------
@@ -597,12 +660,10 @@ async def on_cancel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("Already cancelled.")
         return
     db.cancel_session(conn, sid)
-    session = db.get_session(conn, sid)
-    await _refresh_now(context.bot, conn, sid)
-    await _group_post(
-        context.bot, session, f"❌ The {html.escape(when_text(session))} session is cancelled."
+    await _publish_cancel(context.bot, conn, sid)
+    await query.edit_message_text(
+        f"Cancelled the {when_text(db.get_session(conn, sid))} session."
     )
-    await query.edit_message_text(f"Cancelled the {when_text(session)} session.")
 
 
 def _closed_reason(session) -> str | None:
@@ -623,6 +684,14 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer(reason, show_alert=True)
         return
     added = db.add_signup(conn, sid, user.id, user.full_name[:NAME_CHARS])
+    # After the pick, a new player fills an empty role (e.g. everyone with a
+    # role left). Saved before any await, like on_leave's handover.
+    old_roles = (session["primary_id"], session["secondary_id"])
+    new_roles = old_roles
+    if added and session["picked_at"] is not None and None in old_roles:
+        new_roles = _fill_roles(conn, session, [p for p in old_roles if p])
+        if new_roles != old_roles:
+            db.set_session_pick(conn, sid, *new_roles)
     ids = [s["user_id"] for s in db.list_signups(conn, sid)]
     place, cap = ids.index(user.id) + 1, session["capacity"]
     if place <= cap:
@@ -633,6 +702,25 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer(text)
     if added:
         await request_card_refresh(context, sid)
+    if new_roles != old_roles:
+        await _announce_filled(context.bot, conn, sid, old_roles)
+
+
+async def _announce_filled(bot, conn, sid, old_roles) -> None:
+    session = db.get_session(conn, sid)
+    if session["announced_at"] is None:
+        return  # the pending noon announcement will name them
+    names = _names(conn, session)
+    if not await _group_post(bot, session, _pick_text(session, names)):
+        db.mark_session_unannounced(conn, sid)  # the hourly job re-posts it
+        return
+    await _dm_roles(
+        bot,
+        session,
+        names,
+        primary_changed=session["primary_id"] != old_roles[0],
+        secondary_changed=session["secondary_id"] != old_roles[1],
+    )
 
 
 async def on_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -652,9 +740,14 @@ async def on_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Hand over the role before any await, so the noon pick job can't interleave.
     roles = (session["primary_id"], session["secondary_id"])
     had_role = session["picked_at"] is not None and user.id in roles
+    nobody_left = False
     if had_role:
         keep = [p for p in roles if p and p != user.id]
-        db.set_session_pick(conn, sid, *_fill_roles(conn, session, keep))
+        new_roles = _fill_roles(conn, session, keep)
+        db.set_session_pick(conn, sid, *new_roles)
+        nobody_left = new_roles[0] is None
+        if nobody_left:
+            db.cancel_session(conn, sid)  # before any await, like the handover
     await query.answer("You've left this session.")
     if query.message is not None and query.message.chat.type == "private":
         await query.edit_message_reply_markup(reply_markup=None)
@@ -665,6 +758,9 @@ async def on_leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🏸 A spot opened up: you're in for {session['title']}, "
             f"{when_text(session)} at {session['venue']}.",
         )
+    if nobody_left:
+        await _cancel_nobody_left(context.bot, conn, sid)
+        return
     await request_card_refresh(context, sid)
     if had_role:
         await _announce_handoff(context.bot, conn, sid, user.id, names, roles)
@@ -676,17 +772,16 @@ async def _announce_handoff(bot, conn, sid, leaver, old_names, old_roles) -> Non
         return  # the pending noon announcement will name the new pair
     names = _names(conn, session) | {leaver: old_names.get(leaver, "Someone")}
     primary, secondary = session["primary_id"], session["secondary_id"]
-    when = html.escape(when_text(session))
-    if primary is None:
-        text = f"🧺 {when}: nobody is left to collect the nets and shuttles."
-    else:
-        text = (
-            f"🧺 Change for {when}: {html.escape(names[leaver])} can't make it. "
-            f"{mention_html(primary, names[primary])} is now collecting the nets and "
-            "shuttles from the store room."
+    text = (
+        _duty_header(session, "Nets &amp; shuttles: change")
+        + f"{html.escape(names[leaver])} can't make it.\n"
+        + f"👤 <b>{'Now collecting' if primary != old_roles[0] else 'Still collecting'}:</b> "
+        + f"{mention_html(primary, names[primary])}\n"
+        + _backup_line(
+            secondary, names, "New backup" if secondary != old_roles[1] else "Backup"
         )
-        if secondary:
-            text += f"\nBackup: {mention_html(secondary, names[secondary])}."
+        + LEAVE_HINT
+    )
     if not await _group_post(bot, session, text):
         # The stored roles are authoritative; make the hourly job publish them.
         db.mark_session_unannounced(conn, sid)

@@ -164,4 +164,5 @@ def test_tab_created_while_empty_still_accepts_growth(conn):
     seed(conn)
     mirror.push(*mirror.snapshot(conn))  # must not raise
 
-    assert len(spreadsheet.worksheets["Payments"].data) == 2
+    # header + 1 payment row + blank separator + TOTAL verified row
+    assert len(spreadsheet.worksheets["Payments"].data) == 4

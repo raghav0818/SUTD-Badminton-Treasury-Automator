@@ -137,6 +137,7 @@ async def send_unpaid_reminders(
     *,
     last_call: bool = False,
     event: str | None = None,
+    already_told: set[int] = frozenset(),
 ) -> int:
     """DM every unpaid, not-opted-out member a nudge; return the successful-send count.
 
@@ -161,6 +162,10 @@ async def send_unpaid_reminders(
     for member in db.list_unpaid_members(conn, term_id):
         stamp = f"{event}:{member['telegram_user_id']}" if event else None
         if stamp and db.term_event_claimed(conn, term_id, stamp):
+            continue
+        if member["telegram_user_id"] in already_told:
+            if stamp:
+                db.claim_term_event(conn, term_id, stamp)  # done for today
             continue
         if await _deliver(bot, member["telegram_user_id"], text, term_id):
             sent += 1
@@ -253,18 +258,23 @@ async def run_due_events(bot, conn: sqlite3.Connection, now: datetime) -> None:
             continue
         if today.isoformat() >= term["start_date"] and group_posts_on:
             await post_payment_open(bot, conn, term)
-        blasted = False
-        if term["start_notified_at"] is None:
+        blasting = term["start_notified_at"] is None
+        if blasting:
             await do_term_start_blast(bot, conn, term["id"])
-            blasted = True
+            term = db.get_term(conn, term["id"])
         event = reminder_event(term, today)
-        if event and blasted:
-            # A same-day blast already invited everyone: retire today's
-            # reminder so nobody gets two messages in one day.
-            db.claim_term_event(conn, term["id"], event)
+        if event and term["start_notified_at"] is None:
+            pass  # blast still retrying someone: remind after it's done (no doubles)
         elif event and not db.term_event_claimed(conn, term["id"], event):
             await send_unpaid_reminders(
-                bot, conn, term["id"], last_call=event == "lastcall", event=event
+                bot,
+                conn,
+                term["id"],
+                last_call=event == "lastcall",
+                event=event,
+                # Only people the blast actually reached skip today's reminder
+                # (e.g. a QR holder the blast skipped still gets it).
+                already_told=db.members_notified(conn, term["id"]) if blasting else set(),
             )
         event = group_post_event(term, today)
         if event and group_posts_on and now.hour >= GROUP_POST_HOUR:

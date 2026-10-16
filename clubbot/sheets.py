@@ -21,12 +21,12 @@ PAYMENT_HEADERS = [
     "Amount",
     "Paid at",
     "Verified by",
-    "Bank",
+    "Bank status",
     "Category",
     "Shirt",
     "Size",
 ]
-SHIRT_HEADERS = ["Name", "Size", "Bank"]
+SHIRT_HEADERS = ["Name", "Size", "Bank status"]
 
 
 def _yes_no(value: int | None) -> str:
@@ -73,6 +73,14 @@ class SheetMirror:
             ]
             for p in db.list_payments(conn)
         ]
+        if payments:
+            verified_total = sum(
+                p["amount_cents"] for p in db.list_payments(conn) if p["status"] == "verified"
+            )
+            payments.append([""] * len(PAYMENT_HEADERS))
+            payments.append(
+                ["TOTAL verified", "", "", "", money(verified_total)] + [""] * 6
+            )
         # Latest term's shirt orders (kept after it ends), then per-size counts.
         term = db.get_latest_started_term(conn)
         orders = db.list_shirt_orders(conn, term["id"]) if term else []

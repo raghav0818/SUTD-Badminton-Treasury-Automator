@@ -348,6 +348,14 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Usage: /setgroup rec or /setgroup comp")
         return
     chat_id = update.effective_chat.id
+    other = "comp" if kind == "rec" else "rec"
+    if db.get_setting(conn, db.GROUP_KEYS[other]) == str(chat_id):
+        # One chat as both would point rec-chat removals at competitive players.
+        await update.message.reply_text(
+            f"This chat is already the {other} group. The rec and comp groups "
+            f"must be different chats; send /setgroup {other} in the right chat first."
+        )
+        return
     try:
         me = await context.bot.get_chat_member(chat_id, context.bot.id)
         is_admin = me.status in ("administrator", "creator")
@@ -522,12 +530,18 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if action == "treasurer":
         result = await _do_transfer(context, update.effective_user.id, int(ids[0]))
     else:
-        term_id, member_id = map(int, ids)
+        term_id, member_id, *version = map(int, ids)
         term = db.get_active_term(conn)
+        payment = db.get_payment_for_member_term(conn, member_id=member_id, term_id=term_id)
         if term is None or term["id"] != term_id:
             result = "That term is no longer the active one. Nothing changed."
         elif action == "markpaid":
             result = await _do_markpaid(context, member_id, term_id)
+        elif payment is None or [db.payment_version(payment)] != version:
+            result = (
+                "That payment changed since this button was made (the member sent "
+                "a new receipt). Nothing changed. Send /revoke again if needed."
+            )
         else:
             result = await _do_revoke(context, member_id, term_id)
     await query.edit_message_text(result)
@@ -564,9 +578,14 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"Could not revoke: {who} has no verified payment this term."
         )
         return
+    payment = db.get_payment_for_member_term(
+        conn, member_id=member["telegram_user_id"], term_id=term["id"]
+    )
     await update.message.reply_text(
         f"Revoke {who}'s membership for {term['name']}? They will be told by DM.",
-        reply_markup=_confirm_keyboard(f"revoke:{term['id']}:{member['telegram_user_id']}"),
+        reply_markup=_confirm_keyboard(
+            f"revoke:{term['id']}:{member['telegram_user_id']}:{db.payment_version(payment)}"
+        ),
     )
 
 
@@ -704,13 +723,15 @@ async def cmd_relink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"Relink cancelled for {member['full_name']} (SUTD ID {member['sutd_id']})."
         )
         return
-    db.arm_relink(conn, member["sutd_id"])
+    code = db.arm_relink(conn, member["sutd_id"])
     await update.message.reply_text(
-        f"Relink armed for {member['full_name']} (SUTD ID {member['sutd_id']}).\n"
-        "Ask them to send /start from their NEW Telegram account and register "
-        "with the same SUTD ID within 48 hours. Their payment history will "
-        "move over. Cancel with /relink "
-        f"{member['sutd_id']} cancel."
+        f"Relink armed for {member['full_name']} (SUTD ID {member['sutd_id']}).\n\n"
+        "Send this link PRIVATELY to them only. They open it from their NEW "
+        "Telegram account within 48 hours and register with the same SUTD ID; "
+        "their payment history (and any admin role) moves over:\n"
+        f"https://t.me/{context.bot.username}?start=relink_{code}\n\n"
+        "Anyone with the link can take over the account, so don't post it in a "
+        f"group. Cancel with /relink {member['sutd_id']} cancel."
     )
 
 

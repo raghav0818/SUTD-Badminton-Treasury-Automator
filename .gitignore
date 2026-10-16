@@ -14,12 +14,8 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# Generated artifacts (re-run scripts/make_phase0_qrs.py)
-phase0_qrs/
-
-# Local payment screenshots may contain personal and transaction data
-image copy.png
-screenshot from personal.png
-
 # Local tooling
 .claude/settings.local.json
+
+# Real member/payment data in sample screenshots — never commit
+docs/research/flymax-samples/

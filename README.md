@@ -10,6 +10,90 @@ Raspberry Pi 4.
 
 ---
 
+## Project layout
+
+Root only has folders, plus the three files you actually need to touch
+(`.env`, `README.md`, `CLAUDE.md`). Everything else lives in a folder named
+for what it's for:
+
+```
+SUTD-Badminton-Treasury-Automator/
+├── clubbot/      BOT LOGIC — see "What's in clubbot/" below
+├── tests/        one test_X.py per clubbot/X.py — run: python -m pytest tests/
+├── scripts/      one-off tools — preflight.py (checks secrets work),
+│                 import_rec_members.py (one-time rec-chat import)
+├── deploy/       DEPLOYING — setup_pi.sh, update.sh, the systemd service file
+├── config/       dependencies + secret templates — requirements.txt,
+│                 requirements-dev.txt, .env.example, service-account.json
+├── docs/         DOCUMENTATION
+│   ├── superpowers/specs/   WHAT we decided to build — see "Docs index" below
+│   └── research/             WHY — the investigation behind each decision
+│
+├── .env          your real secrets (gitignored — never commit this)
+├── README.md     this file — commands, setup, day-to-day running
+└── CLAUDE.md     living project memory: status, history, hard-won facts,
+                  launch checklist — the full backstory
+```
+
+Two small dotfiles also sit at root and can't move: `.gitignore` and
+`.gitattributes` only work from the top of the repo — git won't apply them
+from inside a subfolder, so moving them would stop your secrets being
+ignored and break line-endings on the Pi's shell scripts. They're invisible
+in a normal folder view, same as `.env`.
+
+### What's in `clubbot/`
+
+Everything the bot does, one file per job:
+
+| File | What it handles |
+|---|---|
+| `bot.py` | Talks to Telegram: registration, `/pay`, reading a submitted receipt |
+| `payments.py` | Builds the PayNow QR and decides pass/fail on a receipt (the money logic) |
+| `paynow.py` | Low-level PayNow QR format (the standard Singapore banks use) |
+| `qrgen.py` | Turns a QR payload into an actual image |
+| `gemini.py` | Asks Google Gemini to read the numbers/text off a receipt photo |
+| `db.py` | The database: every table, every query, members/payments/terms |
+| `admin.py` | Your commands and the vice captain's/admins' commands |
+| `newterm.py` | The `/newterm` wizard that opens a new collection period |
+| `scheduler.py` | Everything that runs on a timer: reminders, deadline nudges, backups |
+| `removal.py` | Removing unpaid members from the rec chat after the deadline |
+| `reconcile.py` | `/reconcile` — matches receipts against your FLYMAX screenshots |
+| `sessions.py` | `/session` — recreational session sign-ups and court/shuttle host picks |
+| `sheets.py` | Mirrors members/payments/shirts into a read-only Google Sheet |
+| `config.py` | Loads `.env` on startup |
+
+### Docs index
+
+Fourteen planning docs have piled up — here's what each one actually is, oldest first. **Specs** are what got built; **research** is the investigation behind a spec.
+
+**Specs — `docs/superpowers/specs/`** (what was decided and built)
+
+| Date | File | What it covers |
+|---|---|---|
+| 2026-06-11 | `2026-06-11-club-payment-bot-design.md` | The original PRD — the whole bot, v1 |
+| 2026-06-20 | `2026-06-20-phase3-lifecycle-and-auditing-design.md` | Terms, reminders, the old audit digest |
+| 2026-10-04 | `2026-10-04-v2-build-list.md` | v2: comp/rec prices, shirts, roster, reminders, group posts |
+| 2026-10-07 | `2026-10-07-easier-commands-plan.md` | Button-based admin commands instead of typing args |
+| 2026-10-10 | `2026-10-10-session-signups-plan.md` | `/session` sign-ups (replaced the Mitup app) |
+| 2026-10-10 | `removing-member-plan.md` | Auto-removing unpaid members from the rec chat |
+| 2026-10-11 | `2026-10-11-bank-reconciliation-plan.md` | `/reconcile` — catching fake receipts against FLYMAX |
+
+**Research — `docs/research/`** (why those decisions were made)
+
+| Date | File | What it covers |
+|---|---|---|
+| 2026-10-03 | `2026-10-03-payment-verification-alternatives.md` | Why Gemini (paid VLM) over local OCR |
+| 2026-10-07 | `2026-10-07-easier-admin-commands.md` | Tappable buttons vs. typed commands |
+| 2026-10-10 | `2026-10-10-removing-unpaid-members.md` | How a bot can remove people from a group chat at all |
+| 2026-10-10 | `2026-10-10-session-announcements-rsvp.md` | Replacing Mitup, fair host rotation |
+| 2026-10-11 | `2026-10-11-bot-dm-onboarding.md` | Getting a stranger into a DM with the bot |
+| 2026-10-11 | `2026-10-11-fake-receipt-defences.md` | Why a screenshot alone can never prove money moved |
+| 2026-10-11 | `2026-10-11-membership-pricing-strategy.md` | Membership pricing options (not yet acted on) |
+
+For what's actually live vs. still just planned, `CLAUDE.md`'s **Status** section is the up-to-date answer — these docs are historical record, not a to-do list.
+
+---
+
 ## Telegram commands
 
 Tap `/` (or the Menu button) in the chat with the bot to see only the
@@ -61,13 +145,13 @@ that is the whole exception workflow.
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements-dev.txt
-copy .env.example .env        # then fill in .env (see below)
+.venv\Scripts\python -m pip install -r config\requirements-dev.txt
+copy config\.env.example .env        # then fill in .env (see below)
 .venv\Scripts\python scripts\preflight.py   # all lines must say PASS
 .venv\Scripts\python -m clubbot             # Ctrl+C to stop
 ```
 
-Run the tests: `.venv\Scripts\python -m pytest`
+Run the tests: `.venv\Scripts\python -m pytest tests/`
 
 ### .env values
 
@@ -78,7 +162,7 @@ Run the tests: `.venv\Scripts\python -m pytest`
 | `DB_PATH` | leave as `clubbot.db` |
 | `GEMINI_API_KEY` | https://aistudio.google.com/apikey |
 | `GEMINI_MODEL` | leave as `gemini-3.1-flash-lite` |
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | path to the service-account JSON key (optional, for the Sheet) |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | path to the service-account JSON key, e.g. `config/service-account.json` (optional, for the Sheet) |
 | `SHEET_ID` | long ID in the Google Sheet's URL (optional) |
 
 Google Sheet mirror (optional): create a Sheet, put its ID in `SHEET_ID`,
@@ -102,9 +186,16 @@ bash ~/clubbot/deploy/update.sh
 ```
 
 It downloads the latest code from GitHub, installs anything new, and restarts
-the bot. Your `.env`, `service-account.json` and `clubbot.db` are not in git,
-so updates never touch them. The script ends by printing the service status —
-look for `active (running)`.
+the bot. Your `.env`, `config/service-account.json` and `clubbot.db` are not
+in git, so updates never touch them. The script ends by printing the service
+status — look for `active (running)`.
+
+> **One-time, only if the Pi still has `service-account.json` at the old top
+> level** (from before this repo moved it into `config/`): run
+> `mv ~/clubbot/service-account.json ~/clubbot/config/service-account.json`
+> and make sure `~/clubbot/.env`'s `GOOGLE_SERVICE_ACCOUNT_FILE` line says
+> `config/service-account.json`, then restart the bot. Skip this if the Sheet
+> mirror isn't configured, or if you've already done it once.
 
 ### First-time setup (or switching an old scp-copied `~/clubbot` to git)
 
@@ -116,16 +207,23 @@ sudo systemctl stop clubbot                 # "not loaded" on a brand-new Pi is 
 sudo apt install -y git
 mv ~/clubbot ~/clubbot-old                  # skip on a brand-new Pi
 git clone https://github.com/raghav0818/SUTD-Badminton-Treasury-Automator.git ~/clubbot
-sudo cp ~/clubbot-old/.env ~/clubbot-old/service-account.json ~/clubbot/
+sudo cp ~/clubbot-old/.env ~/clubbot/
+mkdir -p ~/clubbot/config
+# The key may be in the old copy's config/ or (older layout) its top level.
+sudo cp ~/clubbot-old/config/service-account.json ~/clubbot/config/ 2>/dev/null \
+  || sudo cp ~/clubbot-old/service-account.json ~/clubbot/config/ 2>/dev/null || true
 sudo cp ~/clubbot-old/clubbot.db ~/clubbot/   # "No such file" is fine: no data yet
 sudo chown -R "$USER:$USER" ~/clubbot
+# Point an old .env at the key's new place (no change if it already does).
+sed -i 's#^GOOGLE_SERVICE_ACCOUNT_FILE=service-account.json$#GOOGLE_SERVICE_ACCOUNT_FILE=config/service-account.json#' ~/clubbot/.env
 bash ~/clubbot/deploy/setup_pi.sh
 ~/clubbot/.venv/bin/python ~/clubbot/scripts/preflight.py   # all lines PASS
 ```
 
-On a brand-new Pi there is no `~/clubbot-old`: instead of the two `sudo cp`
+On a brand-new Pi there is no `~/clubbot-old`: instead of the `sudo cp`
 lines, copy the secrets over from the PC (run in THIS project folder on the
-PC): `scp .env service-account.json blud@blud.local:clubbot/`
+PC): `scp .env blud@blud.local:clubbot/` and
+`scp config/service-account.json blud@blud.local:clubbot/config/`
 
 Once the bot runs fine for a week, delete the old copy: `rm -rf ~/clubbot-old`
 (use `sudo rm -rf` if it says Permission denied).
@@ -192,7 +290,7 @@ receipt-reuse protection.
 
 1. `/transfertreasurer <their sutd_id>` in Telegram.
 2. Give them the GitHub repo, the Pi login, and the secrets (`.env`,
-   `service-account.json`). The weekly database backup DM goes to whoever
+   `config/service-account.json`). The weekly database backup DM goes to whoever
    is treasurer, so it follows the handover automatically.
 3. Point them at `CLAUDE.md` (project status/decisions) and the design doc in
    `docs/superpowers/specs/`.

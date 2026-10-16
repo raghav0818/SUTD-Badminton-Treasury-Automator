@@ -20,7 +20,7 @@ fi
 
 echo "==> Creating Python environment and installing dependencies (first run takes a few minutes)"
 [ -d .venv ] || python3 -m venv .venv
-.venv/bin/pip install --quiet --upgrade -r requirements.txt
+.venv/bin/pip install --quiet --upgrade -r config/requirements.txt
 
 echo "==> Installing the systemd service (may ask for your password)"
 sed "s|{{USER}}|$USER|g; s|{{DIR}}|$APP_DIR|g" deploy/clubbot.service |

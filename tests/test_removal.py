@@ -510,3 +510,35 @@ def test_someone_seen_in_rec_chat_may_register_while_outside_it(conn):
     assert not asyncio.run(bot._in_club_group(context, 70))
     db.note_rec_person(conn, 70, "Removed Lurker")
     assert asyncio.run(bot._in_club_group(context, 70))
+
+
+def test_paying_while_the_sweep_is_running_saves_you(conn):
+    # Codex: the sweep listed everyone first, then kicked one by one. Someone
+    # whose payment is verified mid-sweep must not be kicked anyway.
+    term = _term(conn)
+    db.set_setting(conn, "remove_unpaid", "on")
+    _member(conn, 1, "1010001", "Alice Unpaid")  # the sweep goes alphabetically
+    _member(conn, 6, "1010006", "Zoe Pays Late")
+    fake = make_bot({1: ChatMemberStatus.MEMBER, 6: ChatMemberStatus.MEMBER})
+    _run(fake, conn, term, REMOVAL_DAY - timedelta(days=2))
+
+    async def ban(chat_id, user_id):
+        if user_id == 1:  # Zoe's receipt is verified while Alice's ban is in flight
+            _pay(conn, 6, term, "verified")
+
+    fake.ban_chat_member = AsyncMock(side_effect=ban)
+    _run(fake, conn, term, REMOVAL_DAY)
+    assert _kicked(fake) == [1]
+
+
+def test_a_rec_chat_that_is_also_the_comp_chat_is_never_touched(conn):
+    # Codex: /setgroup rec run inside the comp chat would aim removals at
+    # competitive players. Removal must fail closed when the two match.
+    term = _term(conn)
+    fake = _setup_people(conn, term)
+    db.set_setting(conn, "remove_unpaid", "on")
+    db.set_setting(conn, "comp_group_id", str(REC))
+    for day in range(-2, 3):
+        _run(fake, conn, term, REMOVAL_DAY + timedelta(days=day))
+    fake.ban_chat_member.assert_not_awaited()
+    fake.send_message.assert_not_awaited()

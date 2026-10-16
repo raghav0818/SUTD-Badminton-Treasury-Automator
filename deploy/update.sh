@@ -1,8 +1,8 @@
 #!/bin/bash
 # Pulls the latest code from GitHub and restarts the bot.
 #   Run on the Pi:  bash ~/clubbot/deploy/update.sh
-# Your .env, service-account.json and clubbot.db are not in git, so they are
-# never touched.
+# Your .env, config/service-account.json and clubbot.db are not in git, so
+# they are never touched.
 set -euo pipefail
 
 # Wrapped in a function so bash reads the whole script before running it:

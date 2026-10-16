@@ -115,7 +115,13 @@ def _report(conn, result, payments) -> tuple[str, InlineKeyboardMarkup | None]:
         for pid, line in result.name_differs
     ]
     flagged += [
-        (pid, "one bank payment fits this AND another member's receipt; check FLYMAX by hand")
+        (
+            pid,
+            "was confirmed, but another member's receipt now claims the same bank "
+            "payment; check FLYMAX by hand"
+            if pid in result.suspended
+            else "one bank payment fits this AND another member's receipt; check FLYMAX by hand",
+        )
         for pid in result.ambiguous
     ]
     if flagged:
@@ -141,6 +147,15 @@ def _report(conn, result, payments) -> tuple[str, InlineKeyboardMarkup | None]:
                 for line in result.stray_lines
             )
         )
+    if result.no_txn_lines:
+        sections.append(
+            "🔎 I couldn't read the TXN ID on these rows, so they can't confirm "
+            "anyone. Send a clearer screenshot of them with /reconcile:\n"
+            + "\n".join(
+                f"- {money(line.amount_cents)} from {line.payer_name or '?'} at {_when(line)}"
+                for line in result.no_txn_lines
+            )
+        )
     if result.unreadable_lines:
         sections.append(f"({result.unreadable_lines} row(s) had no readable amount or time and were skipped.)")
     keyboard = None
@@ -149,8 +164,13 @@ def _report(conn, result, payments) -> tuple[str, InlineKeyboardMarkup | None]:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(f"Revoke {by_id[pid]['full_name']}"[:40], callback_data=f"rc:rv:{pid}"),
-                    InlineKeyboardButton("It's fine", callback_data=f"rc:ok:{pid}"),
+                    InlineKeyboardButton(
+                        f"Revoke {by_id[pid]['full_name']}"[:40],
+                        callback_data=f"rc:rv:{pid}:{db.payment_version(by_id[pid])}",
+                    ),
+                    InlineKeyboardButton(
+                        "It's fine", callback_data=f"rc:ok:{pid}:{db.payment_version(by_id[pid])}"
+                    ),
                 ]
                 for pid, _ in flagged
             ]
@@ -189,6 +209,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if payment is None or payment["status"] != "verified":
         await context.bot.send_message(chat_id=user_id, text="That payment is no longer verified. Nothing to do.")
         return
+    if db.payment_version(payment) != int(rest[1]):
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="That button is for an older receipt; the member has sent a new "
+            "one since. Nothing changed. Run /reconcile again to check the new one.",
+        )
+        return
     if action == "ok":
         db.set_bank_confirmed(conn, [payment["id"]])
         scheduler.request_sheet_sync(context.application)
@@ -201,7 +228,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=user_id,
         text=f"Revoke {payment['full_name']}'s membership for {payment['term_name']}? "
         "They will be told by DM that the payment couldn't be confirmed against the bank.",
-        reply_markup=admin._confirm_keyboard(f"revoke:{payment['term_id']}:{payment['member_id']}"),
+        reply_markup=admin._confirm_keyboard(
+            f"revoke:{payment['term_id']}:{payment['member_id']}:{db.payment_version(payment)}"
+        ),
     )
 
 
@@ -217,11 +246,15 @@ async def _run(context, user_id: int, lines: list[BankLine]) -> None:
         )
         return
     payments = db.list_reconcile_payments(conn, term["id"])
-    result = reconcile(payments, lines, school_config(conn))
-    db.set_bank_confirmed(conn, list(result.confirmed))
-    db.set_bank_flagged(
+    result = reconcile(payments, lines, school_config(conn), db.bank_line_owners(conn))
+    db.record_reconcile(
         conn,
-        list(result.missing) + list(result.ambiguous) + [pid for pid, _ in result.name_differs],
+        suspended=list(result.suspended),
+        confirmed=list(result.confirmed),
+        claims=list(result.claimed_lines),
+        flagged=list(result.missing)
+        + list(result.ambiguous)
+        + [pid for pid, _ in result.name_differs],
     )
     scheduler.request_sheet_sync(context.application)
     text, keyboard = _report(conn, result, db.list_reconcile_payments(conn, term["id"]))
@@ -261,5 +294,5 @@ def _verified_ts(payment) -> float:
 def build_handlers(private_filter) -> list:
     return [
         CommandHandler("reconcile", cmd_reconcile, filters=private_filter),
-        CallbackQueryHandler(on_button, pattern=r"^rc:(done|cancel|rv:\d+|ok:\d+)$"),
+        CallbackQueryHandler(on_button, pattern=r"^rc:(done|cancel|rv:\d+:\d+|ok:\d+:\d+)$"),
     ]

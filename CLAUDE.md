@@ -12,8 +12,94 @@ session** — that is how sessions hand off. The full design/PRD is at
 `docs/superpowers/specs/2026-06-11-club-payment-bot-design.md`; read it before
 changing payment or verification logic.
 
-## Status (2026-10-14)
+## Status (2026-10-16)
 
+- **Codex review (`gpt-6.1-sol`) of the working tree + `c7786c2`/`33839d8`:
+  6 findings, all fixed locally (not committed, pushed or deployed).**
+  `/reconcile` (`payments.reconcile`): a truncated re-read (`ALICE` vs
+  `ALICE TAN`) of one transfer is now the same transfer (fuller name kept);
+  an ID match must also agree on time (±15 min); a receipt whose IDs hit two
+  transfers is flagged, leaving those transfers free; when a confirmed
+  payment and a new receipt both fit one transfer, BOTH are flagged and the
+  earlier confirmation is suspended (`result.suspended`). New table
+  `bank_line_claims` (txn_id → payment_id, auto-created): every FLYMAX
+  transfer that ever confirmed a payment is that payment's permanently (never
+  cleared, like `receipt_fingerprints`; one payment can hold several across
+  revoke/resubmit), so it can never back another receipt; it re-backs its
+  owner only if the owner's current receipt still fits. `/reconcile` saves via
+  one all-or-nothing `db.record_reconcile`. `db`: revoke and a new receipt
+  (`mark_payment_pending`) clear `audit_confirmed_at`/`flagged_at`, and a new
+  receipt also clears the old one's amount/time/settled shirt (the member's
+  shirt choice stays). README first-time-setup copies the key from either old
+  location and fixes the `.env` path. Also: Sheet "Bank" column renamed "Bank
+  status" (Payments + Shirts) and a "TOTAL verified" row added under Payments.
+- **Second Codex review (`gpt-6.1-sol`, FULL codebase, 2026-10-16): 9
+  findings, all fixed locally with a test each; 334 tests pass. Not
+  committed/deployed.** (1) `/relink` now needs a single-use secret link
+  (`t.me/<bot>?start=relink_<code>`, `db.arm_relink` returns the code) — a
+  SUTD ID alone can no longer take over an account/treasurer role. (2–3) see
+  `bank_line_claims` / `record_reconcile` above. (4) the rec-chat sweep
+  re-checks payment/Keep/mode/chat right before each ban. (5) `/setgroup`
+  refuses one chat as both rec and comp, and `removal._rec_chat` returns None
+  if they match (fail closed). (6) receipt-review buttons carry the receipt's
+  image-hash prefix; a replaced receipt's old buttons are refused (pre-deploy
+  3-part buttons are refused too). (7) see `mark_payment_pending` above. (8)
+  a same-day term-start blast now only skips today's reminder for members it
+  reached (per-recipient stamps), and reminders wait while the blast retries.
+  (9) a join after the noon pick fills an empty nets/backup role and is
+  announced. Session duty messages were also reformatted (bold headings,
+  date line, "Still collecting"/"New backup"), and the backup's DM now has
+  its own "I can't make it" button. **Treasurer rule (2026-10-16, not
+  negotiable): once the nets/shuttles job has been passed past the last
+  signed-up person (everyone with the role dropped out and nobody is left),
+  the session is auto-cancelled** (`sessions._cancel_nobody_left`: DB cancel
+  before any await, group post, card shows CANCELLED, host DM; the hourly
+  job also cancels any picked session left with nobody). Before the noon pick
+  an empty session is NOT cancelled (host DM + hourly check, as before).
+  335 tests pass.
+- **Third (final) Codex review, 2026-10-16: every pivotal file read in full
+  with a per-file verdict.** OK: paynow, qrgen, gemini, db, newterm,
+  scheduler, removal, sheets, config, `__main__`, all deploy files,
+  requirements. 6 findings, all fixed with tests (342 pass): (1) a FLYMAX
+  row read WITHOUT its TXN ID never confirms anyone (FLYMAX always shows one;
+  such rows only count for the covered period and are listed in the report
+  as "couldn't read the TXN ID"); (2) It's fine / Revoke / /revoke-Confirm
+  buttons carry `db.payment_version` (verified_at stamp) and refuse a
+  re-verified replacement; (3) a receipt whose IDs hit 2+ transfers is
+  contested even when one is already its own; (4) a failed member DM no
+  longer blocks the treasurer's review message, and undelivered review
+  messages are re-sent by the 15-min retry job (`payments.review_notified_at`;
+  the 2 old test-term exceptions will be re-sent once with working buttons);
+  (5) the noon duty post re-posts if a Leave/Join changes duties mid-send,
+  and is stamped only when still true; (6) cancellations (auto and host) are
+  stamped `sessions.cancel_posted_at` only once the group post lands and the
+  hourly job retries; it also cancels any picked session left with nobody
+  (announced or not). Migration from the committed schema verified.
+- **FLYMAX confirmed to be DBS MAX; real screenshot format now known.**
+  Treasurer sent two real screenshots (kept locally only, gitignored, in
+  `docs/research/flymax-samples/` — real member names/amounts). History tab
+  (not Overview) is the row-by-row list `/reconcile` needs: grouped by date,
+  each row has payer name, amount, a 20-digit `TXN ID:`, and
+  "<collector> collected at <time>". **No Billing ID is shown per row** —
+  corrects a PRD §4 assumption; no code change needed since `BankLine`
+  already only reads amount/time/name/transaction_id. Still open: whether
+  FLYMAX's 20-digit TXN ID equals the reference on a payer's own receipt
+  (the UOB payer-receipt IDs on file are 16 digits — a different length, a
+  signal but not proof). Full detail and the confirmed layout:
+  `docs/research/2026-10-11-fake-receipt-defences.md` §7.
+- **Root directory reorganized (local only, not pushed/deployed).** Root now
+  holds only folders plus `.env`, `README.md`, `CLAUDE.md` (and the two
+  dotfiles git requires at the top level, `.gitignore`/`.gitattributes`).
+  Moved into a new `config/` folder: `requirements.txt`,
+  `requirements-dev.txt`, `.env.example`, `service-account.json`. Deleted
+  `pytest.ini` (folded into running tests as `python -m pytest tests/`
+  everywhere instead). Deleted the stale duplicate `AGENTS.md` (superseded by
+  this file). Updated every reference: `.env`'s `GOOGLE_SERVICE_ACCOUNT_FILE`,
+  `clubbot/config.py`'s error message, `deploy/setup_pi.sh`,
+  `deploy/update.sh`, `README.md` (including a one-time Pi migration note for
+  `service-account.json`'s new location — **the Pi itself still has it at the
+  old top-level path until that migration step is run post-deploy**). 317
+  tests still pass.
 - **Missing transaction ID no longer blocks auto-verify (not yet deployed).**
   A real test payment from a newly registered member (Clarice Lim, DBS/PayLah-
   style collapsed success screen) failed auto-verify solely because the bank
@@ -145,15 +231,17 @@ changing payment or verification logic.
 - The user is the club treasurer, not a professional developer — explain
   choices plainly, ask before scope changes.
 - Never store payment screenshots on disk; keep Telegram file_id + extracted
-  fields only. Secrets go in `.env` / `service-account.json` (both
-  gitignored), never in code.
+  fields only. Secrets go in `.env` (repo root) / `config/service-account.json`
+  (both gitignored), never in code.
 - The VLM (Gemini Flash) only *extracts* data from screenshots; membership
   decisions are made by deterministic checks in code (PRD §7.3).
 - Members are keyed by Telegram user ID, never by @username.
-- The school account is called **DBS FLYMAX** (probably the DBS MAX app).
-  The treasurer has view-only app access: no API — hence screenshot
-  verification, backed by `/reconcile` (treasurer's FLYMAX list screenshots
-  matched line by line). A member's receipt is never proof on its own.
+- The school account is called **DBS FLYMAX**, confirmed to be the **DBS MAX**
+  app (History tab, not Overview, has the row-by-row list; see
+  `docs/research/2026-10-11-fake-receipt-defences.md` §7). The treasurer has
+  view-only app access: no API — hence screenshot verification, backed by
+  `/reconcile` (treasurer's FLYMAX list screenshots matched line by line). A
+  member's receipt is never proof on its own.
 - Keep fees configurable per term; never hardcode a fee amount.
 - `receipt_fingerprints` is permanent anti-reuse history. Never clear it
   between terms, and back up `clubbot.db`.
@@ -217,7 +305,7 @@ changing payment or verification logic.
 
 Stack: Python 3.12+ · python-telegram-bot v21+ (long-polling, JobQueue) ·
 SQLite · google-genai (Gemini Flash) · gspread · qrcode · pytest.
-Tests: `python -m pytest` (needs `requirements-dev.txt`).
+Tests: `python -m pytest tests/` (needs `config/requirements-dev.txt`).
 
 ## User context & preferences
 
@@ -323,3 +411,19 @@ Tests: `python -m pytest` (needs `requirements-dev.txt`).
   `/reconcile` (`clubbot/reconcile.py` + `payments.reconcile`). See Status.
 - **Out of scope for now:** per-transaction bank email alerts (would upgrade
   verification to bank-confirmed; asked of SUTD finance, pending).
+- **2026-10-16** — Treasurer sent two real FLYMAX screenshots (kept local
+  only, gitignored, `docs/research/flymax-samples/`). Confirmed FLYMAX = DBS
+  MAX, and documented the real History-tab row format (payer name, amount,
+  20-digit TXN ID, collector + time; no per-row Billing ID, correcting a PRD
+  §4 assumption). No code change — `BankLine`/`extract_bank_lines` already
+  only rely on fields that are actually shown. See
+  `docs/research/2026-10-11-fake-receipt-defences.md` §7.
+- **2026-10-16** — Sheet: "Bank" → "Bank status", "TOTAL verified" row.
+  Codex (`gpt-6.1-sol`) reviewed the uncommitted work + `c7786c2`/`33839d8`:
+  4 High + 2 Medium, all in `/reconcile` matching, revoke/resubmit state, and
+  the README key migration. All fixed with a test per finding (see Status);
+  323 tests pass. Not committed or deployed yet. Then a FULL-codebase Codex
+  review with project context: 9 more findings (relink takeover, bank-claim
+  history + atomic reconcile writes, stale removal sweep, rec/comp same chat,
+  stale review buttons, stale receipt facts, blast vs reminder, session role
+  refill), all fixed with tests; session messages reformatted; 334 tests pass.

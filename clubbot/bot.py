@@ -60,7 +60,8 @@ ASK_ID_TEXT = "Thanks! Now send your 7-digit SUTD student ID (for example, 10102
 BAD_SUTD_ID = "Your SUTD student ID must be exactly 7 digits and start with 1010 (e.g. 1010234). Please try again."
 SUTD_ID_TAKEN = (
     "That SUTD ID is already registered to a different Telegram account.\n"
-    "If you switched accounts, ask the treasurer to relink you. Use /cancel to stop."
+    "If you switched accounts, ask the treasurer for a relink link and open it "
+    "from this account. Use /cancel to stop."
 )
 CONFIRM_PROMPT = (
     "Register as:\n\nName: {name}\nSUTD ID: {sutd_id}\n\n"
@@ -168,6 +169,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         else:
             await update.message.reply_text(_status_text(_db(context), member))
         return ConversationHandler.END
+    if context.args and context.args[0].startswith("relink_"):
+        context.user_data["relink_code"] = context.args[0].removeprefix("relink_")
     # Someone outside the club groups may still be on the roster, which needs
     # their SUTD ID, so they continue and on_sutd_id makes the final call.
     context.user_data["in_club_group"] = await _in_club_group(
@@ -221,7 +224,7 @@ async def on_sutd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(NOT_IN_CLUB)
         return ConversationHandler.END
     if db.get_member_by_sutd_id(_db(context), sutd_id) is not None:
-        if not db.relink_armed(_db(context), sutd_id):
+        if not db.relink_armed(_db(context), sutd_id, context.user_data.get("relink_code")):
             await update.message.reply_text(SUTD_ID_TAKEN)
             return ASK_SUTD_ID
         context.user_data["relink"] = True
@@ -242,7 +245,9 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             if context.user_data.get("relink"):
                 # Re-check at use time: the flag may have been consumed or
                 # expired while this conversation sat at the confirm step.
-                if not db.relink_armed(_db(context), sutd_id):
+                if not db.relink_armed(
+                    _db(context), sutd_id, context.user_data.get("relink_code")
+                ):
                     context.user_data.clear()
                     await update.message.reply_text(RELINK_EXPIRED)
                     return ConversationHandler.END
@@ -642,9 +647,13 @@ async def _finish_receipt(
         )
         return
 
-    await reply(
-        "Your receipt needs treasurer review. You will be notified after it is checked."
-    )
+    try:
+        await reply(
+            "Your receipt needs treasurer review. You will be notified after it is checked."
+        )
+    except Exception:
+        # The treasurer's review buttons matter more than this courtesy note.
+        log.warning("Could not tell member about review of %s", payment["id"], exc_info=True)
     try:
         await _notify_treasurer(context, payment["id"], result.reasons)
     except Exception:
@@ -661,6 +670,16 @@ async def retry_failed_extractions(context: ContextTypes.DEFAULT_TYPE) -> None:
     treasurer's Approve/Reject review. Never raises.
     """
     conn = _db(context)
+    for row in db.list_unnotified_reviews(conn):
+        try:
+            await _notify_treasurer(
+                context,
+                row["id"],
+                ("this receipt is waiting for your review (re-sent: the first "
+                 "message didn't go through)",),
+            )
+        except Exception:
+            log.warning("Review notification for %s still failing", row["id"], exc_info=True)
     extractor = context.bot_data.get("extractor")
     if extractor is None:
         return
@@ -749,14 +768,15 @@ async def _notify_treasurer(
         money(cents)
         for cents in sorted(db.valid_amounts(payment, payment["category"]))
     )
+    receipt = _receipt_tag(payment)
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "Approve", callback_data=f"payment:approve:{payment_id}"
+                    "Approve", callback_data=f"payment:approve:{payment_id}:{receipt}"
                 ),
                 InlineKeyboardButton(
-                    "Reject", callback_data=f"payment:reject:{payment_id}"
+                    "Reject", callback_data=f"payment:reject:{payment_id}:{receipt}"
                 ),
             ]
         ]
@@ -771,6 +791,12 @@ async def _notify_treasurer(
         ),
         reply_markup=keyboard,
     )
+    db.mark_review_notified(conn, payment_id)
+
+
+def _receipt_tag(payment) -> str:
+    """Which receipt a review button is for: a replaced receipt has a new hash."""
+    return (payment["image_hash"] or "")[:12]
 
 
 async def on_payment_review(
@@ -782,10 +808,18 @@ async def on_payment_review(
         await query.edit_message_text("Only the treasurer can review payments.")
         return
     try:
-        _, action, raw_id = query.data.split(":")
+        _, action, raw_id, receipt = query.data.split(":")
         payment_id = int(raw_id)
         if action not in {"approve", "reject"}:
             raise ValueError
+        current = db.get_payment(_db(context), payment_id)
+        if current is None or _receipt_tag(current) != receipt:
+            # The member sent a newer receipt; its own review message decides.
+            await query.edit_message_text(
+                "This review is for an older receipt that the member has since "
+                "replaced. Use the buttons on the newest review message instead."
+            )
+            return
         payment = db.review_payment(
             _db(context), payment_id, approve=action == "approve"
         )
@@ -887,12 +921,14 @@ def build_application(
         CallbackQueryHandler(on_pay_size, pattern=r"^pay:size:(XS|S|M|L|XL|XXL)$")
     )
     app.add_handler(
-        CallbackQueryHandler(on_payment_review, pattern=r"^payment:(approve|reject):\d+$")
+        CallbackQueryHandler(
+            on_payment_review, pattern=r"^payment:(approve|reject):\d+(:[0-9a-f]*)?$"
+        )
     )
     app.add_handler(
         CallbackQueryHandler(
             admin.on_confirm,
-            pattern=r"^cf:(cancel|markpaid:\d+:\d+|revoke:\d+:\d+|treasurer:\d+)$",
+            pattern=r"^cf:(cancel|markpaid:\d+:\d+|revoke:\d+:\d+:\d+|treasurer:\d+)$",
         )
     )
     app.add_handler(CallbackQueryHandler(admin.on_markpaid_pick, pattern=r"^mp:\d+:\d+$"))
